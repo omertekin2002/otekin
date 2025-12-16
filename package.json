@@ -1,0 +1,29 @@
+{
+  "name": "otekin",
+  "version": "0.1.0",
+  "description": "Ömer Tekin terminal profile card (run with `npx otekin`).",
+  "license": "MIT",
+  "author": "Ömer Tekin",
+  "bin": {
+    "otekin": "./bin/otekin.js"
+  },
+  "files": [
+    "bin/",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=16"
+  },
+  "scripts": {
+    "start": "node ./bin/otekin.js"
+  },
+  "keywords": [
+    "cli",
+    "npx",
+    "profile",
+    "terminal"
+  ]
+}
+
+
