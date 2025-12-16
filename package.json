@@ -5,7 +5,7 @@
   "license": "MIT",
   "author": "Ömer Tekin",
   "bin": {
-    "otekin": "./bin/otekin.js"
+    "otekin": "bin/otekin.js"
   },
   "files": [
     "bin/",
@@ -25,5 +25,3 @@
     "terminal"
   ]
 }
-
-
