@@ -4,6 +4,10 @@
   "description": "Ömer Tekin terminal profile card (run with `npx otekin`).",
   "license": "MIT",
   "author": "Ömer Tekin",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/omertekin2002/otekin"
+  },
   "bin": {
     "otekin": "bin/otekin.js"
   },
