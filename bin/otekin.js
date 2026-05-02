@@ -5,10 +5,11 @@ const { spawn } = require('child_process');
 const readline = require('readline');
 const pkg = require('../package.json');
 
-const MESSAGE = "Hello! I'm Ömer, I'm a law student currently studying at Koç University";
+const MESSAGE = "Hello! I'm Ömer, I'm a law & business student currently studying at Koç University";
 const LINKS = {
   website: 'https://omertekin2002.github.io',
-  linkedin: 'https://www.linkedin.com/in/ömer-tekin/'
+  linkedin: 'https://www.linkedin.com/in/ömer-tekin/',
+  cv: 'https://omertekin2002.github.io/resume'
 };
 
 function printHelp() {
@@ -24,7 +25,7 @@ Options:
   --non-interactive       Print text + links and exit (no prompt)
   --json                  Output JSON and exit
   --no-open               Don't open links in a browser (print them instead)
-  -s, --select <choice>   Skip the prompt and select one of: website | linkedin | exit
+  -s, --select <choice>   Skip the prompt and select one of: website | linkedin | cv | exit
 
 Examples:
   npx otekin
@@ -72,6 +73,7 @@ function printNonInteractive() {
   process.stdout.write('Links:\n');
   process.stdout.write(`- Website: ${LINKS.website}\n`);
   process.stdout.write(`- LinkedIn: ${LINKS.linkedin}\n`);
+  process.stdout.write(`- CV: ${LINKS.cv}\n`);
 }
 
 function safeEncodeUrl(url) {
@@ -130,7 +132,8 @@ function normalizeSelect(v) {
   const s = String(v).trim().toLowerCase();
   if (s === '1' || s === 'website' || s === 'site') return 'website';
   if (s === '2' || s === 'linkedin' || s === 'li') return 'linkedin';
-  if (s === '3' || s === 'exit' || s === 'quit' || s === 'q') return 'exit';
+  if (s === '3' || s === 'cv' || s === 'resume') return 'cv';
+  if (s === '4' || s === 'exit' || s === 'quit' || s === 'q') return 'exit';
   return null;
 }
 
@@ -150,6 +153,7 @@ function promptMenu() {
   const choices = [
     { label: 'Personal website', value: 'website' },
     { label: 'LinkedIn', value: 'linkedin' },
+    { label: 'Download CV', value: 'cv' },
     { label: 'Exit', value: 'exit' }
   ];
 
@@ -168,7 +172,7 @@ function promptMenu() {
 
     const render = () => {
       const lines = [];
-      lines.push('Choose an option (↑/↓ + Enter, or 1-3):');
+      lines.push('Choose an option (↑/↓ + Enter, or 1-4):');
       for (let i = 0; i < choices.length; i += 1) {
         const prefix = i === selected ? '❯' : ' ';
         lines.push(`${prefix} ${choices[i].label}`);
@@ -203,7 +207,7 @@ function promptMenu() {
         return;
       }
 
-      if (str === '1' || str === '2' || str === '3') {
+      if (str === '1' || str === '2' || str === '3' || str === '4') {
         selected = Math.max(0, Math.min(choices.length - 1, Number(str) - 1));
         render();
         cleanup();
@@ -282,5 +286,3 @@ main().catch((err) => {
   process.stderr.write((err && err.stack) ? String(err.stack) + '\n' : String(err) + '\n');
   process.exitCode = 1;
 });
-
-
