@@ -1,6 +1,6 @@
 # `npx otekin`
 
-The tiny terminal profile CLI for my profile
+A tiny terminal profile CLI for my profile
 
 ## Run
 
@@ -25,4 +25,3 @@ npx otekin --non-interactive
 npx otekin --select website --no-open
 npx otekin --select cv --no-open
 ```
-
