@@ -18,6 +18,8 @@ otekin — terminal profile card
 
 Usage:
   npx otekin
+  npx otekin cv
+  npx otekin linkedin
 
 Options:
   -h, --help              Show help
@@ -25,11 +27,15 @@ Options:
   --non-interactive       Print text + links and exit (no prompt)
   --json                  Output JSON and exit
   --no-open               Don't open links in a browser (print them instead)
+  --cv, --resume          Open the CV download link directly
   -s, --select <choice>   Skip the prompt and select one of: website | linkedin | cv | exit
 
 Examples:
   npx otekin
+  npx otekin cv
+  npx otekin linkedin
   npx otekin --non-interactive
+  npx otekin --cv
   npx otekin --select website --no-open
 `.trim();
 
@@ -53,6 +59,8 @@ function parseArgs(argv) {
     else if (a === '--non-interactive' || a === '--no-interactive') opts.nonInteractive = true;
     else if (a === '--json') opts.json = true;
     else if (a === '--no-open') opts.noOpen = true;
+    else if (a === '--cv' || a === '--resume') opts.select = 'cv';
+    else if (!a.startsWith('-') && !opts.select) opts.select = a;
     else if (a === '-s' || a === '--select') {
       opts.select = argv[i + 1] ?? null;
       i += 1;
@@ -261,7 +269,7 @@ async function main() {
 
   const selectedFromFlag = normalizeSelect(opts.select);
   if (opts.select && !selectedFromFlag) {
-    process.stderr.write(`Unknown --select value: ${opts.select}\n`);
+    process.stderr.write(`Unknown option: ${opts.select}\n`);
     printHelp();
     process.exitCode = 1;
     return;
