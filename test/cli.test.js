@@ -182,6 +182,26 @@ test('CLI one-shot --json preserves the complete gateway response', async () => 
   });
 });
 
+test('CLI compacts researched source links in ordinary output', async () => {
+  const redirect = 'https://vertexaisearch.cloud.google.com/grounding-api-redirect/very-long-token';
+  await withServer((request, response) => {
+    request.resume();
+    response.writeHead(200, { 'Content-Type': 'application/json' });
+    response.end(JSON.stringify({
+      message: `Answer with a citation [1].\n\nSources:\n1. [example.com](<${redirect}>)`,
+      webSources: [{ title: 'example.com', url: redirect, snippet: 'Supporting evidence.' }]
+    }));
+  }, async (endpoint) => {
+    const result = await runCli(['chat', 'Question'], {
+      OTEKIN_CHAT_API_URL: endpoint
+    });
+    assert.strictEqual(result.code, 0);
+    assert.strictEqual(result.stdout, 'Answer with a citation [1].\n\nSources: [1] example.com\n');
+    assert.doesNotMatch(result.stdout, /vertexaisearch/);
+    assert.strictEqual(result.stderr, '');
+  });
+});
+
 test('CLI chat failures are script-friendly and hide response bodies', async () => {
   await withServer((request, response) => {
     request.resume();
