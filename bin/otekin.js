@@ -5,6 +5,7 @@ const { spawn } = require('child_process');
 const readline = require('readline');
 const pkg = require('../package.json');
 const { requestChat, prepareRequestMessages } = require('../lib/chat-client');
+const { formatChatResponse } = require('../lib/chat-format');
 
 const MESSAGE = "Hello! I'm Ömer, I'm a law & business student currently studying at Koç University";
 const LINKS = {
@@ -233,7 +234,7 @@ async function runOneShotChat(prompt, opts) {
     if (opts.json) {
       process.stdout.write(JSON.stringify(response, null, 2) + '\n');
     } else {
-      writeLine(response.message);
+      writeLine(formatChatResponse(response, { hyperlinks: Boolean(process.stdout.isTTY) }));
     }
   } catch (error) {
     clearProgress();
@@ -313,7 +314,7 @@ async function runInteractiveChat() {
         clearProgress();
         if (exitRequested) break;
         process.stdout.write('AI: ');
-        writeLine(response.message);
+        writeLine(formatChatResponse(response, { hyperlinks: Boolean(process.stdout.isTTY) }));
         process.stdout.write('\n');
         history = candidate.concat({ role: 'assistant', content: response.message });
       } catch (error) {

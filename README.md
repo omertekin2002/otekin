@@ -29,6 +29,8 @@ Interactive chat keeps context in memory for the current CLI process. Use these 
 
 Blank input simply displays the prompt again. Chat requests are non-streaming, so research-heavy answers may take some time.
 
+Research citations are shown as a compact source row instead of raw redirect URLs. In supported terminals, each numbered source label is clickable. Use `--json` when you need the complete source URLs, snippets, and gateway metadata.
+
 ## Options
 
 - `--non-interactive`: print the profile message and links without a prompt.
