@@ -4,6 +4,7 @@
 const { spawn } = require('child_process');
 const readline = require('readline');
 const pkg = require('../package.json');
+const { requestChat, prepareRequestMessages } = require('../lib/chat-client');
 
 const MESSAGE = "Hello! I'm Ömer, I'm a law & business student currently studying at Koç University";
 const LINKS = {
@@ -20,15 +21,17 @@ Usage:
   npx otekin
   npx otekin cv
   npx otekin linkedin
+  npx otekin chat "What happened today?"
+  npx otekin chat
 
 Options:
   -h, --help              Show help
   -v, --version           Show version
   --non-interactive       Print text + links and exit (no prompt)
-  --json                  Output JSON and exit
+  --json                  Output profile or one-shot chat JSON and exit
   --no-open               Don't open links in a browser (print them instead)
   --cv, --resume          Open the CV download link directly
-  -s, --select <choice>   Skip the prompt and select one of: website | linkedin | cv | exit
+  -s, --select <choice>   Skip the prompt and select: website | linkedin | cv | chat | exit
 
 Examples:
   npx otekin
@@ -37,6 +40,16 @@ Examples:
   npx otekin --non-interactive
   npx otekin --cv
   npx otekin --select website --no-open
+  npx otekin chat "Explain quantum computing"
+  npx otekin chat "Explain this" --json
+  npx otekin --select chat
+
+Interactive chat commands:
+  /clear                   Clear conversation history
+  /exit, /quit             End the chat session
+
+Environment:
+  OTEKIN_CHAT_API_URL      Override the HTTP(S) chat endpoint (no API key required)
 `.trim();
 
   process.stdout.write(help + '\n');
@@ -49,7 +62,9 @@ function parseArgs(argv) {
     nonInteractive: false,
     json: false,
     noOpen: false,
-    select: null
+    select: null,
+    command: null,
+    commandArgs: []
   };
 
   for (let i = 0; i < argv.length; i += 1) {
@@ -60,12 +75,17 @@ function parseArgs(argv) {
     else if (a === '--json') opts.json = true;
     else if (a === '--no-open') opts.noOpen = true;
     else if (a === '--cv' || a === '--resume') opts.select = 'cv';
-    else if (!a.startsWith('-') && !opts.select) opts.select = a;
     else if (a === '-s' || a === '--select') {
       opts.select = argv[i + 1] ?? null;
       i += 1;
     } else if (a.startsWith('--select=')) {
       opts.select = a.slice('--select='.length) || null;
+    } else if (!a.startsWith('-') && opts.command === 'chat') {
+      opts.commandArgs.push(a);
+    } else if (!a.startsWith('-') && a.toLowerCase() === 'chat' && !opts.select) {
+      opts.command = 'chat';
+    } else if (!a.startsWith('-') && !opts.select) {
+      opts.select = a;
     }
   }
 
@@ -119,6 +139,16 @@ function openInBrowser(url) {
 async function handleChoice(choice, opts) {
   if (choice === 'exit') return;
 
+  if (choice === 'chat') {
+    if (!isInteractiveAllowed(opts)) {
+      process.stderr.write('Interactive chat requires a terminal. Use `otekin chat "your question"` for one-shot chat.\n');
+      process.exitCode = 1;
+      return;
+    }
+    await runInteractiveChat();
+    return;
+  }
+
   const url = LINKS[choice];
   if (!url) return;
 
@@ -141,7 +171,8 @@ function normalizeSelect(v) {
   if (s === '1' || s === 'website' || s === 'site') return 'website';
   if (s === '2' || s === 'linkedin' || s === 'li') return 'linkedin';
   if (s === '3' || s === 'cv' || s === 'resume') return 'cv';
-  if (s === '4' || s === 'exit' || s === 'quit' || s === 'q') return 'exit';
+  if (s === '4' || s === 'chat' || s === 'ai') return 'chat';
+  if (s === '5' || s === 'exit' || s === 'quit' || s === 'q') return 'exit';
   return null;
 }
 
@@ -157,11 +188,154 @@ function showCursor() {
   } catch {}
 }
 
+function restoreTerminal() {
+  try {
+    if (process.stdin.isTTY && process.stdin.isRaw) process.stdin.setRawMode(false);
+  } catch {}
+  showCursor();
+}
+
+function writeLine(value) {
+  process.stdout.write(String(value).replace(/(?:\r?\n[ \t]*)+$/, '') + '\n');
+}
+
+function startProgress(stream, message) {
+  if (!stream.isTTY) return () => {};
+
+  let cleared = false;
+  stream.write(message);
+  return () => {
+    if (cleared) return;
+    cleared = true;
+    readline.clearLine(stream, 0);
+    readline.cursorTo(stream, 0);
+  };
+}
+
+function errorMessage(error) {
+  return error && error.message ? String(error.message) : 'Chat request failed.';
+}
+
+async function runOneShotChat(prompt, opts) {
+  let messages;
+  try {
+    messages = prepareRequestMessages([], prompt);
+  } catch (error) {
+    process.stderr.write(`Chat error: ${errorMessage(error)}\n`);
+    process.exitCode = 1;
+    return;
+  }
+
+  const clearProgress = startProgress(process.stderr, 'AI: thinking…');
+  try {
+    const response = await requestChat(messages);
+    clearProgress();
+    if (opts.json) {
+      process.stdout.write(JSON.stringify(response, null, 2) + '\n');
+    } else {
+      writeLine(response.message);
+    }
+  } catch (error) {
+    clearProgress();
+    process.stderr.write(`Chat error: ${errorMessage(error)}\n`);
+    process.exitCode = 1;
+  }
+}
+
+function question(rl, prompt) {
+  return new Promise((resolve) => {
+    let answered = false;
+    const onClose = () => {
+      if (answered) return;
+      answered = true;
+      resolve(null);
+    };
+
+    rl.once('close', onClose);
+    rl.question(prompt, (answer) => {
+      if (answered) return;
+      answered = true;
+      rl.removeListener('close', onClose);
+      resolve(answer);
+    });
+  });
+}
+
+async function runInteractiveChat() {
+  restoreTerminal();
+  const rl = readline.createInterface({
+    input: process.stdin,
+    output: process.stdout,
+    terminal: true
+  });
+  let history = [];
+  let exitRequested = false;
+  let activeController = null;
+
+  rl.on('SIGINT', () => {
+    process.stdout.write('\n');
+    rl.close();
+  });
+  rl.on('close', () => {
+    exitRequested = true;
+    if (activeController) activeController.abort();
+  });
+
+  process.stdout.write('AI chat — type /clear to reset or /exit to quit.\n\n');
+
+  try {
+    while (true) {
+      const input = await question(rl, 'You: ');
+      if (input === null) break;
+
+      const prompt = input.trim();
+      const command = prompt.toLowerCase();
+      if (!prompt) continue;
+      if (command === '/exit' || command === '/quit') break;
+      if (command === '/clear') {
+        history = [];
+        process.stdout.write('Conversation cleared.\n\n');
+        continue;
+      }
+
+      let candidate;
+      try {
+        candidate = prepareRequestMessages(history, prompt);
+      } catch (error) {
+        process.stderr.write(`AI error: ${errorMessage(error)}\n\n`);
+        continue;
+      }
+
+      const clearProgress = startProgress(process.stdout, 'AI: thinking…');
+      activeController = new AbortController();
+      try {
+        const response = await requestChat(candidate, { signal: activeController.signal });
+        clearProgress();
+        if (exitRequested) break;
+        process.stdout.write('AI: ');
+        writeLine(response.message);
+        process.stdout.write('\n');
+        history = candidate.concat({ role: 'assistant', content: response.message });
+      } catch (error) {
+        clearProgress();
+        if (exitRequested) break;
+        process.stderr.write(`AI error: ${errorMessage(error)}\n\n`);
+      } finally {
+        activeController = null;
+      }
+    }
+  } finally {
+    rl.close();
+    restoreTerminal();
+  }
+}
+
 function promptMenu() {
   const choices = [
     { label: 'Personal website', value: 'website' },
     { label: 'LinkedIn', value: 'linkedin' },
     { label: 'Download CV', value: 'cv' },
+    { label: 'Chat with AI', value: 'chat' },
     { label: 'Exit', value: 'exit' }
   ];
 
@@ -180,7 +354,7 @@ function promptMenu() {
 
     const render = () => {
       const lines = [];
-      lines.push('Choose an option (↑/↓ + Enter, or 1-4):');
+      lines.push('Choose an option (↑/↓ + Enter, or 1-5):');
       for (let i = 0; i < choices.length; i += 1) {
         const prefix = i === selected ? '❯' : ' ';
         lines.push(`${prefix} ${choices[i].label}`);
@@ -215,7 +389,7 @@ function promptMenu() {
         return;
       }
 
-      if (str === '1' || str === '2' || str === '3' || str === '4') {
+      if (str === '1' || str === '2' || str === '3' || str === '4' || str === '5') {
         selected = Math.max(0, Math.min(choices.length - 1, Number(str) - 1));
         render();
         cleanup();
@@ -260,6 +434,29 @@ async function main() {
     return;
   }
 
+  if (opts.command === 'chat') {
+    const prompt = opts.commandArgs.join(' ').trim();
+    if (prompt) {
+      await runOneShotChat(prompt, opts);
+      return;
+    }
+
+    if (opts.json) {
+      process.stderr.write('Interactive chat does not support --json. Provide a prompt for one-shot JSON output.\n');
+      process.exitCode = 1;
+      return;
+    }
+
+    if (!isInteractiveAllowed(opts)) {
+      process.stderr.write('Chat requires a prompt when input is not an interactive terminal.\n');
+      process.exitCode = 1;
+      return;
+    }
+
+    await runInteractiveChat();
+    return;
+  }
+
   if (opts.json) {
     process.stdout.write(JSON.stringify({ message: MESSAGE, links: LINKS }, null, 2) + '\n');
     return;
@@ -290,7 +487,7 @@ async function main() {
 }
 
 main().catch((err) => {
-  showCursor();
-  process.stderr.write((err && err.stack) ? String(err.stack) + '\n' : String(err) + '\n');
+  restoreTerminal();
+  process.stderr.write((err && err.message) ? String(err.message) + '\n' : 'Unexpected CLI error.\n');
   process.exitCode = 1;
 });

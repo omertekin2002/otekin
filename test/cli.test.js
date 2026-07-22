@@ -1,0 +1,212 @@
+'use strict';
+
+const assert = require('assert');
+const { spawn } = require('child_process');
+const http = require('http');
+const path = require('path');
+const pkg = require('../package.json');
+
+const ROOT = path.resolve(__dirname, '..');
+const CLI = path.join(ROOT, 'bin', 'otekin.js');
+const PROFILE_MESSAGE = "Hello! I'm Ömer, I'm a law & business student currently studying at Koç University";
+
+function runCli(args, env) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, [CLI].concat(args), {
+      cwd: ROOT,
+      env: Object.assign({}, process.env, {
+        OTEKIN_CHAT_API_URL: 'http://127.0.0.1:1/v1/chat'
+      }, env || {}),
+      stdio: ['pipe', 'pipe', 'pipe']
+    });
+    const stdout = [];
+    const stderr = [];
+    const timer = setTimeout(() => {
+      child.kill();
+      reject(new Error(`CLI timed out: ${args.join(' ')}`));
+    }, 5000);
+
+    child.stdout.on('data', (chunk) => stdout.push(chunk));
+    child.stderr.on('data', (chunk) => stderr.push(chunk));
+    child.once('error', (error) => {
+      clearTimeout(timer);
+      reject(error);
+    });
+    child.once('close', (code, signal) => {
+      clearTimeout(timer);
+      resolve({
+        code,
+        signal,
+        stdout: Buffer.concat(stdout).toString('utf8'),
+        stderr: Buffer.concat(stderr).toString('utf8')
+      });
+    });
+    child.stdin.end();
+  });
+}
+
+function listen(handler) {
+  return new Promise((resolve, reject) => {
+    let handlerError = null;
+    const server = http.createServer((request, response) => {
+      Promise.resolve(handler(request, response)).catch((error) => {
+        handlerError = error;
+        if (!response.headersSent) response.writeHead(500);
+        response.end();
+      });
+    });
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', () => {
+      resolve({
+        server,
+        endpoint: `http://127.0.0.1:${server.address().port}/v1/chat`,
+        getHandlerError: () => handlerError
+      });
+    });
+  });
+}
+
+function close(server) {
+  return new Promise((resolve) => server.close(resolve));
+}
+
+async function withServer(handler, run) {
+  const fixture = await listen(handler);
+  try {
+    await run(fixture.endpoint);
+    if (fixture.getHandlerError()) throw fixture.getHandlerError();
+  } finally {
+    await close(fixture.server);
+  }
+}
+
+function readBody(request) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    request.on('data', (chunk) => chunks.push(chunk));
+    request.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')));
+    request.on('error', reject);
+  });
+}
+
+test('CLI help and version include chat without changing version behavior', async () => {
+  const help = await runCli(['--help']);
+  assert.strictEqual(help.code, 0);
+  assert.match(help.stdout, /otekin chat/);
+  assert.match(help.stdout, /\/clear/);
+  assert.strictEqual(help.stderr, '');
+
+  const version = await runCli(['--version']);
+  assert.strictEqual(version.code, 0);
+  assert.strictEqual(version.stdout, `${pkg.version}\n`);
+  assert.strictEqual(version.stderr, '');
+});
+
+test('CLI preserves bare profile JSON output', async () => {
+  const result = await runCli(['--json']);
+  assert.strictEqual(result.code, 0);
+  assert.deepStrictEqual(JSON.parse(result.stdout), {
+    message: PROFILE_MESSAGE,
+    links: {
+      website: 'https://omertekin2002.github.io',
+      linkedin: 'https://www.linkedin.com/in/ömer-tekin/',
+      cv: 'https://omertekin2002.github.io/resume'
+    }
+  });
+  assert.strictEqual(result.stderr, '');
+});
+
+test('CLI preserves profile, CV, and LinkedIn commands', async () => {
+  const profile = await runCli([]);
+  assert.strictEqual(profile.code, 0);
+  assert.match(profile.stdout, new RegExp(PROFILE_MESSAGE.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+  assert.match(profile.stdout, /Links:/);
+
+  const cv = await runCli(['cv', '--no-open']);
+  assert.strictEqual(cv.code, 0);
+  assert.match(cv.stdout, /Link: https:\/\/omertekin2002\.github\.io\/resume/);
+
+  const linkedin = await runCli(['linkedin', '--no-open']);
+  assert.strictEqual(linkedin.code, 0);
+  assert.match(linkedin.stdout, /Link: https:\/\/www\.linkedin\.com/);
+});
+
+test('CLI preserves readable unknown command behavior', async () => {
+  const result = await runCli(['unknown-command']);
+  assert.strictEqual(result.code, 1);
+  assert.match(result.stdout, /Usage:/);
+  assert.match(result.stderr, /Unknown option: unknown-command/);
+});
+
+test('CLI one-shot chat sends the joined prompt and prints only the answer', async () => {
+  await withServer(async (request, response) => {
+    const body = JSON.parse(await readBody(request));
+    assert.strictEqual(request.url, '/v1/chat');
+    assert.deepStrictEqual(body, {
+      messages: [{ role: 'user', content: 'explain this contract' }],
+      stream: false
+    });
+    response.writeHead(200, { 'Content-Type': 'application/json' });
+    response.end(JSON.stringify({ message: 'A concise answer.\n\n', provider: 'fixture' }));
+  }, async (endpoint) => {
+    const result = await runCli(['chat', 'explain', 'this', 'contract'], {
+      OTEKIN_CHAT_API_URL: endpoint
+    });
+    assert.strictEqual(result.code, 0);
+    assert.strictEqual(result.stdout, 'A concise answer.\n');
+    assert.strictEqual(result.stderr, '');
+    assert.doesNotMatch(result.stdout, /Hello! I'm Ömer/);
+  });
+});
+
+test('CLI one-shot --json preserves the complete gateway response', async () => {
+  const gatewayResponse = {
+    message: 'JSON answer',
+    provider: 'fixture',
+    model: 'fixture-model',
+    webSearchQuery: 'fixture query',
+    webSources: [{ url: 'https://example.com' }]
+  };
+
+  await withServer((request, response) => {
+    request.resume();
+    response.writeHead(200, { 'Content-Type': 'application/json' });
+    response.end(JSON.stringify(gatewayResponse));
+  }, async (endpoint) => {
+    const result = await runCli(['--json', 'chat', 'Question'], {
+      OTEKIN_CHAT_API_URL: endpoint
+    });
+    assert.strictEqual(result.code, 0);
+    assert.deepStrictEqual(JSON.parse(result.stdout), gatewayResponse);
+    assert.strictEqual(result.stderr, '');
+  });
+});
+
+test('CLI chat failures are script-friendly and hide response bodies', async () => {
+  await withServer((request, response) => {
+    request.resume();
+    response.writeHead(502, { 'Content-Type': 'application/json' });
+    response.end(JSON.stringify({ error: 'secret internal failure detail' }));
+  }, async (endpoint) => {
+    const result = await runCli(['chat', 'Question'], {
+      OTEKIN_CHAT_API_URL: endpoint
+    });
+    assert.strictEqual(result.code, 1);
+    assert.strictEqual(result.stdout, '');
+    assert.match(result.stderr, /research or model provider failed/i);
+    assert.doesNotMatch(result.stderr, /secret internal failure detail/);
+    assert.doesNotMatch(result.stderr, /\n\s+at /);
+  });
+});
+
+test('CLI rejects promptless non-TTY and promptless JSON chat locally', async () => {
+  const nonTty = await runCli(['chat']);
+  assert.strictEqual(nonTty.code, 1);
+  assert.strictEqual(nonTty.stdout, '');
+  assert.match(nonTty.stderr, /requires a prompt/i);
+
+  const json = await runCli(['chat', '--json']);
+  assert.strictEqual(json.code, 1);
+  assert.strictEqual(json.stdout, '');
+  assert.match(json.stderr, /does not support --json/i);
+});

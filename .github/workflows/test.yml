@@ -1,0 +1,33 @@
+name: Test
+
+on:
+  pull_request:
+  push:
+    branches-ignore:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node-version: [16, 18, 20, 24]
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: ${{ matrix.node-version }}
+
+      - run: npm test
+
+      - run: npm pack --dry-run --json > pack-result.json
+
+      - name: Verify published files
+        run: |
+          node -e "const files = require('./pack-result.json')[0].files.map((item) => item.path); if (!files.includes('bin/otekin.js') || !files.includes('lib/chat-client.js') || files.some((file) => file.startsWith('test/'))) process.exit(1)"

@@ -26,6 +26,10 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
+      - run: npm test
+
+      - run: npm pack --dry-run
+
       - run: |
           npm version patch -m "chore(release): %s [skip ci]"
 

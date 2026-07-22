@@ -1,7 +1,7 @@
 {
   "name": "otekin",
   "version": "0.1.2",
-  "description": "Ömer Tekin terminal profile card (run with `npx otekin`).",
+  "description": "Ömer Tekin terminal profile card and AI chat CLI (run with `npx otekin`).",
   "license": "MIT",
   "author": "Ömer Tekin",
   "repository": {
@@ -13,6 +13,7 @@
   },
   "files": [
     "bin/",
+    "lib/",
     "README.md",
     "LICENSE"
   ],
@@ -20,10 +21,13 @@
     "node": ">=16"
   },
   "scripts": {
-    "start": "node ./bin/otekin.js"
+    "start": "node ./bin/otekin.js",
+    "test": "node ./test/run.js"
   },
   "keywords": [
     "cli",
+    "ai",
+    "chat",
     "npx",
     "profile",
     "terminal"
