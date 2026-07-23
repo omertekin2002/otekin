@@ -29,6 +29,8 @@ Interactive chat keeps context in memory for the current CLI process. Use these 
 
 Blank input simply displays the prompt again. Chat requests are non-streaming, so research-heavy answers may take some time.
 
+Before each chat request, the CLI calls the service's lightweight `GET /healthz` route. This wakes an idle Render free-plan instance before any conversation content is sent. The health check does not invoke research or model providers; a cold start can still take around a minute, and interactive terminals show a brief wake-up notice when it is slow.
+
 Research citations are shown as a compact source row instead of raw redirect URLs. In supported terminals, each numbered source label is clickable. Use `--json` when you need the complete source URLs, snippets, and gateway metadata.
 
 ## Options
@@ -63,6 +65,14 @@ For local development or testing, override the non-secret endpoint:
 
 ```bash
 OTEKIN_CHAT_API_URL=http://localhost:10000/v1/chat npx otekin chat "Hello"
+```
+
+The health URL defaults to `/healthz` on the configured chat endpoint's origin. Override it only when a compatible local service uses a different route:
+
+```bash
+OTEKIN_CHAT_API_URL=http://localhost:10000/v1/chat \
+OTEKIN_CHAT_HEALTH_URL=http://localhost:10000/ready \
+npx otekin chat "Hello"
 ```
 
 CORS restrictions do not affect this Node.js CLI. The override must use an HTTP or HTTPS URL.
