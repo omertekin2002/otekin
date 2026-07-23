@@ -15,7 +15,8 @@ function runCli(args, env) {
     const child = spawn(process.execPath, [CLI].concat(args), {
       cwd: ROOT,
       env: Object.assign({}, process.env, {
-        OTEKIN_CHAT_API_URL: 'http://127.0.0.1:1/v1/chat'
+        OTEKIN_CHAT_API_URL: 'http://127.0.0.1:1/v1/chat',
+        OTEKIN_CHAT_HEALTH_URL: ''
       }, env || {}),
       stdio: ['pipe', 'pipe', 'pipe']
     });
@@ -45,11 +46,28 @@ function runCli(args, env) {
   });
 }
 
-function listen(handler) {
+function listen(handler, healthHandler) {
   return new Promise((resolve, reject) => {
     let handlerError = null;
+    const requests = [];
     const server = http.createServer((request, response) => {
-      Promise.resolve(handler(request, response)).catch((error) => {
+      requests.push({
+        method: request.method,
+        url: request.url,
+        authorization: request.headers.authorization,
+        contentLength: request.headers['content-length']
+      });
+
+      Promise.resolve().then(() => {
+        if (request.method === 'GET' && request.url === '/healthz') {
+          if (healthHandler) return healthHandler(request, response);
+          request.resume();
+          response.writeHead(200, { 'Content-Type': 'application/json' });
+          response.end(JSON.stringify({ ok: true, service: 'fixture' }));
+          return;
+        }
+        return handler(request, response);
+      }).catch((error) => {
         handlerError = error;
         if (!response.headersSent) response.writeHead(500);
         response.end();
@@ -60,7 +78,8 @@ function listen(handler) {
       resolve({
         server,
         endpoint: `http://127.0.0.1:${server.address().port}/v1/chat`,
-        getHandlerError: () => handlerError
+        getHandlerError: () => handlerError,
+        getRequests: () => requests.slice()
       });
     });
   });
@@ -70,10 +89,10 @@ function close(server) {
   return new Promise((resolve) => server.close(resolve));
 }
 
-async function withServer(handler, run) {
-  const fixture = await listen(handler);
+async function withServer(handler, run, healthHandler) {
+  const fixture = await listen(handler, healthHandler);
   try {
-    await run(fixture.endpoint);
+    await run(fixture.endpoint, fixture);
     if (fixture.getHandlerError()) throw fixture.getHandlerError();
   } finally {
     await close(fixture.server);
@@ -148,7 +167,7 @@ test('CLI one-shot chat sends the joined prompt and prints only the answer', asy
     });
     response.writeHead(200, { 'Content-Type': 'application/json' });
     response.end(JSON.stringify({ message: 'A concise answer.\n\n', provider: 'fixture' }));
-  }, async (endpoint) => {
+  }, async (endpoint, fixture) => {
     const result = await runCli(['chat', 'explain', 'this', 'contract'], {
       OTEKIN_CHAT_API_URL: endpoint
     });
@@ -156,6 +175,15 @@ test('CLI one-shot chat sends the joined prompt and prints only the answer', asy
     assert.strictEqual(result.stdout, 'A concise answer.\n');
     assert.strictEqual(result.stderr, '');
     assert.doesNotMatch(result.stdout, /Hello! I'm Ömer/);
+    const requests = fixture.getRequests();
+    assert.deepStrictEqual(
+      requests.map((request) => `${request.method} ${request.url}`),
+      ['GET /healthz', 'POST /v1/chat']
+    );
+    assert.strictEqual(requests[0].authorization, undefined);
+    assert.strictEqual(requests[0].contentLength, undefined);
+    assert.strictEqual(requests[1].authorization, undefined);
+    assert(Number(requests[1].contentLength) > 0);
   });
 });
 
@@ -216,6 +244,32 @@ test('CLI chat failures are script-friendly and hide response bodies', async () 
     assert.match(result.stderr, /research or model provider failed/i);
     assert.doesNotMatch(result.stderr, /secret internal failure detail/);
     assert.doesNotMatch(result.stderr, /\n\s+at /);
+  });
+});
+
+test('CLI does not send conversation data when the health check fails', async () => {
+  let chatRequests = 0;
+  await withServer((request, response) => {
+    chatRequests += 1;
+    request.resume();
+    response.writeHead(200, { 'Content-Type': 'application/json' });
+    response.end(JSON.stringify({ message: 'Should not be reached.' }));
+  }, async (endpoint, fixture) => {
+    const result = await runCli(['chat', 'Private question'], {
+      OTEKIN_CHAT_API_URL: endpoint
+    });
+    assert.strictEqual(result.code, 1);
+    assert.strictEqual(result.stdout, '');
+    assert.match(result.stderr, /health check failed/i);
+    assert.strictEqual(chatRequests, 0);
+    assert.deepStrictEqual(
+      fixture.getRequests().map((request) => `${request.method} ${request.url}`),
+      ['GET /healthz']
+    );
+  }, (request, response) => {
+    request.resume();
+    response.writeHead(500, { 'Content-Type': 'application/json' });
+    response.end(JSON.stringify({ error: 'unavailable' }));
   });
 });
 

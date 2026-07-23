@@ -7,6 +7,8 @@ const {
   MAX_MESSAGES,
   MAX_TOTAL_CHARACTERS,
   ChatApiError,
+  checkChatService,
+  ensureChatServiceAwake,
   prepareRequestMessages,
   requestChat
 } = require('../lib/chat-client');
@@ -45,6 +47,98 @@ function readBody(request) {
     request.on('error', reject);
   });
 }
+
+test('ensureChatServiceAwake checks /healthz without auth or conversation data', async () => {
+  await withServer((request, response) => {
+    request.resume();
+    assert.strictEqual(request.method, 'GET');
+    assert.strictEqual(request.url, '/healthz');
+    assert.strictEqual(request.headers.accept, 'application/json');
+    assert.strictEqual(request.headers.authorization, undefined);
+    assert.strictEqual(request.headers['content-length'], undefined);
+    response.writeHead(200, { 'Content-Type': 'application/json' });
+    response.end(JSON.stringify({ ok: true, service: 'signloop-chat-service' }));
+  }, async (endpoint) => {
+    const result = await ensureChatServiceAwake({ endpoint });
+    assert.deepStrictEqual(result, { ok: true, service: 'signloop-chat-service' });
+  });
+});
+
+test('ensureChatServiceAwake retries transient wake-up responses', async () => {
+  let requests = 0;
+  await withServer((request, response) => {
+    request.resume();
+    requests += 1;
+    if (requests < 3) {
+      response.writeHead(503, { 'Content-Type': 'application/json' });
+      response.end(JSON.stringify({ error: 'starting' }));
+      return;
+    }
+    response.writeHead(200, { 'Content-Type': 'application/json' });
+    response.end(JSON.stringify({ ok: true, service: 'signloop-chat-service' }));
+  }, async (endpoint) => {
+    const result = await ensureChatServiceAwake({
+      endpoint,
+      attempts: 3,
+      retryDelayMs: 1,
+      timeoutMs: 1000
+    });
+    assert.strictEqual(result.ok, true);
+    assert.strictEqual(requests, 3);
+  });
+});
+
+test('checkChatService supports an explicit health endpoint override', async () => {
+  await withServer((request, response) => {
+    request.resume();
+    assert.strictEqual(request.url, '/ready');
+    response.writeHead(200, { 'Content-Type': 'application/json' });
+    response.end(JSON.stringify({ ok: true, service: 'custom-fixture' }));
+  }, async (endpoint) => {
+    const healthEndpoint = endpoint.replace('/v1/chat', '/ready');
+    const result = await checkChatService({ endpoint, healthEndpoint });
+    assert.strictEqual(result.service, 'custom-fixture');
+  });
+});
+
+test('checkChatService rejects invalid health responses and unsupported URLs', async () => {
+  await withServer((request, response) => {
+    request.resume();
+    response.writeHead(200, { 'Content-Type': 'application/json' });
+    response.end(JSON.stringify({ ok: false }));
+  }, async (endpoint) => {
+    await assert.rejects(checkChatService({ endpoint }), /invalid health response/i);
+  });
+
+  await assert.rejects(
+    checkChatService({ healthEndpoint: 'file:///tmp/healthz' }),
+    /HTTP or HTTPS/i
+  );
+});
+
+test('checkChatService bounds wake-up time and response size', async () => {
+  await withServer((request, response) => {
+    request.resume();
+    setTimeout(() => {
+      if (!response.destroyed) {
+        response.end(JSON.stringify({ ok: true, service: 'late' }));
+      }
+    }, 100);
+  }, async (endpoint) => {
+    await assert.rejects(checkChatService({ endpoint, timeoutMs: 15 }), /too long to wake/i);
+  });
+
+  await withServer((request, response) => {
+    request.resume();
+    response.writeHead(200, { 'Content-Type': 'application/json' });
+    response.end(JSON.stringify({ ok: true, padding: 'x'.repeat(128) }));
+  }, async (endpoint) => {
+    await assert.rejects(
+      checkChatService({ endpoint, maxResponseBytes: 32 }),
+      /health response was too large/i
+    );
+  });
+});
 
 test('requestChat sends the exact dependency-free gateway contract', async () => {
   await withServer(async (request, response) => {

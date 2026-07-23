@@ -4,7 +4,11 @@
 const { spawn } = require('child_process');
 const readline = require('readline');
 const pkg = require('../package.json');
-const { requestChat, prepareRequestMessages } = require('../lib/chat-client');
+const {
+  requestChat,
+  prepareRequestMessages,
+  ensureChatServiceAwake
+} = require('../lib/chat-client');
 const { formatChatResponse } = require('../lib/chat-format');
 
 const MESSAGE = "Hello! I'm Ömer, I'm a law & business student currently studying at Koç University";
@@ -51,6 +55,7 @@ Interactive chat commands:
 
 Environment:
   OTEKIN_CHAT_API_URL      Override the HTTP(S) chat endpoint (no API key required)
+  OTEKIN_CHAT_HEALTH_URL   Override its HTTP(S) health endpoint (defaults to /healthz)
 `.trim();
 
   process.stdout.write(help + '\n');
@@ -213,6 +218,20 @@ function startProgress(stream, message) {
   };
 }
 
+function startDelayedProgress(stream, message, delayMs) {
+  if (!stream.isTTY) return () => {};
+
+  let clearProgress = () => {};
+  const timer = setTimeout(() => {
+    clearProgress = startProgress(stream, message);
+  }, delayMs);
+
+  return () => {
+    clearTimeout(timer);
+    clearProgress();
+  };
+}
+
 function errorMessage(error) {
   return error && error.message ? String(error.message) : 'Chat request failed.';
 }
@@ -222,6 +241,21 @@ async function runOneShotChat(prompt, opts) {
   try {
     messages = prepareRequestMessages([], prompt);
   } catch (error) {
+    process.stderr.write(`Chat error: ${errorMessage(error)}\n`);
+    process.exitCode = 1;
+    return;
+  }
+
+  const clearWakeProgress = startDelayedProgress(
+    process.stderr,
+    'AI: waking chat service…',
+    750
+  );
+  try {
+    await ensureChatServiceAwake();
+    clearWakeProgress();
+  } catch (error) {
+    clearWakeProgress();
     process.stderr.write(`Chat error: ${errorMessage(error)}\n`);
     process.exitCode = 1;
     return;
@@ -307,9 +341,18 @@ async function runInteractiveChat() {
         continue;
       }
 
-      const clearProgress = startProgress(process.stdout, 'AI: thinking…');
       activeController = new AbortController();
+      const clearWakeProgress = startDelayedProgress(
+        process.stdout,
+        'AI: waking chat service…',
+        750
+      );
+      let clearProgress = () => {};
       try {
+        await ensureChatServiceAwake({ signal: activeController.signal });
+        clearWakeProgress();
+        if (exitRequested) break;
+        clearProgress = startProgress(process.stdout, 'AI: thinking…');
         const response = await requestChat(candidate, { signal: activeController.signal });
         clearProgress();
         if (exitRequested) break;
@@ -318,6 +361,7 @@ async function runInteractiveChat() {
         process.stdout.write('\n');
         history = candidate.concat({ role: 'assistant', content: response.message });
       } catch (error) {
+        clearWakeProgress();
         clearProgress();
         if (exitRequested) break;
         process.stderr.write(`AI error: ${errorMessage(error)}\n\n`);
