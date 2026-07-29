@@ -113,6 +113,7 @@ test('CLI help and version include chat without changing version behavior', asyn
   assert.strictEqual(help.code, 0);
   assert.match(help.stdout, /otekin chat/);
   assert.match(help.stdout, /\/clear/);
+  assert.match(help.stdout, /--research <mode>/);
   assert.strictEqual(help.stderr, '');
 
   const version = await runCli(['--version']);
@@ -163,7 +164,8 @@ test('CLI one-shot chat sends the joined prompt and prints only the answer', asy
     assert.strictEqual(request.url, '/v1/chat');
     assert.deepStrictEqual(body, {
       messages: [{ role: 'user', content: 'explain this contract' }],
-      stream: false
+      stream: false,
+      research: 'auto'
     });
     response.writeHead(200, { 'Content-Type': 'application/json' });
     response.end(JSON.stringify({ message: 'A concise answer.\n\n', provider: 'fixture' }));
@@ -185,6 +187,29 @@ test('CLI one-shot chat sends the joined prompt and prints only the answer', asy
     assert.strictEqual(requests[1].authorization, undefined);
     assert(Number(requests[1].contentLength) > 0);
   });
+});
+
+test('CLI forwards an explicit research mode and rejects invalid modes locally', async () => {
+  await withServer(async (request, response) => {
+    const body = JSON.parse(await readBody(request));
+    assert.strictEqual(body.research, 'always');
+    response.writeHead(200, { 'Content-Type': 'application/json' });
+    response.end(JSON.stringify({ message: 'Grounded answer.' }));
+  }, async (endpoint) => {
+    const result = await runCli(
+      ['chat', 'Find', 'current', 'sources', '--research', 'always'],
+      { OTEKIN_CHAT_API_URL: endpoint }
+    );
+    assert.strictEqual(result.code, 0);
+    assert.strictEqual(result.stdout, 'Grounded answer.\n');
+    assert.strictEqual(result.stderr, '');
+  });
+
+  const invalid = await runCli(['chat', 'Question', '--research=sometimes']);
+  assert.strictEqual(invalid.code, 1);
+  assert.strictEqual(invalid.stdout, '');
+  assert.match(invalid.stderr, /must be auto, always, or never/i);
+  assert.doesNotMatch(invalid.stderr, /Unable to wake|Unable to reach/i);
 });
 
 test('CLI one-shot --json preserves the complete gateway response', async () => {
@@ -230,18 +255,26 @@ test('CLI compacts researched source links in ordinary output', async () => {
   });
 });
 
-test('CLI chat failures are script-friendly and hide response bodies', async () => {
+test('CLI chat failures show safe categories and request IDs while hiding response bodies', async () => {
   await withServer((request, response) => {
     request.resume();
-    response.writeHead(502, { 'Content-Type': 'application/json' });
-    response.end(JSON.stringify({ error: 'secret internal failure detail' }));
+    response.writeHead(502, {
+      'Content-Type': 'application/json',
+      'X-Request-ID': 'gateway-request-123'
+    });
+    response.end(JSON.stringify({
+      error: 'secret internal failure detail',
+      code: 'research_unavailable'
+    }));
   }, async (endpoint) => {
     const result = await runCli(['chat', 'Question'], {
       OTEKIN_CHAT_API_URL: endpoint
     });
     assert.strictEqual(result.code, 1);
     assert.strictEqual(result.stdout, '');
-    assert.match(result.stderr, /research or model provider failed/i);
+    assert.match(result.stderr, /grounded web research is temporarily unavailable/i);
+    assert.match(result.stderr, /Request ID: gateway-request-123/);
+    assert.match(result.stderr, /--research never/);
     assert.doesNotMatch(result.stderr, /secret internal failure detail/);
     assert.doesNotMatch(result.stderr, /\n\s+at /);
   });

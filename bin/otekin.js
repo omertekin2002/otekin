@@ -7,7 +7,8 @@ const pkg = require('../package.json');
 const {
   requestChat,
   prepareRequestMessages,
-  ensureChatServiceAwake
+  ensureChatServiceAwake,
+  normalizeResearchMode
 } = require('../lib/chat-client');
 const { formatChatResponse } = require('../lib/chat-format');
 
@@ -34,6 +35,7 @@ Options:
   -v, --version           Show version
   --non-interactive       Print text + links and exit (no prompt)
   --json                  Output profile or one-shot chat JSON and exit
+  --research <mode>       Chat research: auto | always | never (default: auto)
   --no-open               Don't open links in a browser (print them instead)
   --cv, --resume          Open the CV download link directly
   -s, --select <choice>   Skip the prompt and select: website | linkedin | cv | chat | exit
@@ -46,6 +48,8 @@ Examples:
   npx otekin --cv
   npx otekin --select website --no-open
   npx otekin chat "Explain quantum computing"
+  npx otekin chat "What changed today?" --research always
+  npx otekin chat "Rewrite this paragraph" --research never
   npx otekin chat "Explain this" --json
   npx otekin --select chat
 
@@ -67,6 +71,7 @@ function parseArgs(argv) {
     version: false,
     nonInteractive: false,
     json: false,
+    researchMode: undefined,
     noOpen: false,
     select: null,
     command: null,
@@ -79,7 +84,13 @@ function parseArgs(argv) {
     else if (a === '-v' || a === '--version') opts.version = true;
     else if (a === '--non-interactive' || a === '--no-interactive') opts.nonInteractive = true;
     else if (a === '--json') opts.json = true;
-    else if (a === '--no-open') opts.noOpen = true;
+    else if (a === '--research') {
+      const value = argv[i + 1];
+      opts.researchMode = value && !value.startsWith('-') ? value : '';
+      if (opts.researchMode) i += 1;
+    } else if (a.startsWith('--research=')) {
+      opts.researchMode = a.slice('--research='.length);
+    } else if (a === '--no-open') opts.noOpen = true;
     else if (a === '--cv' || a === '--resume') opts.select = 'cv';
     else if (a === '-s' || a === '--select') {
       opts.select = argv[i + 1] ?? null;
@@ -151,7 +162,7 @@ async function handleChoice(choice, opts) {
       process.exitCode = 1;
       return;
     }
-    await runInteractiveChat();
+    await runInteractiveChat(opts);
     return;
   }
 
@@ -233,7 +244,12 @@ function startDelayedProgress(stream, message, delayMs) {
 }
 
 function errorMessage(error) {
-  return error && error.message ? String(error.message) : 'Chat request failed.';
+  const message = error && error.message ? String(error.message) : 'Chat request failed.';
+  const requestId = error && typeof error.requestId === 'string'
+    ? error.requestId.trim()
+    : '';
+  if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(requestId)) return message;
+  return `${message} (Request ID: ${requestId})`;
 }
 
 async function runOneShotChat(prompt, opts) {
@@ -263,7 +279,7 @@ async function runOneShotChat(prompt, opts) {
 
   const clearProgress = startProgress(process.stderr, 'AI: thinking…');
   try {
-    const response = await requestChat(messages);
+    const response = await requestChat(messages, { researchMode: opts.researchMode });
     clearProgress();
     if (opts.json) {
       process.stdout.write(JSON.stringify(response, null, 2) + '\n');
@@ -296,7 +312,7 @@ function question(rl, prompt) {
   });
 }
 
-async function runInteractiveChat() {
+async function runInteractiveChat(opts) {
   restoreTerminal();
   const rl = readline.createInterface({
     input: process.stdin,
@@ -353,7 +369,10 @@ async function runInteractiveChat() {
         clearWakeProgress();
         if (exitRequested) break;
         clearProgress = startProgress(process.stdout, 'AI: thinking…');
-        const response = await requestChat(candidate, { signal: activeController.signal });
+        const response = await requestChat(candidate, {
+          signal: activeController.signal,
+          researchMode: opts.researchMode
+        });
         clearProgress();
         if (exitRequested) break;
         process.stdout.write('AI: ');
@@ -479,6 +498,14 @@ async function main() {
     return;
   }
 
+  try {
+    opts.researchMode = normalizeResearchMode(opts.researchMode);
+  } catch (error) {
+    process.stderr.write(`${errorMessage(error)}\n`);
+    process.exitCode = 1;
+    return;
+  }
+
   if (opts.command === 'chat') {
     const prompt = opts.commandArgs.join(' ').trim();
     if (prompt) {
@@ -498,7 +525,7 @@ async function main() {
       return;
     }
 
-    await runInteractiveChat();
+    await runInteractiveChat(opts);
     return;
   }
 

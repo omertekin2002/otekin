@@ -7,8 +7,10 @@ const {
   MAX_MESSAGES,
   MAX_TOTAL_CHARACTERS,
   ChatApiError,
+  RESEARCH_MODES,
   checkChatService,
   ensureChatServiceAwake,
+  normalizeResearchMode,
   prepareRequestMessages,
   requestChat
 } = require('../lib/chat-client');
@@ -148,9 +150,10 @@ test('requestChat sends the exact dependency-free gateway contract', async () =>
     assert.strictEqual(request.headers['content-type'], 'application/json');
     assert.strictEqual(request.headers.accept, 'application/json');
     assert.strictEqual(request.headers.authorization, undefined);
-    assert.deepStrictEqual(Object.keys(body).sort(), ['messages', 'stream']);
+    assert.deepStrictEqual(Object.keys(body).sort(), ['messages', 'research', 'stream']);
     assert.deepStrictEqual(body.messages, [{ role: 'user', content: 'Hello' }]);
     assert.strictEqual(body.stream, false);
+    assert.strictEqual(body.research, 'auto');
     assert.strictEqual(Number(request.headers['content-length']), Buffer.byteLength(JSON.stringify(body)));
 
     response.writeHead(200, { 'Content-Type': 'application/json' });
@@ -161,6 +164,34 @@ test('requestChat sends the exact dependency-free gateway contract', async () =>
   });
 });
 
+test('requestChat validates and forwards every research mode', async () => {
+  const receivedModes = [];
+  await withServer(async (request, response) => {
+    const body = JSON.parse(await readBody(request));
+    receivedModes.push(body.research);
+    response.writeHead(200, { 'Content-Type': 'application/json' });
+    response.end(JSON.stringify({ message: 'Hi' }));
+  }, async (endpoint) => {
+    for (const researchMode of RESEARCH_MODES) {
+      await requestChat([{ role: 'user', content: 'Hello' }], {
+        endpoint,
+        researchMode
+      });
+    }
+
+    await assert.rejects(
+      requestChat([{ role: 'user', content: 'Hello' }], {
+        endpoint,
+        researchMode: 'sometimes'
+      }),
+      /must be auto, always, or never/i
+    );
+  });
+
+  assert.deepStrictEqual(receivedModes, RESEARCH_MODES);
+  assert.strictEqual(normalizeResearchMode(' ALWAYS '), 'always');
+});
+
 test('requestChat maps non-success responses and captures safe metadata', async () => {
   await withServer((request, response) => {
     request.resume();
@@ -169,7 +200,10 @@ test('requestChat maps non-success responses and captures safe metadata', async 
       'Retry-After': '12',
       'X-Request-ID': 'request-fixture'
     });
-    response.end(JSON.stringify({ error: 'internal provider detail' }));
+    response.end(JSON.stringify({
+      error: 'internal provider detail',
+      code: 'service_busy'
+    }));
   }, async (endpoint) => {
     await assert.rejects(
       requestChat([{ role: 'user', content: 'Hello' }], { endpoint }),
@@ -178,11 +212,47 @@ test('requestChat maps non-success responses and captures safe metadata', async 
         assert.strictEqual(error.statusCode, 429);
         assert.strictEqual(error.retryAfter, '12');
         assert.strictEqual(error.requestId, 'request-fixture');
+        assert.strictEqual(error.code, 'service_busy');
         assert.match(error.message, /busy/i);
         assert.doesNotMatch(error.message, /internal provider detail/);
         return true;
       }
     );
+  });
+});
+
+test('requestChat maps safe gateway error codes without exposing response messages', async () => {
+  const fixtures = [
+    [502, 'research_unavailable', /grounded web research/i],
+    [502, 'generation_unavailable', /generation is temporarily unavailable/i],
+    [504, 'request_timeout', /timed out/i],
+    [400, 'invalid_request', /request or conversation was invalid/i]
+  ];
+  let responseIndex = 0;
+
+  await withServer((request, response) => {
+    request.resume();
+    const [statusCode, code] = fixtures[responseIndex];
+    responseIndex += 1;
+    response.writeHead(statusCode, {
+      'Content-Type': 'application/json',
+      'X-Request-ID': `safe-error-${responseIndex}`
+    });
+    response.end(JSON.stringify({ error: 'private upstream detail', code }));
+  }, async (endpoint) => {
+    for (const [statusCode, code, messagePattern] of fixtures) {
+      await assert.rejects(
+        requestChat([{ role: 'user', content: 'Hello' }], { endpoint }),
+        (error) => {
+          assert(error instanceof ChatApiError);
+          assert.strictEqual(error.statusCode, statusCode);
+          assert.strictEqual(error.code, code);
+          assert.match(error.message, messagePattern);
+          assert.doesNotMatch(error.message, /private upstream detail/i);
+          return true;
+        }
+      );
+    }
   });
 });
 

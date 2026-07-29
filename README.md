@@ -16,6 +16,8 @@ No API key or additional package is required. Ask a one-shot question, start an 
 
 ```bash
 npx otekin chat "What happened today?"
+npx otekin chat "What happened today?" --research always
+npx otekin chat "Rewrite this paragraph" --research never
 npx otekin chat
 npx otekin chat "Explain this" --json
 npx otekin --select chat
@@ -29,6 +31,8 @@ Interactive chat keeps context in memory for the current CLI process. Use these 
 
 Blank input simply displays the prompt again. Chat requests are non-streaming, so research-heavy answers may take some time.
 
+Research defaults to `auto`: current, volatile, or explicitly sourced questions can use grounded web research, while ordinary conversation goes directly to generation. Use `--research always` to require grounded sources or `--research never` to skip research for that invocation. The selected mode also applies to every turn of an interactive chat session.
+
 Before each chat request, the CLI calls the service's lightweight `GET /healthz` route. This wakes an idle Render free-plan instance before any conversation content is sent. The health check does not invoke research or model providers; a cold start can still take around a minute, and interactive terminals show a brief wake-up notice when it is slow.
 
 Research citations are shown as a compact source row instead of raw redirect URLs. In supported terminals, each numbered source label is clickable. Use `--json` when you need the complete source URLs, snippets, and gateway metadata.
@@ -40,6 +44,7 @@ Research citations are shown as a compact source row instead of raw redirect URL
 - `--cv`, `--resume`: open the CV link directly.
 - `--select <website|linkedin|cv|chat|exit>`: skip the menu and choose an option.
 - `--json`: output profile JSON, or preserve the complete response object for a one-shot chat.
+- `--research <auto|always|never>`: control grounded research for one-shot or interactive chat; defaults to `auto`.
 - `--help`, `--version`: print CLI help or the package version.
 
 ## Examples
@@ -52,14 +57,18 @@ npx otekin --cv
 npx otekin --select website --no-open
 npx otekin --select cv --no-open
 npx otekin chat "Explain quantum computing simply"
+npx otekin chat "Find sources on recent EU AI Act changes" --research always
+npx otekin chat "Rewrite this sentence" --research never
 npx otekin --json chat "What changed recently in EU AI regulation?"
 ```
 
 ## Chat service and privacy
 
-Chat uses the public SLgateway endpoint and requires no API key. The endpoint performs web research for every turn. Conversation history is stored only in CLI memory; the complete bounded history is sent again on subsequent turns so the assistant can preserve context.
+Chat uses the public SLgateway endpoint and requires no API key. In the default `auto` mode, the endpoint researches only requests that clearly need current information or sources; failed automatic research falls back to ordinary generation. `always` requires grounded research, while `never` bypasses it. Conversation history is stored only in CLI memory; the complete bounded history is sent again on subsequent turns so the assistant can preserve context.
 
-Conversation content is transmitted to SLgateway and its configured research and model providers. Calling the public endpoint can consume those providers' resources. Do not send sensitive content you would not want processed by those services.
+Conversation content is transmitted to SLgateway and its configured model provider. It is also sent to the configured research provider when the selected research policy enables research. Calling the public endpoint can consume those providers' resources. Do not send sensitive content you would not want processed by those services.
+
+When the gateway returns a safe structured failure, the CLI shows a specific category and its request ID. The request ID can be used to correlate server logs without exposing provider responses or credentials.
 
 For local development or testing, override the non-secret endpoint:
 
