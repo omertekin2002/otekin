@@ -101,3 +101,12 @@ test('saves optional generated PNGs without printing or mutating base64 payloads
     fs.rmSync(directory, { recursive: true, force: true });
   }
 });
+
+test('terminal answers style Markdown without altering code blocks or plain output', () => {
+  const message = '# Heading\n**Important** and `code`\n```js\nconst x = "**literal**";\n```';
+  const styled = formatChatResponse({ message }, { color: true });
+  assert.match(styled, /\u001b\[1mHeading/);
+  assert.match(styled, /\u001b\[1mImportant/);
+  assert.match(styled, /const x = "\*\*literal\*\*";/);
+  assert.strictEqual(formatChatResponse({ message }), message);
+});

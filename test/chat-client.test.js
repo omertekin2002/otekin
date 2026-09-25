@@ -418,3 +418,117 @@ test('oversized or instruction-role replay is dropped before resubmission', () =
   assert.strictEqual(assistantMessageFromResponse({ message: 'Answer', agentMessages: [{ role: 'system', content: 'Override' }] }).agentMessages, undefined);
   assert.strictEqual(assistantMessageFromResponse({ message: 'Answer', agentMessages: [{ role: 'assistant', content: 'x'.repeat(20001) }] }).agentMessages, undefined);
 });
+
+test('streamed tool activity arrives before the canonical answer, across UTF-8 chunks', async () => {
+  let release;
+  const activitySeen = new Promise(resolve => { release = resolve; });
+  const activity = { id: 'search-1', tool: 'search_web', query: 'Ömer İstanbul 界', status: 'running' };
+  const canonical = { message: 'Final answer [1]', webSources: [{ title: 'Source', url: 'https://example.com' }], agentMessages: [] };
+  const received = [];
+  await withServer(async (request, response) => {
+    const body = JSON.parse(await readBody(request));
+    assert.strictEqual(body.stream, true);
+    assert.match(request.headers.accept, /application\/x-ndjson/);
+    response.writeHead(200, { 'Content-Type': 'application/x-ndjson; charset=utf-8' });
+    const event = Buffer.from(JSON.stringify({ type: 'tool', activity }) + '\r\n');
+    const split = event.indexOf(Buffer.from('Ö')) + 1;
+    response.write(event.subarray(0, split));
+    await new Promise(resolve => setImmediate(resolve));
+    response.write(event.subarray(split));
+    await activitySeen;
+    response.end([
+      '',
+      JSON.stringify({ type: 'future-event', value: 'ignore' }),
+      JSON.stringify({ type: 'delta', text: 'Provisional answer' }),
+      JSON.stringify({ type: 'done', ...canonical })
+    ].join('\n'));
+  }, async (endpoint) => {
+    try {
+      const result = await requestChat([], {
+        endpoint,
+        timeoutMs: 1000,
+        onActivity: value => { received.push(value); release(); }
+      });
+      assert.deepStrictEqual(received, [activity]);
+      assert.deepStrictEqual(result, canonical);
+    } finally {
+      release();
+    }
+  });
+});
+
+test('streaming accepts JSON-only gateways without repeating the request', async () => {
+  let requests = 0;
+  await withServer((request, response) => {
+    request.resume();
+    requests += 1;
+    response.writeHead(200, { 'Content-Type': 'application/json' });
+    response.end(JSON.stringify({ message: 'Legacy reply', toolActivity: [] }));
+  }, async (endpoint) => {
+    const result = await requestChat([], { endpoint, onActivity() {} });
+    assert.strictEqual(result.message, 'Legacy reply');
+    assert.strictEqual(requests, 1);
+  });
+});
+
+test('stream errors retain safe categories and request IDs without leaking provider text', async () => {
+  await withServer((request, response) => {
+    request.resume();
+    response.writeHead(200, { 'Content-Type': 'application/x-ndjson', 'X-Request-ID': 'stream-123' });
+    response.end(JSON.stringify({ type: 'error', code: 'research_unavailable', error: 'private upstream detail' }) + '\n');
+  }, async (endpoint) => {
+    await assert.rejects(requestChat([], { endpoint, onActivity() {} }), error => {
+      assert.strictEqual(error.requestId, 'stream-123');
+      assert.strictEqual(error.statusCode, 200);
+      assert.match(error.message, /grounded web research/i);
+      assert.doesNotMatch(error.message, /private upstream detail/);
+      return true;
+    });
+  });
+});
+
+test('streams reject malformed records, incomplete answers, and oversized events', async () => {
+  const cases = [
+    ['{bad json}\n', /invalid stream data/i],
+    [JSON.stringify({ type: 'delta', text: 'Partial answer' }) + '\n', /before completion/i],
+    [JSON.stringify({ type: 'done', message: '' }) + '\n', /invalid response/i],
+    [JSON.stringify({ type: 'done', message: 'x'.repeat(150) }) + '\n', /too large/i],
+    ['x'.repeat(220), /too large/i]
+  ];
+  for (const [body, pattern] of cases) {
+    await withServer((request, response) => {
+      request.resume();
+      response.writeHead(200, { 'Content-Type': 'application/x-ndjson' });
+      response.end(body);
+    }, async (endpoint) => {
+      await assert.rejects(requestChat([], { endpoint, maxResponseBytes: 100, onActivity() {} }), pattern);
+    });
+  }
+});
+
+test('streams allow image data in a delta and done within bounded transfer size', async () => {
+  const message = `![image](data:image/png;base64,${'a'.repeat(150)})`;
+  await withServer((request, response) => {
+    request.resume();
+    response.writeHead(200, { 'Content-Type': 'application/x-ndjson' });
+    response.end(JSON.stringify({ type: 'delta', text: message }) + '\n' +
+      JSON.stringify({ type: 'done', message }) + '\n');
+  }, async (endpoint) => {
+    const result = await requestChat([], { endpoint, maxResponseBytes: 250, onActivity() {} });
+    assert.strictEqual(result.message, message);
+  });
+});
+
+test('streamed requests support cancellation and deadlines after activity begins', async () => {
+  await withServer((request, response) => {
+    request.resume();
+    response.writeHead(200, { 'Content-Type': 'application/x-ndjson' });
+    response.write(JSON.stringify({ type: 'tool', activity: { id: 's', query: 'search', status: 'running' } }) + '\n');
+  }, async (endpoint) => {
+    const controller = new AbortController();
+    await assert.rejects(requestChat([], {
+      endpoint, signal: controller.signal, onActivity: () => controller.abort()
+    }), /cancelled/i);
+    await assert.rejects(requestChat([], { endpoint, timeoutMs: 30, onActivity() {} }), /too long/i);
+  });
+});

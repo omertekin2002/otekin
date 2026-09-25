@@ -218,7 +218,8 @@ test('CLI one-shot --json preserves the complete gateway response', async () => 
     provider: 'fixture',
     model: 'fixture-model',
     webSearchQuery: 'fixture query',
-    webSources: [{ url: 'https://example.com' }]
+    webSources: [{ url: 'https://example.com' }],
+    toolActivity: [{ id: 'search', tool: 'search_web', query: 'fixture query', status: 'complete' }]
   };
 
   await withServer((request, response) => {

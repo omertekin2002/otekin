@@ -29,7 +29,9 @@ Interactive chat keeps context in memory for the current CLI process. Use these 
 - `/exit` or `/quit` ends the session.
 - Ctrl+C also ends the session.
 
-Blank input simply displays the prompt again. Chat requests are non-streaming. The service can take several model and tool steps before answering, and the CLI allows up to five minutes per chat request after waking the service.
+Blank input simply displays the prompt again. In a terminal, chat shows live tool activity: search queries, pages being read, API requests, and image generation. A dim status line shows the current operation and elapsed time; completed steps remain above the answer, and failed tools are marked explicitly. The final answer appears once the gateway finishes, using its canonical citations and image output. The CLI allows up to five minutes per chat request after waking the service.
+
+The terminal interface uses subtle color, clear speaker labels, and lightweight Markdown styling. Set `NO_COLOR=1` to disable color. Piped output stays plain, and `--json` returns the complete response without progress output. One-shot activity goes to stderr so stdout remains usable in pipelines. JSON and fully redirected requests continue to use the non-streaming endpoint contract. Gateways that return JSON to a streaming request display their completed tool activity after the reply arrives.
 
 Research defaults to `auto`: the answering model decides when to search, read pages or PDFs, or fetch public API data. Search results are leads; the model opens sources before citing them. Use `--research always` to require fresh source text fetched during each turn, or `--research never` to disable those research tools. The selected mode also applies to every turn of an interactive chat session. Fresh retrieval does not guarantee that every claim is supported.
 
@@ -68,7 +70,7 @@ npx otekin --json chat "What changed recently in EU AI regulation?"
 
 ## Chat service and privacy
 
-Chat uses the public SLgateway endpoint and requires no API key. In the default `auto` mode, the model chooses its research tools and can continue after a tool failure. `always` requires fresh retrieval during the current turn, while `never` disables research tools. Conversation history, including tool replay and source catalogs, is stored only in CLI memory; bounded history is sent again on subsequent turns. Generated image files are saved separately as described above. The CLI accepts responses up to 24 MiB to accommodate optional images.
+Chat uses the public SLgateway endpoint and requires no API key. In the default `auto` mode, the model chooses its research tools and can continue after a tool failure. `always` requires fresh retrieval during the current turn, while `never` disables research tools. Conversation history, including tool replay and source catalogs, is stored only in CLI memory; bounded history is sent again on subsequent turns. Generated image files are saved separately as described above. The CLI accepts responses up to 24 MiB to accommodate optional images. Streaming transfers are capped at 48 MiB because image data can appear in both a provisional delta and the final reply; each individual event remains limited to 24 MiB.
 
 Conversation content is transmitted to SLgateway and its configured model providers. Tool use can send search queries to search providers, URLs to hosted readers, requests to public API targets, and image prompts to the image provider. Calling the public endpoint can consume those providers' resources. Do not send sensitive content you would not want processed by those services.
 

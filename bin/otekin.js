@@ -13,6 +13,9 @@ const {
 } = require('../lib/chat-client');
 const { formatChatResponse } = require('../lib/chat-format');
 const { saveGeneratedImages } = require('../lib/chat-images');
+const { cleanText, createTheme, clipLine, startProgress, createActivityDisplay } = require('../lib/terminal');
+
+const outputTheme = createTheme(process.stdout);
 
 const MESSAGE = "Hello! I'm Ömer, I'm a law & business student currently studying at Koç University";
 const LINKS = {
@@ -60,6 +63,7 @@ Interactive chat commands:
   /exit, /quit             End the chat session
 
 Environment:
+  NO_COLOR                Disable terminal colors
   OTEKIN_CHAT_API_URL      Override the HTTP(S) chat endpoint (no API key required)
   OTEKIN_CHAT_HEALTH_URL   Override its HTTP(S) health endpoint (defaults to /healthz)
 `.trim();
@@ -218,35 +222,8 @@ function writeLine(value) {
   process.stdout.write(String(value).replace(/(?:\r?\n[ \t]*)+$/, '') + '\n');
 }
 
-function startProgress(stream, message) {
-  if (!stream.isTTY) return () => {};
-
-  let cleared = false;
-  stream.write(message);
-  return () => {
-    if (cleared) return;
-    cleared = true;
-    readline.clearLine(stream, 0);
-    readline.cursorTo(stream, 0);
-  };
-}
-
-function startDelayedProgress(stream, message, delayMs) {
-  if (!stream.isTTY) return () => {};
-
-  let clearProgress = () => {};
-  const timer = setTimeout(() => {
-    clearProgress = startProgress(stream, message);
-  }, delayMs);
-
-  return () => {
-    clearTimeout(timer);
-    clearProgress();
-  };
-}
-
 function errorMessage(error) {
-  const message = error && error.message ? String(error.message) : 'Chat request failed.';
+  const message = error && error.message ? cleanText(error.message) : 'Chat request failed.';
   const requestId = error && typeof error.requestId === 'string'
     ? error.requestId.trim()
     : '';
@@ -264,10 +241,10 @@ async function runOneShotChat(prompt, opts) {
     return;
   }
 
-  const clearWakeProgress = startDelayedProgress(
+  const clearWakeProgress = opts.json ? () => {} : startProgress(
     process.stderr,
-    'AI: waking chat service…',
-    750
+    'Waking chat service',
+    { delayMs: 750 }
   );
   try {
     await ensureChatServiceAwake();
@@ -279,17 +256,25 @@ async function runOneShotChat(prompt, opts) {
     return;
   }
 
-  const clearProgress = startProgress(process.stderr, 'AI: thinking…');
+  const activity = !opts.json && process.stderr.isTTY ? createActivityDisplay(process.stderr) : null;
   try {
-    const response = await requestChat(messages, { researchMode: opts.researchMode });
-    clearProgress();
+    const response = await requestChat(messages, {
+      researchMode: opts.researchMode,
+      onActivity: activity ? activity.onActivity : undefined
+    });
+    if (activity) activity.finish(response);
     if (opts.json) {
       process.stdout.write(JSON.stringify(response, null, 2) + '\n');
     } else {
-      writeLine(formatChatResponse(saveGeneratedImages(response), { hyperlinks: Boolean(process.stdout.isTTY) }));
+      if (outputTheme.interactive) process.stdout.write('\n' + outputTheme.strong('  AI') + '\n\n');
+      writeLine(formatChatResponse(saveGeneratedImages(response), {
+        hyperlinks: outputTheme.interactive,
+        color: outputTheme.color
+      }));
+      if (outputTheme.interactive) process.stdout.write('\n');
     }
   } catch (error) {
-    clearProgress();
+    if (activity) activity.stop();
     process.stderr.write(`Chat error: ${errorMessage(error)}\n`);
     process.exitCode = 1;
   }
@@ -334,11 +319,14 @@ async function runInteractiveChat(opts) {
     if (activeController) activeController.abort();
   });
 
-  process.stdout.write('AI chat — type /clear to reset or /exit to quit.\n\n');
+  process.stdout.write('\n  ' + outputTheme.accent(outputTheme.strong('otekin')) +
+    outputTheme.muted(` / chat   ·   research ${opts.researchMode}`) + '\n');
+  process.stdout.write('  ' + outputTheme.muted('Ask a question. Follow the research as it happens.') + '\n');
+  process.stdout.write('  ' + outputTheme.muted('/clear reset   /exit quit   Ctrl+C cancel & exit') + '\n\n');
 
   try {
     while (true) {
-      const input = await question(rl, 'You: ');
+      const input = await question(rl, outputTheme.accent('  You › '));
       if (input === null) break;
 
       const prompt = input.trim();
@@ -347,7 +335,7 @@ async function runInteractiveChat(opts) {
       if (command === '/exit' || command === '/quit') break;
       if (command === '/clear') {
         history = [];
-        process.stdout.write('Conversation cleared.\n\n');
+        process.stdout.write('\n  ' + outputTheme.muted('Conversation cleared. A fresh start.') + '\n\n');
         continue;
       }
 
@@ -355,38 +343,45 @@ async function runInteractiveChat(opts) {
       try {
         candidate = prepareRequestMessages(history, prompt);
       } catch (error) {
-        process.stderr.write(`AI error: ${errorMessage(error)}\n\n`);
+        process.stderr.write(`\n  ${outputTheme.warning('!')} ${errorMessage(error)}\n\n`);
         continue;
       }
 
       activeController = new AbortController();
-      const clearWakeProgress = startDelayedProgress(
+      process.stdout.write('\n');
+      const clearWakeProgress = startProgress(
         process.stdout,
-        'AI: waking chat service…',
-        750
+        'Waking chat service',
+        { delayMs: 750 }
       );
-      let clearProgress = () => {};
+      let activity = null;
       try {
         await ensureChatServiceAwake({ signal: activeController.signal });
         clearWakeProgress();
         if (exitRequested) break;
-        clearProgress = startProgress(process.stdout, 'AI: thinking…');
+        activity = createActivityDisplay(process.stdout);
         const response = await requestChat(candidate, {
           signal: activeController.signal,
-          researchMode: opts.researchMode
+          researchMode: opts.researchMode,
+          onActivity: activity.onActivity
         });
-        clearProgress();
+        activity.finish(response);
         if (exitRequested) break;
-        process.stdout.write('AI: ');
-        writeLine(formatChatResponse(saveGeneratedImages(response), { hyperlinks: Boolean(process.stdout.isTTY) }));
+        process.stdout.write('\n' + outputTheme.strong('  AI') + '\n\n');
+        writeLine(formatChatResponse(saveGeneratedImages(response), {
+          hyperlinks: outputTheme.interactive,
+          color: outputTheme.color
+        }));
         process.stdout.write('\n');
         history = candidate.concat(assistantMessageFromResponse(response));
       } catch (error) {
         clearWakeProgress();
-        clearProgress();
+        if (activity) activity.stop();
         if (exitRequested) break;
-        process.stderr.write(`AI error: ${errorMessage(error)}\n\n`);
+        process.stderr.write(`  ${outputTheme.warning('!')} ${errorMessage(error)}\n\n`);
       } finally {
+        clearWakeProgress();
+        if (activity) activity.stop();
         activeController = null;
       }
     }
@@ -420,10 +415,12 @@ function promptMenu() {
 
     const render = () => {
       const lines = [];
-      lines.push('Choose an option (↑/↓ + Enter, or 1-5):');
+      const width = Math.max(1, (output.columns || 80) - 3);
+      lines.push('  ' + outputTheme.muted(clipLine('↑/↓ navigate · Enter choose · 1–5 jump', width)));
       for (let i = 0; i < choices.length; i += 1) {
-        const prefix = i === selected ? '❯' : ' ';
-        lines.push(`${prefix} ${choices[i].label}`);
+        const prefix = i === selected ? '›' : ' ';
+        const label = clipLine(`${prefix} ${i + 1}  ${choices[i].label}`, width);
+        lines.push('  ' + (i === selected ? outputTheme.accent(outputTheme.strong(label)) : outputTheme.muted(label)));
       }
       const out = lines.join('\n') + '\n';
 
@@ -536,7 +533,12 @@ async function main() {
     return;
   }
 
-  process.stdout.write(MESSAGE + '\n\n');
+  if (outputTheme.interactive) {
+    process.stdout.write('\n  ' + outputTheme.strong('Ömer Tekin') + outputTheme.muted(' / otekin') + '\n');
+    process.stdout.write('  ' + outputTheme.muted('Law & business student at Koç University') + '\n\n');
+  } else {
+    process.stdout.write(MESSAGE + '\n\n');
+  }
 
   const selectedFromFlag = normalizeSelect(opts.select);
   if (opts.select && !selectedFromFlag) {
