@@ -1,6 +1,6 @@
 {
   "name": "otekin",
-  "version": "0.1.6",
+  "version": "0.1.7",
   "description": "Ömer Tekin terminal profile card and AI chat CLI (run with `npx otekin`).",
   "license": "MIT",
   "author": "Ömer Tekin",
