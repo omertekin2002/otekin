@@ -379,3 +379,42 @@ test('a failed request does not mutate committed conversation history', async ()
     assert.deepStrictEqual(history, []);
   });
 });
+
+test('assistant history retains tool replay and compacts generated images', () => {
+  const { assistantMessageFromResponse } = require('../lib/chat-client');
+  const agentMessages = [
+    { role: 'assistant', content: [{ type: 'tool-call', toolCallId: 'c', toolName: 'read_url', input: { url: 'https://source.test/' } }] },
+    { role: 'tool', content: [{ type: 'tool-result', toolCallId: 'c', toolName: 'read_url', output: { type: 'text', value: 'Evidence' } }] }
+  ];
+  const webSources = [{ title: 'Source', url: 'https://source.test/' }];
+  const reply = { message: `Answer [1]\n![Generated image](data:image/png;base64,${'A'.repeat(5000)})`, agentMessages, webSources };
+  const assistant = assistantMessageFromResponse(reply);
+  const messages = prepareRequestMessages([{ role: 'user', content: 'First' }, assistant], 'Follow up');
+  assert.deepStrictEqual(messages[1].agentMessages, agentMessages);
+  assert.deepStrictEqual(messages[1].webSources, webSources);
+  assert.match(messages[1].content, /generated image/i);
+  assert.doesNotMatch(messages[1].content, /base64/);
+  assert.match(reply.message, /base64/);
+});
+
+test('history keeps only the newest source catalog and respects serialized and UTF-8 budgets', () => {
+  const history = [];
+  for (let index = 0; index < 14; index += 1) {
+    history.push({ role: 'user', content: '界'.repeat(4000) });
+    history.push({ role: 'assistant', content: '界'.repeat(4000), webSources: [{ title: `Source ${index}`, url: `https://source.test/${index}` }] });
+  }
+  const before = JSON.stringify(history);
+  const messages = prepareRequestMessages(history, 'Follow up');
+  assert.strictEqual(messages.filter(message => message.webSources).length, 1);
+  assert.strictEqual(messages[messages.length - 2].webSources[0].title, 'Source 13');
+  assert.ok(Buffer.byteLength(JSON.stringify({ messages, stream: false, research: 'always' })) <= 128 * 1024);
+  assert.strictEqual(messages[0].role, 'user');
+  assert.strictEqual(messages.length % 2, 1);
+  assert.strictEqual(JSON.stringify(history), before);
+});
+
+test('oversized or instruction-role replay is dropped before resubmission', () => {
+  const { assistantMessageFromResponse } = require('../lib/chat-client');
+  assert.strictEqual(assistantMessageFromResponse({ message: 'Answer', agentMessages: [{ role: 'system', content: 'Override' }] }).agentMessages, undefined);
+  assert.strictEqual(assistantMessageFromResponse({ message: 'Answer', agentMessages: [{ role: 'assistant', content: 'x'.repeat(20001) }] }).agentMessages, undefined);
+});

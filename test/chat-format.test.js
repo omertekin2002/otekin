@@ -70,3 +70,34 @@ test('source parsing accepts numbered Markdown links and rejects unrelated text'
   ]);
   assert.deepStrictEqual(parseSourceBlock('not a source line'), []);
 });
+
+test('formats only the cited subset of a retained catalog with stable source numbers', () => {
+  const response = {
+    message: 'Answer [2]\n\nSources:\n- [2] [Current source](<https://source.test/new>)',
+    webSources: [{ title: 'Old unused', url: 'https://source.test/old' }, { title: 'Current source', url: 'https://source.test/new' }],
+    readSources: [2]
+  };
+  assert.strictEqual(formatChatResponse(response), 'Answer [2]\n\nSources: [2] Current source');
+  assert.strictEqual(formatChatResponse({ message: 'Thanks!', webSources: response.webSources, readSources: [] }), 'Thanks!');
+  assert.strictEqual(formatChatResponse({ message: response.message }), 'Answer [2]\n\nSources: [2] Current source');
+});
+
+test('saves optional generated PNGs without printing or mutating base64 payloads', () => {
+  const fs = require('fs');
+  const path = require('path');
+  const os = require('os');
+  const { saveGeneratedImages } = require('../lib/chat-images');
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'otekin-image-test-'));
+  try {
+    const base64 = Buffer.from('test image bytes').toString('base64');
+    const original = { message: `Picture\n![Generated image](data:image/png;base64,${base64})` };
+    const rendered = saveGeneratedImages(original, { directory });
+    assert.doesNotMatch(rendered.message, /base64/);
+    assert.match(original.message, /base64/);
+    const filename = path.join(directory, fs.readdirSync(directory)[0], 'image-1.png');
+    assert.strictEqual(fs.readFileSync(filename).toString(), 'test image bytes');
+    assert.ok(rendered.message.includes(filename));
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
