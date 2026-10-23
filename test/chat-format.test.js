@@ -195,6 +195,42 @@ test('legacy footer fallback preserves explicit IDs and matches missing titles b
   }), 'Answer.\n\nSources: [1] Legacy metadata');
 });
 
+test('mixed footers keep the canonical block when citation numbers would collide', () => {
+  const mixed = 'Answer [2]\n\nSources:\n- [2] [A](https://a.test/)\n- [B](https://b.test/)';
+  assert.strictEqual(formatChatResponse({ message: mixed }), mixed);
+  // A numberless position cannot borrow another catalog source's stable ID.
+  const positional = 'Answer [1]\n\nSources:\n- [1] [A](https://a.test/)\n- [B](https://b.test/)';
+  assert.strictEqual(formatChatResponse({
+    message: positional,
+    webSources: [{ number: 2, title: 'Two', url: 'https://two.test/' }]
+  }), positional);
+  const duplicate = 'Answer [2]\n\nSources:\n- [2] [A](https://a.test/)\n- [2] [B](https://b.test/)';
+  assert.strictEqual(formatChatResponse({ message: duplicate }), duplicate);
+  const sameId = 'Answer [2]\n\nSources:\n- [2] [A](https://a.test/)\n- [Again](https://two.test/)';
+  assert.strictEqual(formatChatResponse({
+    message: sameId,
+    webSources: [{ number: 2, title: 'Two', url: 'https://two.test/' }]
+  }), sameId);
+
+  // Distinct positions and URL matches to distinct stable IDs still format.
+  assert.strictEqual(
+    formatChatResponse({ message: 'Answer [1][2]\n\nSources:\n- [1] [A](https://a.test/)\n- [B](https://b.test/)' }),
+    'Answer [1][2]\n\nSources: [1] A · [2] B'
+  );
+  const resolved = {
+    message: 'Answer [65][2]\n\nSources:\n- [Footer two](https://two.test/)\n- [65] [Footer new](https://new.test/)',
+    webSources: [
+      { number: 65, title: 'New', url: 'https://new.test/' },
+      { number: 1, title: 'Unrelated', url: 'https://wrong.test/' },
+      { number: 2, title: 'Two', url: 'https://two.test/' }
+    ]
+  };
+  assert.strictEqual(formatChatResponse(resolved), 'Answer [65][2]\n\nSources: [2] Two · [65] New');
+  const linked = formatChatResponse(resolved, { hyperlinks: true });
+  assert.ok(linked.includes('\u001B]8;;https://two.test/\u0007[2] Two'));
+  assert.ok(linked.includes('\u001B]8;;https://new.test/\u0007[65] New'));
+});
+
 test('invalid explicit catalog IDs are never treated as numberless legacy entries', () => {
   const message = 'Answer [1]\n\nSources:\n- [1] [Footer](<https://footer.test/>)';
   for (const number of [0, -1, 1.5, NaN, Infinity, Number.MAX_SAFE_INTEGER + 1, '1', null, undefined, true]) {
