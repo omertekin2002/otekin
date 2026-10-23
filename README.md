@@ -37,7 +37,7 @@ Research defaults to `auto`: the answering model decides when to search, read pa
 
 Before each chat request, the CLI calls the service's lightweight `GET /healthz` route. This wakes an idle Render free-plan instance before any conversation content is sent. The health check does not invoke research or model providers; a cold start can still take around a minute, and interactive terminals show a brief wake-up notice when it is slow.
 
-Research citations are shown as a compact source row instead of raw redirect URLs. In supported terminals, each numbered source label is clickable. Use `--json` when you need the complete source URLs, snippets, and gateway metadata.
+Research citations are shown as a compact source row instead of raw redirect URLs. Source labels preserve the gateway's stable citation numbers, so gaps can remain as older sources retire. In supported terminals, each numbered source label is clickable. Use `--json` when you need the complete source URLs, snippets, and gateway metadata.
 
 Interactive history retains the gateway's bounded tool results and source catalog so follow-up questions can use the same evidence and source numbers. Older complete turns are trimmed to stay within the service's character and request-byte limits.
 
