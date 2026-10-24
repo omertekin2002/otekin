@@ -16,8 +16,6 @@ No API key or additional package is required. Ask a one-shot question, start an 
 
 ```bash
 npx otekin chat "What happened today?"
-npx otekin chat "What happened today?" --research always
-npx otekin chat "Rewrite this paragraph" --research never
 npx otekin chat
 npx otekin chat "Explain this" --json
 npx otekin --select chat
@@ -33,7 +31,7 @@ Blank input simply displays the prompt again. In a terminal, chat shows live too
 
 The terminal interface uses subtle color, clear speaker labels, and lightweight Markdown styling. Set `NO_COLOR=1` to disable color. Piped output stays plain, and `--json` returns the complete response without progress output. One-shot activity goes to stderr so stdout remains usable in pipelines. JSON and fully redirected requests continue to use the non-streaming endpoint contract. Gateways that return JSON to a streaming request display their completed tool activity after the reply arrives.
 
-Research defaults to `auto`: the answering model decides when to search, read pages or PDFs, or fetch public API data. Search results are leads; the model opens sources before citing them. Use `--research always` to require fresh source text fetched during each turn, or `--research never` to disable those research tools. The selected mode also applies to every turn of an interactive chat session. Fresh retrieval does not guarantee that every claim is supported.
+Research is automatic: the CLI uses the gateway's default `auto` behavior, in which the answering model decides when to search, read pages or PDFs, or fetch public API data. Search results are leads; the model opens sources before citing them. Fresh retrieval does not guarantee that every claim is supported.
 
 Before each chat request, the CLI calls the service's lightweight `GET /healthz` route. This wakes an idle Render free-plan instance before any conversation content is sent. The health check does not invoke research or model providers; a cold start can still take around a minute, and interactive terminals show a brief wake-up notice when it is slow.
 
@@ -50,7 +48,6 @@ When the service has optional image generation enabled, ask for an image in the 
 - `--cv`, `--resume`: open the CV link directly.
 - `--select <website|linkedin|cv|chat|exit>`: skip the menu and choose an option.
 - `--json`: output profile JSON, or preserve the complete response object for a one-shot chat.
-- `--research <auto|always|never>`: control grounded research for one-shot or interactive chat; defaults to `auto`.
 - `--help`, `--version`: print CLI help or the package version.
 
 ## Examples
@@ -63,14 +60,13 @@ npx otekin --cv
 npx otekin --select website --no-open
 npx otekin --select cv --no-open
 npx otekin chat "Explain quantum computing simply"
-npx otekin chat "Find sources on recent EU AI Act changes" --research always
-npx otekin chat "Rewrite this sentence" --research never
+npx otekin chat "Find sources on recent EU AI Act changes"
 npx otekin --json chat "What changed recently in EU AI regulation?"
 ```
 
 ## Chat service and privacy
 
-Chat uses the public SLgateway endpoint and requires no API key. In the default `auto` mode, the model chooses its research tools and can continue after a tool failure. `always` requires fresh retrieval during the current turn, while `never` disables research tools. Conversation history, including tool replay and source catalogs, is stored only in CLI memory; bounded history is sent again on subsequent turns. Generated image files are saved separately as described above. The CLI accepts responses up to 24 MiB to accommodate optional images. Streaming transfers are capped at 48 MiB because image data can appear in both a provisional delta and the final reply; each individual event remains limited to 24 MiB.
+Chat uses the public SLgateway endpoint and requires no API key. The model chooses its research tools and can continue after a tool failure. Conversation history, including tool replay and source catalogs, is stored only in CLI memory; bounded history is sent again on subsequent turns. Generated image files are saved separately as described above. The CLI accepts responses up to 24 MiB to accommodate optional images. Streaming transfers are capped at 48 MiB because image data can appear in both a provisional delta and the final reply; each individual event remains limited to 24 MiB.
 
 Conversation content is transmitted to SLgateway and its configured model providers. Tool use can send search queries to search providers, URLs to hosted readers, requests to public API targets, and image prompts to the image provider. Calling the public endpoint can consume those providers' resources. Do not send sensitive content you would not want processed by those services.
 
