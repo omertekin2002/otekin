@@ -7,10 +7,8 @@ const {
   MAX_MESSAGES,
   MAX_TOTAL_CHARACTERS,
   ChatApiError,
-  RESEARCH_MODES,
   checkChatService,
   ensureChatServiceAwake,
-  normalizeResearchMode,
   prepareRequestMessages,
   requestChat
 } = require('../lib/chat-client');
@@ -150,10 +148,9 @@ test('requestChat sends the exact dependency-free gateway contract', async () =>
     assert.strictEqual(request.headers['content-type'], 'application/json');
     assert.strictEqual(request.headers.accept, 'application/json');
     assert.strictEqual(request.headers.authorization, undefined);
-    assert.deepStrictEqual(Object.keys(body).sort(), ['messages', 'research', 'stream']);
+    assert.deepStrictEqual(Object.keys(body).sort(), ['messages', 'stream']);
     assert.deepStrictEqual(body.messages, [{ role: 'user', content: 'Hello' }]);
     assert.strictEqual(body.stream, false);
-    assert.strictEqual(body.research, 'auto');
     assert.strictEqual(Number(request.headers['content-length']), Buffer.byteLength(JSON.stringify(body)));
 
     response.writeHead(200, { 'Content-Type': 'application/json' });
@@ -164,32 +161,23 @@ test('requestChat sends the exact dependency-free gateway contract', async () =>
   });
 });
 
-test('requestChat validates and forwards every research mode', async () => {
-  const receivedModes = [];
+test('requestChat omits research so the gateway applies its default auto mode', async () => {
+  const bodies = [];
   await withServer(async (request, response) => {
-    const body = JSON.parse(await readBody(request));
-    receivedModes.push(body.research);
+    bodies.push(JSON.parse(await readBody(request)));
     response.writeHead(200, { 'Content-Type': 'application/json' });
     response.end(JSON.stringify({ message: 'Hi' }));
   }, async (endpoint) => {
-    for (const researchMode of RESEARCH_MODES) {
-      await requestChat([{ role: 'user', content: 'Hello' }], {
-        endpoint,
-        researchMode
-      });
-    }
-
-    await assert.rejects(
-      requestChat([{ role: 'user', content: 'Hello' }], {
-        endpoint,
-        researchMode: 'sometimes'
-      }),
-      /must be auto, always, or never/i
-    );
+    await requestChat([{ role: 'user', content: 'Hello' }], { endpoint, onActivity() {} });
+    // A stale caller option must not reintroduce the field.
+    await requestChat([{ role: 'user', content: 'Hello' }], { endpoint, researchMode: 'always' });
   });
 
-  assert.deepStrictEqual(receivedModes, RESEARCH_MODES);
-  assert.strictEqual(normalizeResearchMode(' ALWAYS '), 'always');
+  assert.deepStrictEqual(bodies.map((body) => Object.keys(body).sort()), [
+    ['messages', 'stream'],
+    ['messages', 'stream']
+  ]);
+  assert.deepStrictEqual(bodies.map((body) => body.stream), [true, false]);
 });
 
 test('requestChat maps non-success responses and captures safe metadata', async () => {
@@ -223,7 +211,6 @@ test('requestChat maps non-success responses and captures safe metadata', async 
 
 test('requestChat maps safe gateway error codes without exposing response messages', async () => {
   const fixtures = [
-    [502, 'research_unavailable', /grounded web research/i],
     [502, 'generation_unavailable', /generation is temporarily unavailable/i],
     [504, 'request_timeout', /timed out/i],
     [400, 'invalid_request', /request or conversation was invalid/i]
@@ -253,6 +240,27 @@ test('requestChat maps safe gateway error codes without exposing response messag
         }
       );
     }
+  });
+});
+
+test('an unexpected research_unavailable code falls back to the generic provider failure', async () => {
+  await withServer((request, response) => {
+    request.resume();
+    response.writeHead(502, { 'Content-Type': 'application/json', 'X-Request-ID': 'legacy-research' });
+    response.end(JSON.stringify({ error: 'private upstream detail', code: 'research_unavailable' }));
+  }, async (endpoint) => {
+    await assert.rejects(
+      requestChat([{ role: 'user', content: 'Hello' }], { endpoint }),
+      (error) => {
+        assert(error instanceof ChatApiError);
+        assert.strictEqual(error.statusCode, 502);
+        assert.strictEqual(error.code, null);
+        assert.strictEqual(error.requestId, 'legacy-research');
+        assert.strictEqual(error.message, 'Chat service research or model provider failed.');
+        assert.doesNotMatch(error.message, /--research|private upstream detail/i);
+        return true;
+      }
+    );
   });
 });
 
@@ -407,7 +415,7 @@ test('history keeps only the newest source catalog and respects serialized and U
   const messages = prepareRequestMessages(history, 'Follow up');
   assert.strictEqual(messages.filter(message => message.webSources).length, 1);
   assert.strictEqual(messages[messages.length - 2].webSources[0].title, 'Source 13');
-  assert.ok(Buffer.byteLength(JSON.stringify({ messages, stream: false, research: 'always' })) <= 128 * 1024);
+  assert.ok(Buffer.byteLength(JSON.stringify({ messages, stream: false })) <= 128 * 1024);
   assert.strictEqual(messages[0].role, 'user');
   assert.strictEqual(messages.length % 2, 1);
   assert.strictEqual(JSON.stringify(history), before);
@@ -475,12 +483,13 @@ test('stream errors retain safe categories and request IDs without leaking provi
   await withServer((request, response) => {
     request.resume();
     response.writeHead(200, { 'Content-Type': 'application/x-ndjson', 'X-Request-ID': 'stream-123' });
-    response.end(JSON.stringify({ type: 'error', code: 'research_unavailable', error: 'private upstream detail' }) + '\n');
+    response.end(JSON.stringify({ type: 'error', code: 'generation_unavailable', error: 'private upstream detail' }) + '\n');
   }, async (endpoint) => {
     await assert.rejects(requestChat([], { endpoint, onActivity() {} }), error => {
       assert.strictEqual(error.requestId, 'stream-123');
       assert.strictEqual(error.statusCode, 200);
-      assert.match(error.message, /grounded web research/i);
+      assert.strictEqual(error.code, 'generation_unavailable');
+      assert.match(error.message, /generation is temporarily unavailable/i);
       assert.doesNotMatch(error.message, /private upstream detail/);
       return true;
     });

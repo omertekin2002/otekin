@@ -113,7 +113,7 @@ test('CLI help and version include chat without changing version behavior', asyn
   assert.strictEqual(help.code, 0);
   assert.match(help.stdout, /otekin chat/);
   assert.match(help.stdout, /\/clear/);
-  assert.match(help.stdout, /--research <mode>/);
+  assert.doesNotMatch(help.stdout, /--research/);
   assert.strictEqual(help.stderr, '');
 
   const version = await runCli(['--version']);
@@ -164,8 +164,7 @@ test('CLI one-shot chat sends the joined prompt and prints only the answer', asy
     assert.strictEqual(request.url, '/v1/chat');
     assert.deepStrictEqual(body, {
       messages: [{ role: 'user', content: 'explain this contract' }],
-      stream: false,
-      research: 'auto'
+      stream: false
     });
     response.writeHead(200, { 'Content-Type': 'application/json' });
     response.end(JSON.stringify({ message: 'A concise answer.\n\n', provider: 'fixture' }));
@@ -189,27 +188,31 @@ test('CLI one-shot chat sends the joined prompt and prints only the answer', asy
   });
 });
 
-test('CLI forwards an explicit research mode and rejects invalid modes locally', async () => {
+test('CLI treats the removed --research flag like any other unknown option', async () => {
+  const bodies = [];
   await withServer(async (request, response) => {
-    const body = JSON.parse(await readBody(request));
-    assert.strictEqual(body.research, 'always');
+    bodies.push(JSON.parse(await readBody(request)));
     response.writeHead(200, { 'Content-Type': 'application/json' });
-    response.end(JSON.stringify({ message: 'Grounded answer.' }));
+    response.end(JSON.stringify({ message: 'Answer.' }));
   }, async (endpoint) => {
-    const result = await runCli(
-      ['chat', 'Find', 'current', 'sources', '--research', 'always'],
-      { OTEKIN_CHAT_API_URL: endpoint }
-    );
-    assert.strictEqual(result.code, 0);
-    assert.strictEqual(result.stdout, 'Grounded answer.\n');
-    assert.strictEqual(result.stderr, '');
+    // Unknown dash-prefixed options are ignored; bare words after `chat` join the prompt.
+    for (const args of [
+      ['chat', 'Find', 'sources', '--research=never'],
+      ['chat', 'Find', 'sources', '--research', 'always'],
+      ['chat', 'Find', 'sources', '--unknown-flag']
+    ]) {
+      const result = await runCli(args, { OTEKIN_CHAT_API_URL: endpoint });
+      assert.strictEqual(result.code, 0);
+      assert.strictEqual(result.stdout, 'Answer.\n');
+      assert.strictEqual(result.stderr, '');
+    }
   });
 
-  const invalid = await runCli(['chat', 'Question', '--research=sometimes']);
-  assert.strictEqual(invalid.code, 1);
-  assert.strictEqual(invalid.stdout, '');
-  assert.match(invalid.stderr, /must be auto, always, or never/i);
-  assert.doesNotMatch(invalid.stderr, /Unable to wake|Unable to reach/i);
+  assert.deepStrictEqual(bodies, [
+    { messages: [{ role: 'user', content: 'Find sources' }], stream: false },
+    { messages: [{ role: 'user', content: 'Find sources always' }], stream: false },
+    { messages: [{ role: 'user', content: 'Find sources' }], stream: false }
+  ]);
 });
 
 test('CLI one-shot --json preserves the complete gateway response', async () => {
@@ -265,7 +268,7 @@ test('CLI chat failures show safe categories and request IDs while hiding respon
     });
     response.end(JSON.stringify({
       error: 'secret internal failure detail',
-      code: 'research_unavailable'
+      code: 'generation_unavailable'
     }));
   }, async (endpoint) => {
     const result = await runCli(['chat', 'Question'], {
@@ -273,9 +276,9 @@ test('CLI chat failures show safe categories and request IDs while hiding respon
     });
     assert.strictEqual(result.code, 1);
     assert.strictEqual(result.stdout, '');
-    assert.match(result.stderr, /grounded web research is temporarily unavailable/i);
+    assert.match(result.stderr, /chat generation is temporarily unavailable/i);
     assert.match(result.stderr, /Request ID: gateway-request-123/);
-    assert.match(result.stderr, /--research never/);
+    assert.doesNotMatch(result.stderr, /--research/);
     assert.doesNotMatch(result.stderr, /secret internal failure detail/);
     assert.doesNotMatch(result.stderr, /\n\s+at /);
   });

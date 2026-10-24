@@ -8,8 +8,7 @@ const {
   requestChat,
   prepareRequestMessages,
   assistantMessageFromResponse,
-  ensureChatServiceAwake,
-  normalizeResearchMode
+  ensureChatServiceAwake
 } = require('../lib/chat-client');
 const { formatChatResponse } = require('../lib/chat-format');
 const { saveGeneratedImages } = require('../lib/chat-images');
@@ -40,7 +39,6 @@ Options:
   -v, --version           Show version
   --non-interactive       Print text + links and exit (no prompt)
   --json                  Output profile or one-shot chat JSON and exit
-  --research <mode>       Chat research: auto | always | never (default: auto)
   --no-open               Don't open links in a browser (print them instead)
   --cv, --resume          Open the CV download link directly
   -s, --select <choice>   Skip the prompt and select: website | linkedin | cv | chat | exit
@@ -53,8 +51,6 @@ Examples:
   npx otekin --cv
   npx otekin --select website --no-open
   npx otekin chat "Explain quantum computing"
-  npx otekin chat "What changed today?" --research always
-  npx otekin chat "Rewrite this paragraph" --research never
   npx otekin chat "Explain this" --json
   npx otekin --select chat
 
@@ -77,7 +73,6 @@ function parseArgs(argv) {
     version: false,
     nonInteractive: false,
     json: false,
-    researchMode: undefined,
     noOpen: false,
     select: null,
     command: null,
@@ -90,13 +85,7 @@ function parseArgs(argv) {
     else if (a === '-v' || a === '--version') opts.version = true;
     else if (a === '--non-interactive' || a === '--no-interactive') opts.nonInteractive = true;
     else if (a === '--json') opts.json = true;
-    else if (a === '--research') {
-      const value = argv[i + 1];
-      opts.researchMode = value && !value.startsWith('-') ? value : '';
-      if (opts.researchMode) i += 1;
-    } else if (a.startsWith('--research=')) {
-      opts.researchMode = a.slice('--research='.length);
-    } else if (a === '--no-open') opts.noOpen = true;
+    else if (a === '--no-open') opts.noOpen = true;
     else if (a === '--cv' || a === '--resume') opts.select = 'cv';
     else if (a === '-s' || a === '--select') {
       opts.select = argv[i + 1] ?? null;
@@ -259,7 +248,6 @@ async function runOneShotChat(prompt, opts) {
   const activity = !opts.json && process.stderr.isTTY ? createActivityDisplay(process.stderr) : null;
   try {
     const response = await requestChat(messages, {
-      researchMode: opts.researchMode,
       onActivity: activity ? activity.onActivity : undefined
     });
     if (activity) activity.finish(response);
@@ -320,7 +308,7 @@ async function runInteractiveChat(opts) {
   });
 
   process.stdout.write('\n  ' + outputTheme.accent(outputTheme.strong('otekin')) +
-    outputTheme.muted(` / chat   ·   research ${opts.researchMode}`) + '\n');
+    outputTheme.muted(' / chat') + '\n');
   process.stdout.write('  ' + outputTheme.muted('Ask a question. Follow the research as it happens.') + '\n');
   process.stdout.write('  ' + outputTheme.muted('/clear reset   /exit quit   Ctrl+C cancel & exit') + '\n\n');
 
@@ -362,7 +350,6 @@ async function runInteractiveChat(opts) {
         activity = createActivityDisplay(process.stdout);
         const response = await requestChat(candidate, {
           signal: activeController.signal,
-          researchMode: opts.researchMode,
           onActivity: activity.onActivity
         });
         activity.finish(response);
@@ -494,14 +481,6 @@ async function main() {
 
   if (opts.version) {
     process.stdout.write(String(pkg.version) + '\n');
-    return;
-  }
-
-  try {
-    opts.researchMode = normalizeResearchMode(opts.researchMode);
-  } catch (error) {
-    process.stderr.write(`${errorMessage(error)}\n`);
-    process.exitCode = 1;
     return;
   }
 
