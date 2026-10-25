@@ -233,6 +233,43 @@ test('scrolled-up conversations stay in place while research and replies arrive'
   }
 });
 
+test('scrolled-up conversations stay in place when cancelling removes research lines', async () => {
+  let activity;
+  let signal;
+  let calls = 0;
+  const ui = await terminalApp({services: {
+    ...client,
+    ensureChatServiceAwake: async () => {},
+    async requestChat(_messages, options) {
+      calls += 1;
+      if (calls === 1) return {message: Array.from({length: 50}, (_,index) => `Answer line ${index + 1}`).join('\n')};
+      activity = options.onActivity;
+      signal = options.signal;
+      return new Promise((_resolve, reject) => {
+        signal.addEventListener('abort', () => reject(new Error('Cancelled')), {once: true});
+      });
+    }
+  }});
+  const viewport = () => ui.screen().split('\n').slice(2, 25).join('\n');
+  try {
+    await ui.type('First question\r');
+    await waitFor(() => ui.screen().includes('Answer line 50'));
+    await ui.type('Second question\r');
+    await waitFor(() => Boolean(activity));
+    for (let index = 0; index < 20; index += 1) {
+      activity({id: `read-${index}`, tool: 'read_url', url: `https://example.com/${index}`, status: 'running'});
+    }
+    await ui.type('\u001b[1;5H');
+    const before = viewport();
+    assert.match(before, /First question/);
+    await ui.type('\u001b');
+    await waitFor(() => signal.aborted && ui.screen().includes('Cancelled.'));
+    assert.strictEqual(viewport(), before);
+  } finally {
+    await ui.close();
+  }
+});
+
 test('slash-prefixed text is sent as chat unless it is a single command word', async () => {
   const requests = [];
   const models = ['gpt-6.1-sol', undefined, '\u001b[31mspoofed'];
