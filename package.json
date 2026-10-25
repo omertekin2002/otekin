@@ -1,6 +1,6 @@
 {
   "name": "otekin",
-  "version": "0.1.12",
+  "version": "0.1.13",
   "description": "Ömer Tekin's full-screen terminal workspace and AI chat (run with `npx otekin`).",
   "license": "MIT",
   "author": "Ömer Tekin",
