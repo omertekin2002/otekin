@@ -541,3 +541,73 @@ test('streamed requests support cancellation and deadlines after activity begins
     await assert.rejects(requestChat([], { endpoint, timeoutMs: 30, onActivity() {} }), /too long/i);
   });
 });
+
+test('streamed reply deltas reach onDelta in order, across TCP chunks and UTF-8 boundaries', async () => {
+  const canonical = { message: 'Merhaba Ömer [1]', webSources: [{ title: 'Source', url: 'https://example.com' }] };
+  const events = [];
+  await withServer(async (request, response) => {
+    const body = JSON.parse(await readBody(request));
+    assert.strictEqual(body.stream, true);
+    response.writeHead(200, { 'Content-Type': 'application/x-ndjson' });
+    response.write(JSON.stringify({ type: 'tool', activity: { id: 's', query: 'q', status: 'running' } }) + '\n');
+    const split = Buffer.from(JSON.stringify({ type: 'delta', text: 'Merhaba Ö' }) + '\n');
+    const middle = split.indexOf(Buffer.from('Ö')) + 1;
+    response.write(Buffer.concat([Buffer.from(JSON.stringify({ type: 'delta', text: 'Hi. ' }) + '\n'), split.subarray(0, middle)]));
+    await new Promise(resolve => setTimeout(resolve, 10));
+    response.write(split.subarray(middle));
+    response.end([
+      JSON.stringify({ type: 'delta', text: 42 }),
+      JSON.stringify({ type: 'delta' }),
+      JSON.stringify({ type: 'delta', text: 'mer' }),
+      JSON.stringify({ type: 'done', ...canonical }),
+      JSON.stringify({ type: 'delta', text: 'after done' })
+    ].join('\n') + '\n');
+  }, async (endpoint) => {
+    const result = await requestChat([], {
+      endpoint,
+      timeoutMs: 1000,
+      onActivity: activity => events.push(['tool', activity.id]),
+      onDelta: text => events.push(['delta', text])
+    });
+    assert.deepStrictEqual(events, [['tool', 's'], ['delta', 'Hi. '], ['delta', 'Merhaba Ö'], ['delta', 'mer']]);
+    assert.deepStrictEqual(result, canonical);
+  });
+});
+
+test('onDelta alone requests a stream and is never called for JSON replies', async () => {
+  const bodies = [];
+  await withServer(async (request, response) => {
+    bodies.push(JSON.parse(await readBody(request)));
+    response.writeHead(200, { 'Content-Type': 'application/json' });
+    response.end(JSON.stringify({ message: 'JSON reply', delta: 'ignored' }));
+  }, async (endpoint) => {
+    const deltas = [];
+    const onDelta = text => deltas.push(text);
+    assert.strictEqual((await requestChat([], { endpoint, onDelta })).message, 'JSON reply');
+    assert.strictEqual((await requestChat([], { endpoint, onDelta, onActivity() {} })).message, 'JSON reply');
+    assert.deepStrictEqual(bodies.map(body => body.stream), [true, true]);
+    assert.deepStrictEqual(deltas, []);
+  });
+});
+
+test('onDelta is not called after the request is aborted', async () => {
+  await withServer((request, response) => {
+    request.resume();
+    response.writeHead(200, { 'Content-Type': 'application/x-ndjson' });
+    response.write([
+      JSON.stringify({ type: 'delta', text: 'first' }),
+      JSON.stringify({ type: 'delta', text: 'late' })
+    ].join('\n') + '\n');
+    setTimeout(() => response.end(JSON.stringify({ type: 'delta', text: 'later' }) + '\n'), 20);
+  }, async (endpoint) => {
+    const controller = new AbortController();
+    const deltas = [];
+    await assert.rejects(requestChat([], {
+      endpoint,
+      signal: controller.signal,
+      onDelta: text => { deltas.push(text); controller.abort(); }
+    }), /cancelled/i);
+    await new Promise(resolve => setTimeout(resolve, 40));
+    assert.deepStrictEqual(deltas, ['first']);
+  });
+});
