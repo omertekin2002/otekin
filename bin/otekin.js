@@ -2,17 +2,15 @@
 'use strict';
 
 const { spawn } = require('child_process');
-const readline = require('readline');
 const pkg = require('../package.json');
 const {
   requestChat,
   prepareRequestMessages,
-  assistantMessageFromResponse,
   ensureChatServiceAwake
 } = require('../lib/chat-client');
 const { formatChatResponse } = require('../lib/chat-format');
 const { saveGeneratedImages } = require('../lib/chat-images');
-const { cleanText, createTheme, clipLine, startProgress, createActivityDisplay } = require('../lib/terminal');
+const { cleanText, createTheme, startProgress, createActivityDisplay } = require('../lib/terminal');
 
 const outputTheme = createTheme(process.stdout);
 
@@ -25,7 +23,7 @@ const LINKS = {
 
 function printHelp() {
   const help = `
-otekin — terminal profile card
+otekin — full-screen terminal workspace & AI chat
 
 Usage:
   npx otekin
@@ -41,7 +39,7 @@ Options:
   --json                  Output profile or one-shot chat JSON and exit
   --no-open               Don't open links in a browser (print them instead)
   --cv, --resume          Open the CV download link directly
-  -s, --select <choice>   Skip the prompt and select: website | linkedin | cv | chat | exit
+  -s, --select <choice>   Select directly: website | linkedin | cv | chat | exit
 
 Examples:
   npx otekin
@@ -54,7 +52,16 @@ Examples:
   npx otekin chat "Explain this" --json
   npx otekin --select chat
 
-Interactive chat commands:
+Interactive terminal (Node.js 22+):
+  Enter                    Send a message
+  Ctrl+J, Alt+Enter         Insert a newline (Shift+Enter where supported)
+  Tab                      Focus navigation / complete a slash command
+  Page Up / Page Down      Scroll the conversation
+  Esc                      Cancel the current request
+  Ctrl+C                   Cancel a request, or exit when idle
+  /help                    Show all keyboard shortcuts
+  /profile                 About Ömer
+  /website, /linkedin, /cv  Open profile links
   /clear                   Clear conversation history
   /exit, /quit             End the chat session
 
@@ -106,7 +113,7 @@ function parseArgs(argv) {
 
 function isInteractiveAllowed(opts) {
   if (opts.nonInteractive) return false;
-  return Boolean(process.stdin.isTTY && process.stdout.isTTY);
+  return Boolean(process.stdin.isTTY && outputTheme.interactive);
 }
 
 function printNonInteractive() {
@@ -188,12 +195,6 @@ function normalizeSelect(v) {
   return null;
 }
 
-function hideCursor() {
-  try {
-    process.stdout.write('\u001B[?25l');
-  } catch {}
-}
-
 function showCursor() {
   try {
     process.stdout.write('\u001B[?25h');
@@ -204,7 +205,7 @@ function restoreTerminal() {
   try {
     if (process.stdin.isTTY && process.stdin.isRaw) process.stdin.setRawMode(false);
   } catch {}
-  showCursor();
+  if (process.stdout.isTTY) showCursor();
 }
 
 function writeLine(value) {
@@ -268,207 +269,9 @@ async function runOneShotChat(prompt, opts) {
   }
 }
 
-function question(rl, prompt) {
-  return new Promise((resolve) => {
-    let answered = false;
-    const onClose = () => {
-      if (answered) return;
-      answered = true;
-      resolve(null);
-    };
-
-    rl.once('close', onClose);
-    rl.question(prompt, (answer) => {
-      if (answered) return;
-      answered = true;
-      rl.removeListener('close', onClose);
-      resolve(answer);
-    });
-  });
-}
-
 async function runInteractiveChat(opts) {
-  restoreTerminal();
-  const rl = readline.createInterface({
-    input: process.stdin,
-    output: process.stdout,
-    terminal: true
-  });
-  let history = [];
-  let exitRequested = false;
-  let activeController = null;
-
-  rl.on('SIGINT', () => {
-    process.stdout.write('\n');
-    rl.close();
-  });
-  rl.on('close', () => {
-    exitRequested = true;
-    if (activeController) activeController.abort();
-  });
-
-  process.stdout.write('\n  ' + outputTheme.accent(outputTheme.strong('otekin')) +
-    outputTheme.muted(' / chat') + '\n');
-  process.stdout.write('  ' + outputTheme.muted('Ask a question. Follow the research as it happens.') + '\n');
-  process.stdout.write('  ' + outputTheme.muted('/clear reset   /exit quit   Ctrl+C cancel & exit') + '\n\n');
-
-  try {
-    while (true) {
-      const input = await question(rl, outputTheme.accent('  You › '));
-      if (input === null) break;
-
-      const prompt = input.trim();
-      const command = prompt.toLowerCase();
-      if (!prompt) continue;
-      if (command === '/exit' || command === '/quit') break;
-      if (command === '/clear') {
-        history = [];
-        process.stdout.write('\n  ' + outputTheme.muted('Conversation cleared. A fresh start.') + '\n\n');
-        continue;
-      }
-
-      let candidate;
-      try {
-        candidate = prepareRequestMessages(history, prompt);
-      } catch (error) {
-        process.stderr.write(`\n  ${outputTheme.warning('!')} ${errorMessage(error)}\n\n`);
-        continue;
-      }
-
-      activeController = new AbortController();
-      process.stdout.write('\n');
-      const clearWakeProgress = startProgress(
-        process.stdout,
-        'Waking chat service',
-        { delayMs: 750 }
-      );
-      let activity = null;
-      try {
-        await ensureChatServiceAwake({ signal: activeController.signal });
-        clearWakeProgress();
-        if (exitRequested) break;
-        activity = createActivityDisplay(process.stdout);
-        const response = await requestChat(candidate, {
-          signal: activeController.signal,
-          onActivity: activity.onActivity
-        });
-        activity.finish(response);
-        if (exitRequested) break;
-        process.stdout.write('\n' + outputTheme.strong('  AI') + '\n\n');
-        writeLine(formatChatResponse(saveGeneratedImages(response), {
-          hyperlinks: outputTheme.interactive,
-          color: outputTheme.color
-        }));
-        process.stdout.write('\n');
-        history = candidate.concat(assistantMessageFromResponse(response));
-      } catch (error) {
-        clearWakeProgress();
-        if (activity) activity.stop();
-        if (exitRequested) break;
-        process.stderr.write(`  ${outputTheme.warning('!')} ${errorMessage(error)}\n\n`);
-      } finally {
-        clearWakeProgress();
-        if (activity) activity.stop();
-        activeController = null;
-      }
-    }
-  } finally {
-    rl.close();
-    restoreTerminal();
-  }
-}
-
-function promptMenu() {
-  const choices = [
-    { label: 'Personal website', value: 'website' },
-    { label: 'LinkedIn', value: 'linkedin' },
-    { label: 'Download CV', value: 'cv' },
-    { label: 'Chat with AI', value: 'chat' },
-    { label: 'Exit', value: 'exit' }
-  ];
-
-  return new Promise((resolve) => {
-    let selected = 0;
-    let renderedLines = 0;
-
-    const input = process.stdin;
-    const output = process.stdout;
-
-    readline.emitKeypressEvents(input);
-    input.setRawMode(true);
-    input.resume();
-
-    hideCursor();
-
-    const render = () => {
-      const lines = [];
-      const width = Math.max(1, (output.columns || 80) - 3);
-      lines.push('  ' + outputTheme.muted(clipLine('↑/↓ navigate · Enter choose · 1–5 jump', width)));
-      for (let i = 0; i < choices.length; i += 1) {
-        const prefix = i === selected ? '›' : ' ';
-        const label = clipLine(`${prefix} ${i + 1}  ${choices[i].label}`, width);
-        lines.push('  ' + (i === selected ? outputTheme.accent(outputTheme.strong(label)) : outputTheme.muted(label)));
-      }
-      const out = lines.join('\n') + '\n';
-
-      if (renderedLines > 0) {
-        readline.moveCursor(output, 0, -renderedLines);
-        readline.cursorTo(output, 0);
-        readline.clearScreenDown(output);
-      }
-      output.write(out);
-      renderedLines = lines.length;
-    };
-
-    let cleanedUp = false;
-    const cleanup = () => {
-      if (cleanedUp) return;
-      cleanedUp = true;
-      input.removeListener('keypress', onKeypress);
-      try {
-        if (input.isTTY) input.setRawMode(false);
-      } catch {}
-      input.pause();
-      showCursor();
-    };
-
-    const onKeypress = (str, key) => {
-      if (key && key.ctrl && key.name === 'c') {
-        cleanup();
-        resolve('exit');
-        return;
-      }
-
-      if (str === '1' || str === '2' || str === '3' || str === '4' || str === '5') {
-        selected = Math.max(0, Math.min(choices.length - 1, Number(str) - 1));
-        render();
-        cleanup();
-        resolve(choices[selected].value);
-        return;
-      }
-
-      if (!key) return;
-      if (key.name === 'up') {
-        selected = (selected - 1 + choices.length) % choices.length;
-        render();
-      } else if (key.name === 'down') {
-        selected = (selected + 1) % choices.length;
-        render();
-      } else if (key.name === 'return' || key.name === 'enter') {
-        cleanup();
-        resolve(choices[selected].value);
-      } else if (key.name === 'escape') {
-        cleanup();
-        resolve('exit');
-      }
-    };
-
-    // Ensure cursor is restored even if something goes sideways.
-    process.once('exit', showCursor);
-
-    render();
-    input.on('keypress', onKeypress);
-  });
+  const { runTerminalApp } = await import('../lib/fullscreen.mjs');
+  await runTerminalApp({ links: LINKS, version: pkg.version, options: opts, openInBrowser });
 }
 
 async function main() {
@@ -512,6 +315,11 @@ async function main() {
     return;
   }
 
+  if (isInteractiveAllowed(opts) && (!opts.select || normalizeSelect(opts.select) === 'chat')) {
+    await runInteractiveChat(opts);
+    return;
+  }
+
   if (outputTheme.interactive) {
     process.stdout.write('\n  ' + outputTheme.strong('Ömer Tekin') + outputTheme.muted(' / otekin') + '\n');
     process.stdout.write('  ' + outputTheme.muted('Law & business student at Koç University') + '\n\n');
@@ -532,13 +340,7 @@ async function main() {
     return;
   }
 
-  if (!isInteractiveAllowed(opts)) {
-    printNonInteractive();
-    return;
-  }
-
-  const choice = await promptMenu();
-  await handleChoice(choice, opts);
+  printNonInteractive();
 }
 
 main().catch((err) => {
