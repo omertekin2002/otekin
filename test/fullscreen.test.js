@@ -216,6 +216,57 @@ test('bracketed paste is edited as a draft and never submits embedded newlines',
   }
 });
 
+test('Tab on narrow terminals preserves unsent drafts, including while a reply is pending', async () => {
+  let reply;
+  const ui = await terminalApp({columns: 80, rows: 24, services: {
+    ...client, ensureChatServiceAwake: async () => {},
+    requestChat: () => new Promise(resolve => {reply = resolve;})
+  }});
+  try {
+    await ui.type('\t');
+    assert.match(ui.screen(), /Keyboard shortcuts and commands/);
+    await ui.type('\u0015An unsent draft\u001b[D');
+    const cursor = ui.emulator.buffer.active.cursorX;
+    await ui.type('\t');
+    assert.match(ui.screen(), /│ › An unsent draft/);
+    assert.strictEqual(ui.emulator.buffer.active.cursorX, cursor);
+    await ui.type('\u0015A question\r');
+    await waitFor(() => Boolean(reply));
+    await ui.type('My follow-up draft\t');
+    assert.match(ui.screen(), /│ › My follow-up draft/);
+    reply({message: 'The reply arrived.'});
+    await waitFor(() => ui.screen().includes('The reply arrived.'));
+    assert.match(ui.screen(), /│ › My follow-up draft/);
+  } finally {
+    await ui.close();
+  }
+});
+
+test('Down preserves a new draft unless it is leaving an active prompt recall session', async () => {
+  const ui = await terminalApp({services: {
+    ...client, ensureChatServiceAwake: async () => {},
+    requestChat: async () => ({message: 'A remembered answer.'})
+  }});
+  try {
+    await ui.type('A remembered question\r');
+    await waitFor(() => ui.screen().includes('A remembered answer.'));
+    await ui.type('My current draft\u001b[D');
+    const cursor = ui.emulator.buffer.active.cursorX;
+    await ui.type('\u001b[B');
+    assert.match(ui.screen(), /│ › My current draft/);
+    assert.strictEqual(ui.emulator.buffer.active.cursorX, cursor);
+    await ui.type('\u001b[A');
+    assert.match(ui.screen(), /│ › A remembered question/);
+    await ui.type('\u001b[B');
+    assert.match(ui.screen(), /│ › My current draft/);
+    assert.strictEqual(ui.emulator.buffer.active.cursorX, cursor);
+    await ui.type('\u0015A newer draft\u001b[B');
+    assert.match(ui.screen(), /│ › A newer draft/);
+  } finally {
+    await ui.close();
+  }
+});
+
 test('cancelling a request keeps the app usable and cannot commit a stale reply', async () => {
   let signal;
   let rejectRequest;
