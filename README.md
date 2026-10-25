@@ -52,6 +52,10 @@ Use these commands in the composer:
 - `/clear` clears the conversation history.
 - `/exit` or `/quit` ends the session.
 
+Only a single word after `/` runs a command. Other text that starts with a slash, such as `/r/law is debating this`, is sent as a message. To send a single slash word as a message, start it with `//`; for example, `//etc` sends `/etc`.
+
+Each reply is labeled with the name of the model that answered, as reported by the gateway.
+
 Blank input is ignored. In a terminal, chat shows live tool activity: search queries, pages being read, API requests, and image generation. A status line shows the current operation and elapsed time; completed steps remain above the answer, and failed tools are marked explicitly. The final answer appears once the gateway finishes, using its canonical citations and image output. The CLI allows up to five minutes per chat request after the health check succeeds.
 
 The terminal interface uses subtle color, clear speaker labels, and lightweight Markdown styling. Set `NO_COLOR=1` to disable color. Piped output stays plain, and `--json` returns the complete response without progress output. One-shot activity goes to stderr so stdout remains usable in pipelines. JSON and fully redirected requests continue to use the non-streaming endpoint contract. Gateways that return JSON to a streaming request display their completed tool activity after the reply arrives.

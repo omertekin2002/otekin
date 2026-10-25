@@ -193,6 +193,149 @@ test('chat keeps the composer live, preserves drafts and context, and scrolls lo
   }
 });
 
+test('scrolled-up conversations stay in place while research and replies arrive', async () => {
+  let reply;
+  let activity;
+  const ui = await terminalApp({services: {
+    ...client,
+    ensureChatServiceAwake: async () => {},
+    requestChat(_messages, options) {
+      activity = options.onActivity;
+      return new Promise(resolve => {reply = resolve;});
+    }
+  }});
+  const viewport = () => ui.screen().split('\n').slice(2, 25).join('\n');
+  const linesBelow = () => Number((ui.screen().match(/↑ (\d+) lines/) || [])[1] || 0);
+  try {
+    await ui.type('First question\r');
+    await waitFor(() => Boolean(reply));
+    reply({message: Array.from({length: 50}, (_,index) => `Answer line ${index + 1}`).join('\n')});
+    await waitFor(() => ui.screen().includes('Answer line 50'));
+    reply = null;
+    await ui.type('Second question\r');
+    await waitFor(() => Boolean(reply));
+    await ui.type('\u001b[5~');
+    const before = viewport();
+    const below = linesBelow();
+    assert.match(before, /Answer line/);
+    assert(below > 0);
+    activity({id: 'search', tool: 'search_web', query: 'current news', status: 'running'});
+    await waitFor(() => linesBelow() > below);
+    assert.strictEqual(viewport(), before);
+    reply({message: Array.from({length: 10}, (_,index) => `Second answer ${index + 1}`).join('\n')});
+    await waitFor(() => linesBelow() > below + 10);
+    assert.strictEqual(viewport(), before);
+    await ui.type('\u001b[1;5F');
+    assert.match(ui.screen(), /Second answer 10/);
+    assert.doesNotMatch(ui.screen(), /↑ \d+ lines/);
+  } finally {
+    await ui.close();
+  }
+});
+
+test('scrolled-up conversations stay in place when cancelling removes research lines', async () => {
+  let activity;
+  let signal;
+  let calls = 0;
+  const ui = await terminalApp({services: {
+    ...client,
+    ensureChatServiceAwake: async () => {},
+    async requestChat(_messages, options) {
+      calls += 1;
+      if (calls === 1) return {message: Array.from({length: 50}, (_,index) => `Answer line ${index + 1}`).join('\n')};
+      activity = options.onActivity;
+      signal = options.signal;
+      return new Promise((_resolve, reject) => {
+        signal.addEventListener('abort', () => reject(new Error('Cancelled')), {once: true});
+      });
+    }
+  }});
+  const viewport = () => ui.screen().split('\n').slice(2, 25).join('\n');
+  try {
+    await ui.type('First question\r');
+    await waitFor(() => ui.screen().includes('Answer line 50'));
+    await ui.type('Second question\r');
+    await waitFor(() => Boolean(activity));
+    for (let index = 0; index < 20; index += 1) {
+      activity({id: `read-${index}`, tool: 'read_url', url: `https://example.com/${index}`, status: 'running'});
+    }
+    await ui.type('\u001b[1;5H');
+    const before = viewport();
+    assert.match(before, /First question/);
+    await ui.type('\u001b');
+    await waitFor(() => signal.aborted && ui.screen().includes('Cancelled.'));
+    assert.strictEqual(viewport(), before);
+  } finally {
+    await ui.close();
+  }
+});
+
+test('slash-prefixed text is sent as chat unless it is a single command word', async () => {
+  const requests = [];
+  const models = ['gpt-6.1-sol', undefined, '\u001b[31mspoofed'];
+  const ui = await terminalApp({columns: 80, services: {
+    ...client, ensureChatServiceAwake: async () => {},
+    requestChat: async messages => {
+      requests.push(messages);
+      return {message: `Reply ${requests.length}.`, model: models[requests.length - 1]};
+    }
+  }});
+  try {
+    await ui.type('/r/law is debating this\r');
+    await waitFor(() => ui.screen().includes('Reply 1.'));
+    assert.strictEqual(requests[0][0].content, '/r/law is debating this');
+    assert.match(ui.screen(), /gpt-6\.1-sol\n\s*Reply 1\./);
+    await ui.type('//etc\r');
+    await waitFor(() => ui.screen().includes('Reply 2.'));
+    assert.strictEqual(requests[1][2].content, '/etc');
+    assert.match(ui.screen(), /OTEKIN\n\s*Reply 2\./);
+    await ui.type('\u001b[A');
+    assert.match(ui.screen(), /│ › \/\/etc/);
+    await ui.type('\u0015Third\r');
+    await waitFor(() => ui.screen().includes('Reply 3.'));
+    assert.match(ui.screen(), /OTEKIN\n\s*Reply 3\./);
+    assert.doesNotMatch(ui.screen(), /spoofed/);
+    await ui.type('/HELP\r');
+    assert.match(ui.screen(), /Make yourself at home/);
+    assert.strictEqual(requests.length, 3);
+  } finally {
+    await ui.close();
+  }
+});
+
+test('the header title uses the default foreground and /clear reports why a request stopped', async () => {
+  let signal;
+  const ui = await terminalApp({services: {
+    ...client, ensureChatServiceAwake: async () => {},
+    requestChat(_messages, options) {
+      signal = options.signal;
+      return new Promise((_resolve, reject) => {
+        signal.addEventListener('abort', () => reject(new Error('Cancelled')), {once: true});
+      });
+    }
+  }});
+  try {
+    const header = ui.emulator.buffer.active.getLine(0);
+    const titleColumn = header.translateToString(true).indexOf('/ Chat');
+    assert(titleColumn > 0);
+    // Chalk disables color when the test runner's stdout is not a terminal.
+    if (header.getCell(1).isFgPalette()) {
+      assert(header.getCell(titleColumn).isFgDefault());
+      assert(header.getCell(titleColumn).isDim());
+    }
+    await ui.type('Stop me\r');
+    await waitFor(() => Boolean(signal));
+    await ui.type('/clear\r');
+    await waitFor(() => signal.aborted);
+    await waitFor(() => ui.screen().includes("Hi, I'm Ömer"));
+    await new Promise(resolve => setTimeout(resolve, 50));
+    assert.match(ui.screen(), /Conversation cleared/);
+    assert.doesNotMatch(ui.screen(), /Cancelled\./);
+  } finally {
+    await ui.close();
+  }
+});
+
 test('bracketed paste is edited as a draft and never submits embedded newlines', async () => {
   const requests = [];
   const ui = await terminalApp({services: {

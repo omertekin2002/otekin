@@ -64,6 +64,7 @@ Interactive terminal (Node.js 22+):
   /website, /linkedin, /cv  Open profile links
   /clear                   Clear conversation history
   /exit, /quit             End the chat session
+  //text                   Send a message that starts with /
 
 Environment:
   NO_COLOR                Disable terminal colors
