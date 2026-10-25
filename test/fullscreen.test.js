@@ -444,3 +444,171 @@ test('cancelling a request keeps the app usable and cannot commit a stale reply'
     await ui.close();
   }
 });
+
+function streamingServices() {
+  const state = {requests: 0};
+  return {state, services: {
+    ...client, ensureChatServiceAwake: async () => {},
+    requestChat(_messages, options) {
+      state.requests += 1;
+      state.onDelta = options.onDelta;
+      state.onActivity = options.onActivity;
+      state.signal = options.signal;
+      return new Promise((resolve, reject) => {
+        state.resolve = resolve;
+        state.reject = reject;
+        options.signal.addEventListener('abort', () => reject(new Error('Cancelled')), {once: true});
+      });
+    }
+  }};
+}
+
+test('streamed reply text appears before done and settles on the canonical answer', async () => {
+  const canonical = {message: 'Canonical **answer** with a citation [1].', webSources: [{title: 'Source', url: 'https://example.com/source'}]};
+  const {state, services} = streamingServices();
+  const ui = await terminalApp({services});
+  let finalScreen;
+  try {
+    await ui.type('Stream please\r');
+    await waitFor(() => Boolean(state.onDelta));
+    state.onActivity({id: 'search', tool: 'search_web', query: 'live answers', status: 'running'});
+    state.onDelta('Provisional ');
+    state.onDelta('words are ');
+    await waitFor(() => ui.screen().includes('Provisional words are'));
+    assert.match(ui.screen(), /WRITING · provisional/);
+    assert.match(ui.screen(), /Writing · \d+s/);
+    assert.match(ui.screen(), /Searching[^\n]*live answers[\s\S]*Provisional words are/);
+    state.onDelta('arriving.');
+    await waitFor(() => ui.screen().includes('Provisional words are arriving.'));
+    state.resolve(canonical);
+    await waitFor(() => ui.screen().includes('Canonical'));
+    assert.doesNotMatch(ui.screen(), /Provisional|WRITING/);
+    finalScreen = ui.screen();
+  } finally {
+    await ui.close();
+  }
+
+  const plain = await terminalApp({services: {
+    ...client, ensureChatServiceAwake: async () => {},
+    async requestChat(_messages, options) {
+      options.onActivity({id: 'search', tool: 'search_web', query: 'live answers', status: 'running'});
+      return canonical;
+    }
+  }});
+  try {
+    await plain.type('Stream please\r');
+    await waitFor(() => plain.screen().includes('Canonical'));
+    assert.strictEqual(finalScreen, plain.screen());
+  } finally {
+    await plain.close();
+  }
+});
+
+test('streamed text never renders terminal escapes or inline image data', async () => {
+  const {state, services} = streamingServices();
+  const ui = await terminalApp({services});
+  const base64 = 'QUJD'.repeat(200);
+  try {
+    await ui.type('Draw something\r');
+    await waitFor(() => Boolean(state.onDelta));
+    state.onDelta('\u001b[2J\u001b]0;pwned-title\u0007Safe \u001b[31mred\u001b[0m text ');
+    state.onDelta('\u001b]8;;https://evil.example\u0007link\u001b]8;;\u0007 then ');
+    state.onDelta(`![chart](data:image/png;base64,${base64.slice(0, 300)}`);
+    await waitFor(() => ui.screen().includes('[generating image…]'));
+    state.onDelta(`${base64.slice(300)}) and done`);
+    await waitFor(() => ui.screen().includes('and done'));
+    assert.match(ui.screen(), /Safe red text link then \[generating image…\] and done/);
+    state.onDelta(` raw data:image/jpeg;base64,${base64}`);
+    await waitFor(() => ui.screen().includes('raw [generating image…]'));
+    assert.doesNotMatch(ui.raw(), /pwned-title|evil\.example|QUJDQUJD/);
+    assert.doesNotMatch(ui.raw(), /\u001b\[2J/);
+    assert.strictEqual(ui.emulator.buffer.active.type, 'alternate');
+  } finally {
+    await ui.close();
+  }
+});
+
+test('cancel, /clear, and request errors discard provisional text, including late deltas', async () => {
+  const {state, services} = streamingServices();
+  const ui = await terminalApp({services});
+  try {
+    await ui.type('First\r');
+    await waitFor(() => Boolean(state.onDelta));
+    state.onDelta('Cancelled provisional text');
+    await waitFor(() => ui.screen().includes('Cancelled provisional text'));
+    await ui.type('Draft kept');
+    await ui.type('\u001b');
+    await waitFor(() => state.signal.aborted && ui.screen().includes('Cancelled.'));
+    state.onDelta(' late delta');
+    await new Promise(resolve => setTimeout(resolve, 250));
+    assert.doesNotMatch(ui.screen(), /provisional|late delta/);
+    assert.match(ui.screen(), /│ › Draft kept/);
+
+    const first = state.onDelta;
+    state.onDelta = null;
+    await ui.type('\u0015Second\r');
+    await waitFor(() => Boolean(state.onDelta));
+    const second = state.onDelta;
+    second('Cleared provisional text');
+    await waitFor(() => ui.screen().includes('Cleared provisional text'));
+    first(' stale first delta');
+    second(' and more');
+    await waitFor(() => ui.screen().includes('Cleared provisional text and more'));
+    assert.doesNotMatch(ui.screen(), /stale first delta/);
+    await ui.type('/clear\r');
+    await waitFor(() => ui.screen().includes("Hi, I'm Ömer"));
+    second(' late delta');
+    await new Promise(resolve => setTimeout(resolve, 250));
+    assert.doesNotMatch(ui.screen(), /provisional|late delta/);
+
+    state.onDelta = null;
+    await ui.type('Third\r');
+    await waitFor(() => Boolean(state.onDelta));
+    state.onDelta('Failed provisional text');
+    await waitFor(() => ui.screen().includes('Failed provisional text'));
+    state.reject(Object.assign(new Error('Service unavailable'), {requestId: 'stream-error'}));
+    await waitFor(() => ui.screen().includes('stream-error'));
+    assert.doesNotMatch(ui.screen(), /provisional/);
+
+    state.onDelta = null;
+    await ui.type('Fourth\r');
+    await waitFor(() => Boolean(state.onDelta));
+    state.onDelta('Working again');
+    await waitFor(() => ui.screen().includes('Working again'));
+    state.resolve({message: 'Fourth answer.'});
+    await waitFor(() => ui.screen().includes('Fourth answer.'));
+    assert.strictEqual(state.requests, 4);
+  } finally {
+    await ui.close();
+  }
+});
+
+test('scrolled-up conversations stay in place while provisional text grows', async () => {
+  const {state, services} = streamingServices();
+  const ui = await terminalApp({services});
+  const viewport = () => ui.screen().split('\n').slice(2, 25).join('\n');
+  const linesBelow = () => Number((ui.screen().match(/↑ (\d+) lines/) || [])[1] || 0);
+  try {
+    await ui.type('First question\r');
+    await waitFor(() => Boolean(state.resolve));
+    state.resolve({message: Array.from({length: 50}, (_,index) => `Answer line ${index + 1}`).join('\n')});
+    await waitFor(() => ui.screen().includes('Answer line 50'));
+    state.onDelta = null;
+    await ui.type('Second question\r');
+    await waitFor(() => Boolean(state.onDelta));
+    await ui.type('\u001b[5~');
+    const before = viewport();
+    const below = linesBelow();
+    assert.match(before, /Answer line/);
+    assert(below > 0);
+    for (let index = 1; index <= 3; index += 1) {
+      state.onDelta(`Streamed line ${index}\n`);
+      await waitFor(() => linesBelow() > below + index);
+      assert.strictEqual(viewport(), before);
+    }
+    await ui.type('\u001b[1;5F');
+    assert.match(ui.screen(), /Streamed line 3/);
+  } finally {
+    await ui.close();
+  }
+});
