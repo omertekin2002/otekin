@@ -9,6 +9,7 @@ global.test = (name, run) => {
 require('./chat-client.test');
 require('./chat-format.test');
 require('./terminal.test');
+require('./fullscreen.test');
 require('./cli.test');
 
 (async () => {

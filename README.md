@@ -1,6 +1,8 @@
 # `npx otekin`
 
-A tiny terminal profile CLI with generic AI chat.
+A full-screen terminal workspace with AI chat and Ömer Tekin's profile. Built with React and Ink.
+
+Requires **Node.js 22 or newer**.
 
 ## Run
 
@@ -10,9 +12,30 @@ npx otekin cv
 npx otekin linkedin
 ```
 
+In an interactive terminal, `npx otekin` opens a full-screen workspace. A persistent composer stays below the scrollable conversation, with live research activity and a navigation rail on wider terminals. The layout adapts when you resize the window. Exiting restores your previous terminal screen.
+
+Type `/` to open the command picker. Use ↑/↓ to choose a command, Tab to complete it, and Enter to run it. Profile links are also available through the navigation rail; press Tab to focus it, then ↑/↓ and Enter.
+
+| Key | Action |
+| --- | --- |
+| Enter | Send a message |
+| Ctrl+J or Alt+Enter | Add a new line; Shift+Enter also works in supporting terminals |
+| ←/→, Home/End | Move the editing cursor |
+| ↑/↓ | Move between lines; recall prompts in a single-line draft |
+| Ctrl+W, Ctrl+U, Ctrl+K | Delete a word, the draft, or the rest of the line |
+| Page Up / Page Down | Scroll while keeping the composer visible |
+| Ctrl+Home / Ctrl+End | Jump to the beginning or end of the conversation |
+| Esc | Cancel a request or return to the composer |
+| Ctrl+C | Cancel a request; exit when idle |
+| Ctrl+D | Exit with an empty draft |
+
+You can write your next draft while a reply is in progress. Pasted multiline text stays in the composer until you press Enter. Chat history and previous prompts last for the current session.
+
+Pipes, `TERM=dumb`, and `--non-interactive` use plain profile output. Direct link commands, one-shot chat, and JSON output remain available without entering full-screen mode.
+
 ## AI chat
 
-No API key or additional package is required. Ask a one-shot question, start an interactive conversation, or open chat through the profile menu:
+No API key is required. Ask a one-shot question or open the full-screen chat directly:
 
 ```bash
 npx otekin chat "What happened today?"
@@ -21,13 +44,15 @@ npx otekin chat "Explain this" --json
 npx otekin --select chat
 ```
 
-Interactive chat keeps context in memory for the current CLI process. Use these commands at the `You:` prompt:
+Use these commands in the composer:
 
+- `/help` shows commands and keyboard shortcuts.
+- `/profile` shows Ömer's profile.
+- `/website`, `/linkedin`, and `/cv` open profile links. With `--no-open`, they display the URL in the conversation.
 - `/clear` clears the conversation history.
 - `/exit` or `/quit` ends the session.
-- Ctrl+C also ends the session.
 
-Blank input simply displays the prompt again. In a terminal, chat shows live tool activity: search queries, pages being read, API requests, and image generation. A dim status line shows the current operation and elapsed time; completed steps remain above the answer, and failed tools are marked explicitly. The final answer appears once the gateway finishes, using its canonical citations and image output. The CLI allows up to five minutes per chat request after the health check succeeds.
+Blank input is ignored. In a terminal, chat shows live tool activity: search queries, pages being read, API requests, and image generation. A status line shows the current operation and elapsed time; completed steps remain above the answer, and failed tools are marked explicitly. The final answer appears once the gateway finishes, using its canonical citations and image output. The CLI allows up to five minutes per chat request after the health check succeeds.
 
 The terminal interface uses subtle color, clear speaker labels, and lightweight Markdown styling. Set `NO_COLOR=1` to disable color. Piped output stays plain, and `--json` returns the complete response without progress output. One-shot activity goes to stderr so stdout remains usable in pipelines. JSON and fully redirected requests continue to use the non-streaming endpoint contract. Gateways that return JSON to a streaming request display their completed tool activity after the reply arrives.
 
@@ -46,7 +71,7 @@ When the service has optional image generation enabled, ask for an image in the 
 - `--non-interactive`: print the profile message and links without a prompt.
 - `--no-open`: print a selected URL instead of opening it in a browser.
 - `--cv`, `--resume`: open the CV link directly.
-- `--select <website|linkedin|cv|chat|exit>`: skip the menu and choose an option.
+- `--select <website|linkedin|cv|chat|exit>`: choose an option directly.
 - `--json`: output profile JSON, or preserve the complete response object for a one-shot chat.
 - `--help`, `--version`: print CLI help or the package version.
 
@@ -87,3 +112,13 @@ npx otekin chat "Hello"
 ```
 
 CORS restrictions do not affect this Node.js CLI. The override must use an HTTP or HTTPS URL.
+
+## Develop locally
+
+```bash
+npm ci
+npm start
+npm test
+```
+
+`npm start` opens the local version in your terminal. The terminal tests use a headless xterm emulator to check the actual rendered screen, keyboard input, resizing, scrolling, and cleanup.
