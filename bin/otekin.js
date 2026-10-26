@@ -10,6 +10,7 @@ const {
 } = require('../lib/chat-client');
 const { formatChatResponse } = require('../lib/chat-format');
 const { saveGeneratedImages } = require('../lib/chat-images');
+const { browserCommand } = require('../lib/browser');
 const { cleanText, createTheme, startProgress, createActivityDisplay } = require('../lib/terminal');
 
 const outputTheme = createTheme(process.stdout);
@@ -129,27 +130,8 @@ function printNonInteractive() {
   process.stdout.write(`- CV: ${LINKS.cv}\n`);
 }
 
-function safeEncodeUrl(url) {
-  try {
-    return encodeURI(url);
-  } catch {
-    return url;
-  }
-}
-
 function openInBrowser(url) {
-  const encoded = safeEncodeUrl(url);
-  const platform = process.platform;
-
-  const command = platform === 'darwin'
-    ? 'open'
-    : platform === 'win32'
-      ? 'cmd'
-      : 'xdg-open';
-
-  const args = platform === 'win32'
-    ? ['/c', 'start', '', encoded]
-    : [encoded];
+  const { command, args } = browserCommand(process.platform, url);
 
   return new Promise((resolve, reject) => {
     const child = spawn(command, args, { stdio: 'ignore', detached: true });
