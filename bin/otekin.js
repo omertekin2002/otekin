@@ -10,18 +10,16 @@ const {
 } = require('../lib/chat-client');
 const { formatChatResponse } = require('../lib/chat-format');
 const { saveGeneratedImages } = require('../lib/chat-images');
+const { browserCommand } = require('../lib/browser');
+const { historyFileFor } = require('../lib/chat-history');
 const { cleanText, createTheme, startProgress, createActivityDisplay } = require('../lib/terminal');
+const profile = require('../lib/profile');
 
 const outputTheme = createTheme(process.stdout);
 
-const MESSAGE = "Hello! I'm Ömer, I'm a law & business student currently studying at Koç University";
-const LINKS = {
-  website: 'https://omertekin2002.github.io',
-  linkedin: 'https://www.linkedin.com/in/ömer-tekin/',
-  cv: 'https://omertekin2002.github.io/resume'
-};
+const LINKS = profile.links;
 
-function printHelp() {
+function printHelp(stream = process.stdout) {
   const help = `
 otekin — full-screen terminal workspace & AI chat
 
@@ -31,6 +29,7 @@ Usage:
   npx otekin linkedin
   npx otekin chat "What happened today?"
   npx otekin chat
+  npx otekin chat -- "-5°C in °F?"
 
 Options:
   -h, --help              Show help
@@ -38,8 +37,13 @@ Options:
   --non-interactive       Print text + links and exit (no prompt)
   --json                  Output profile or one-shot chat JSON and exit
   --no-open               Don't open links in a browser (print them instead)
+  --no-history            Don't load or save full-screen chat history this run
   --cv, --resume          Open the CV download link directly
   -s, --select <choice>   Select directly: website | linkedin | cv | chat | exit
+  --                      End options; later arguments are prompt text or a choice
+
+Prompt words that look like options, such as -x or --name, are rejected as
+unknown options unless they come after --.
 
 Examples:
   npx otekin
@@ -62,7 +66,7 @@ Interactive terminal (Node.js 22+):
   /help                    Show all keyboard shortcuts
   /profile                 About Ömer
   /website, /linkedin, /cv  Open profile links
-  /clear                   Clear conversation history
+  /clear                   Clear the conversation and delete saved history
   /exit, /quit             End the chat session
   //text                   Send a message that starts with /
 
@@ -70,9 +74,23 @@ Environment:
   NO_COLOR                Disable terminal colors
   OTEKIN_CHAT_API_URL      Override the HTTP(S) chat endpoint (no API key required)
   OTEKIN_CHAT_HEALTH_URL   Override its HTTP(S) health endpoint (defaults to /healthz)
+  OTEKIN_NO_HISTORY=1      Never load or save full-screen chat history
+  OTEKIN_HISTORY_FILE      Save full-screen chat history to this file instead
+
+The full-screen chat saves its conversation and recent prompts so they come back
+next time. One-shot, --json and piped chat never read or write it.
 `.trim();
 
-  process.stdout.write(help + '\n');
+  stream.write(help + '\n');
+}
+
+const OPTION_SHAPE = /^--?[A-Za-z][^\s=]*(=.*)?$/;
+
+function unknownOptionError(arg) {
+  // Drop any `=value` so pasted values are never echoed back.
+  const name = cleanText(arg.split('=')[0]);
+  return `Unknown option: ${name}\n` +
+    `Run "otekin --help" to see the options. To send text that starts with "-", put it after "--": otekin chat -- "${name}"`;
 }
 
 function parseArgs(argv) {
@@ -82,31 +100,37 @@ function parseArgs(argv) {
     nonInteractive: false,
     json: false,
     noOpen: false,
+    noHistory: false,
     select: null,
     command: null,
-    commandArgs: []
+    commandArgs: [],
+    error: null,
+    errorHelp: false
   };
+  let optionsEnded = false;
 
   for (let i = 0; i < argv.length; i += 1) {
     const a = argv[i];
-    if (a === '-h' || a === '--help') opts.help = true;
+    if (optionsEnded || !OPTION_SHAPE.test(a)) {
+      if (a === '--' && !optionsEnded) optionsEnded = true;
+      else if (opts.command === 'chat') opts.commandArgs.push(a);
+      else if (a.toLowerCase() === 'chat' && !opts.select) opts.command = 'chat';
+      else if (!opts.select) opts.select = a;
+    } else if (a === '-h' || a === '--help') opts.help = true;
     else if (a === '-v' || a === '--version') opts.version = true;
     else if (a === '--non-interactive' || a === '--no-interactive') opts.nonInteractive = true;
     else if (a === '--json') opts.json = true;
     else if (a === '--no-open') opts.noOpen = true;
+    else if (a === '--no-history') opts.noHistory = true;
     else if (a === '--cv' || a === '--resume') opts.select = 'cv';
-    else if (a === '-s' || a === '--select') {
-      opts.select = argv[i + 1] ?? null;
-      i += 1;
-    } else if (a.startsWith('--select=')) {
-      opts.select = a.slice('--select='.length) || null;
-    } else if (!a.startsWith('-') && opts.command === 'chat') {
-      opts.commandArgs.push(a);
-    } else if (!a.startsWith('-') && a.toLowerCase() === 'chat' && !opts.select) {
-      opts.command = 'chat';
-    } else if (!a.startsWith('-') && !opts.select) {
-      opts.select = a;
-    }
+    else if (a === '-s' || a === '--select' || a.startsWith('--select=')) {
+      const value = a.startsWith('--select=') ? a.slice('--select='.length) : argv[(i += 1)];
+      if (value && value !== '--') opts.select = value;
+      else if (!opts.error) {
+        opts.error = 'Missing value for --select';
+        opts.errorHelp = true;
+      }
+    } else if (!opts.error) opts.error = unknownOptionError(a);
   }
 
   return opts;
@@ -124,27 +148,8 @@ function printNonInteractive() {
   process.stdout.write(`- CV: ${LINKS.cv}\n`);
 }
 
-function safeEncodeUrl(url) {
-  try {
-    return encodeURI(url);
-  } catch {
-    return url;
-  }
-}
-
 function openInBrowser(url) {
-  const encoded = safeEncodeUrl(url);
-  const platform = process.platform;
-
-  const command = platform === 'darwin'
-    ? 'open'
-    : platform === 'win32'
-      ? 'cmd'
-      : 'xdg-open';
-
-  const args = platform === 'win32'
-    ? ['/c', 'start', '', encoded]
-    : [encoded];
+  const { command, args } = browserCommand(process.platform, url);
 
   return new Promise((resolve, reject) => {
     const child = spawn(command, args, { stdio: 'ignore', detached: true });
@@ -272,11 +277,24 @@ async function runOneShotChat(prompt, opts) {
 
 async function runInteractiveChat(opts) {
   const { runTerminalApp } = await import('../lib/fullscreen.mjs');
-  await runTerminalApp({ links: LINKS, version: pkg.version, options: opts, openInBrowser });
+  await runTerminalApp({
+    links: LINKS,
+    version: pkg.version,
+    options: opts,
+    openInBrowser,
+    historyFile: historyFileFor(opts)
+  });
 }
 
 async function main() {
   const opts = parseArgs(process.argv.slice(2));
+
+  if (opts.error) {
+    process.stderr.write(opts.error + '\n');
+    if (opts.errorHelp) printHelp(process.stderr);
+    process.exitCode = 1;
+    return;
+  }
 
   if (opts.help) {
     printHelp();
@@ -312,7 +330,7 @@ async function main() {
   }
 
   if (opts.json) {
-    process.stdout.write(JSON.stringify({ message: MESSAGE, links: LINKS }, null, 2) + '\n');
+    process.stdout.write(JSON.stringify({ message: `${profile.greeting} ${profile.tagline}`, links: LINKS }, null, 2) + '\n');
     return;
   }
 
@@ -322,10 +340,10 @@ async function main() {
   }
 
   if (outputTheme.interactive) {
-    process.stdout.write('\n  ' + outputTheme.strong('Ömer Tekin') + outputTheme.muted(' / otekin') + '\n');
-    process.stdout.write('  ' + outputTheme.muted('Law & business student at Koç University') + '\n\n');
+    process.stdout.write('\n  ' + outputTheme.strong(profile.name) + outputTheme.muted(' / otekin') + '\n');
+    process.stdout.write('  ' + outputTheme.muted(profile.tagline) + '\n\n');
   } else {
-    process.stdout.write(MESSAGE + '\n\n');
+    process.stdout.write(`${profile.greeting}\n${profile.tagline}\n\n`);
   }
 
   const selectedFromFlag = normalizeSelect(opts.select);

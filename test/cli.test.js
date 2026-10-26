@@ -2,13 +2,16 @@
 
 const assert = require('assert');
 const { spawn } = require('child_process');
+const fs = require('fs');
 const http = require('http');
+const os = require('os');
 const path = require('path');
 const pkg = require('../package.json');
 
 const ROOT = path.resolve(__dirname, '..');
 const CLI = path.join(ROOT, 'bin', 'otekin.js');
-const PROFILE_MESSAGE = "Hello! I'm Ömer, I'm a law & business student currently studying at Koç University";
+const GREETING = "Hi, I'm Ömer Tekin.";
+const TAGLINE = 'Law & business student at Koç University.';
 
 function runCli(args, env) {
   return new Promise((resolve, reject) => {
@@ -114,6 +117,11 @@ test('CLI help and version include chat without changing version behavior', asyn
   assert.match(help.stdout, /otekin chat/);
   assert.match(help.stdout, /\/clear/);
   assert.doesNotMatch(help.stdout, /--research/);
+  assert.match(help.stdout, /otekin chat -- "-5°C in °F\?"/);
+  assert.match(help.stdout, /--no-history/);
+  assert.match(help.stdout, /OTEKIN_NO_HISTORY=1/);
+  assert.match(help.stdout, /OTEKIN_HISTORY_FILE/);
+  assert.doesNotMatch(help.stdout, /memory only|current session/i);
   assert.strictEqual(help.stderr, '');
 
   const version = await runCli(['--version']);
@@ -126,7 +134,7 @@ test('CLI preserves bare profile JSON output', async () => {
   const result = await runCli(['--json']);
   assert.strictEqual(result.code, 0);
   assert.deepStrictEqual(JSON.parse(result.stdout), {
-    message: PROFILE_MESSAGE,
+    message: `${GREETING} ${TAGLINE}`,
     links: {
       website: 'https://omertekin2002.github.io',
       linkedin: 'https://www.linkedin.com/in/ömer-tekin/',
@@ -139,8 +147,21 @@ test('CLI preserves bare profile JSON output', async () => {
 test('CLI preserves profile, CV, and LinkedIn commands', async () => {
   const profile = await runCli([]);
   assert.strictEqual(profile.code, 0);
-  assert.match(profile.stdout, new RegExp(PROFILE_MESSAGE.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
-  assert.match(profile.stdout, /Links:/);
+  assert.strictEqual(profile.stdout, [
+    GREETING,
+    TAGLINE,
+    '',
+    'Links:',
+    '- Website: https://omertekin2002.github.io',
+    '- LinkedIn: https://www.linkedin.com/in/ömer-tekin/',
+    '- CV: https://omertekin2002.github.io/resume',
+    ''
+  ].join('\n'));
+  assert.strictEqual(profile.stderr, '');
+
+  const nonInteractive = await runCli(['--non-interactive']);
+  assert.strictEqual(nonInteractive.code, 0);
+  assert.strictEqual(nonInteractive.stdout, profile.stdout);
 
   const cv = await runCli(['cv', '--no-open']);
   assert.strictEqual(cv.code, 0);
@@ -175,7 +196,7 @@ test('CLI one-shot chat sends the joined prompt and prints only the answer', asy
     assert.strictEqual(result.code, 0);
     assert.strictEqual(result.stdout, 'A concise answer.\n');
     assert.strictEqual(result.stderr, '');
-    assert.doesNotMatch(result.stdout, /Hello! I'm Ömer/);
+    assert.doesNotMatch(result.stdout, /Hi, I'm Ömer|Koç University/);
     const requests = fixture.getRequests();
     assert.deepStrictEqual(
       requests.map((request) => `${request.method} ${request.url}`),
@@ -188,31 +209,160 @@ test('CLI one-shot chat sends the joined prompt and prints only the answer', asy
   });
 });
 
-test('CLI treats the removed --research flag like any other unknown option', async () => {
+test('CLI rejects unknown options without sending anything', async () => {
+  await withServer((request, response) => {
+    request.resume();
+    response.writeHead(200, { 'Content-Type': 'application/json' });
+    response.end(JSON.stringify({ message: 'Should not be reached.' }));
+  }, async (endpoint, fixture) => {
+    for (const [args, name] of [
+      [['--reserch'], '--reserch'],
+      [['chat', 'Find', 'sources', '--research', 'always'], '--research'],
+      [['chat', 'Find', '--research=never'], '--research'],
+      [['chat', '-x', 'hi'], '-x'],
+      [['chat', 'hi', '--reserch'], '--reserch'],
+      [['--research=secret', 'chat', 'hi'], '--research'],
+      [['--help', '--unknown-flag'], '--unknown-flag'],
+      [['--json', 'chat', 'hi', '--unknown-flag', '--select'], '--unknown-flag']
+    ]) {
+      const result = await runCli(args, { OTEKIN_CHAT_API_URL: endpoint });
+      assert.strictEqual(result.code, 1, args.join(' '));
+      assert.strictEqual(result.stdout, '', args.join(' '));
+      assert.strictEqual(
+        result.stderr,
+        `Unknown option: ${name}\n` +
+          `Run "otekin --help" to see the options. To send text that starts with "-", put it after "--": otekin chat -- "${name}"\n`,
+        args.join(' ')
+      );
+      assert.doesNotMatch(result.stderr, /secret|never|Usage:/);
+    }
+    assert.deepStrictEqual(fixture.getRequests(), []);
+  });
+
+  const control = await runCli(['chat', 'hi', '--bad\u001B[31m']);
+  assert.strictEqual(control.code, 1);
+  assert.doesNotMatch(control.stderr, /\u001B/);
+  assert.match(control.stderr, /^Unknown option: --bad\n/);
+});
+
+test('CLI sends option-like words after -- as the prompt', async () => {
   const bodies = [];
   await withServer(async (request, response) => {
     bodies.push(JSON.parse(await readBody(request)));
     response.writeHead(200, { 'Content-Type': 'application/json' });
     response.end(JSON.stringify({ message: 'Answer.' }));
   }, async (endpoint) => {
-    // Unknown dash-prefixed options are ignored; bare words after `chat` join the prompt.
-    for (const args of [
-      ['chat', 'Find', 'sources', '--research=never'],
-      ['chat', 'Find', 'sources', '--research', 'always'],
-      ['chat', 'Find', 'sources', '--unknown-flag']
-    ]) {
+    for (const args of [['chat', '--', '--research', 'always'], ['chat', '--', '--reserch', 'hi']]) {
       const result = await runCli(args, { OTEKIN_CHAT_API_URL: endpoint });
-      assert.strictEqual(result.code, 0);
+      assert.strictEqual(result.code, 0, args.join(' '));
       assert.strictEqual(result.stdout, 'Answer.\n');
       assert.strictEqual(result.stderr, '');
     }
   });
 
-  assert.deepStrictEqual(bodies, [
-    { messages: [{ role: 'user', content: 'Find sources' }], stream: false },
-    { messages: [{ role: 'user', content: 'Find sources always' }], stream: false },
-    { messages: [{ role: 'user', content: 'Find sources' }], stream: false }
+  assert.deepStrictEqual(bodies.map((body) => body.messages[0].content), ['--research always', '--reserch hi']);
+});
+
+test('CLI accepts every known option', async () => {
+  for (const args of [['-h'], ['--help']]) {
+    const result = await runCli(args);
+    assert.strictEqual(result.code, 0, args.join(' '));
+    assert.match(result.stdout, /Usage:/);
+    assert.match(result.stdout, /rejected as\s+unknown options unless they come after --/);
+    assert.doesNotMatch(result.stdout, /ignored/);
+    assert.strictEqual(result.stderr, '');
+  }
+
+  for (const args of [['-v'], ['--version']]) {
+    const result = await runCli(args);
+    assert.strictEqual(result.code, 0, args.join(' '));
+    assert.strictEqual(result.stdout, `${pkg.version}\n`);
+  }
+
+  for (const args of [['--non-interactive'], ['--no-interactive'], ['--no-history', '--non-interactive']]) {
+    const result = await runCli(args);
+    assert.strictEqual(result.code, 0, args.join(' '));
+    assert.match(result.stdout, /Links:/);
+    assert.strictEqual(result.stderr, '');
+  }
+
+  for (const args of [['--cv', '--no-open'], ['--resume', '--no-open'], ['-s', 'cv', '--no-open'], ['--select', 'cv', '--no-open'], ['--select=cv', '--no-open']]) {
+    const result = await runCli(args);
+    assert.strictEqual(result.code, 0, args.join(' '));
+    assert.match(result.stdout, /Link: https:\/\/omertekin2002\.github\.io\/resume/);
+    assert.strictEqual(result.stderr, '');
+  }
+});
+
+test('CLI sends dash-leading prompts and treats arguments after -- as positional', async () => {
+  const bodies = [];
+  await withServer(async (request, response) => {
+    bodies.push(JSON.parse(await readBody(request)));
+    response.writeHead(200, { 'Content-Type': 'application/json' });
+    response.end(JSON.stringify({ message: 'Answer.' }));
+  }, async (endpoint) => {
+    for (const args of [
+      ['chat', '-5°C in °F?'],
+      ['chat', '-', 'bullet', '--- x', '--a b=c'],
+      ['chat', '--', '--help', 'me'],
+      ['chat', 'Explain', '--', '--select', '-h', '--'],
+      ['chat', 'Explain this', '--no-open']
+    ]) {
+      const result = await runCli(args, { OTEKIN_CHAT_API_URL: endpoint });
+      assert.strictEqual(result.code, 0, args.join(' '));
+      assert.strictEqual(result.stdout, 'Answer.\n');
+      assert.strictEqual(result.stderr, '');
+    }
+  });
+
+  assert.deepStrictEqual(bodies.map((body) => body.messages[0].content), [
+    '-5°C in °F?',
+    '- bullet --- x --a b=c',
+    '--help me',
+    'Explain --select -h --',
+    'Explain this'
   ]);
+  assert.deepStrictEqual(bodies[0], {
+    messages: [{ role: 'user', content: '-5°C in °F?' }],
+    stream: false
+  });
+});
+
+test('CLI parses options before -- and keeps options after prompt words', async () => {
+  const gatewayResponse = { message: 'JSON answer', provider: 'fixture' };
+  const bodies = [];
+  await withServer(async (request, response) => {
+    bodies.push(JSON.parse(await readBody(request)));
+    response.writeHead(200, { 'Content-Type': 'application/json' });
+    response.end(JSON.stringify(gatewayResponse));
+  }, async (endpoint) => {
+    for (const args of [['--json', 'chat', '--', '-v'], ['chat', 'Explain this', '--json']]) {
+      const result = await runCli(args, { OTEKIN_CHAT_API_URL: endpoint });
+      assert.strictEqual(result.code, 0);
+      assert.deepStrictEqual(JSON.parse(result.stdout), gatewayResponse);
+      assert.strictEqual(result.stderr, '');
+    }
+  });
+  assert.deepStrictEqual(bodies.map((body) => body.messages[0].content), ['-v', 'Explain this']);
+
+  const cv = await runCli(['--no-open', '--', 'cv']);
+  assert.strictEqual(cv.code, 0);
+  assert.match(cv.stdout, /Link: https:\/\/omertekin2002\.github\.io\/resume/);
+  assert.strictEqual(cv.stderr, '');
+});
+
+test('CLI rejects --select without a value', async () => {
+  for (const args of [['--select'], ['--select', '--'], ['-s'], ['--select='], ['--select', '--', 'cv']]) {
+    const result = await runCli(args);
+    assert.strictEqual(result.code, 1, args.join(' '));
+    assert.strictEqual(result.stdout, '');
+    assert.match(result.stderr, /^Missing value for --select\n/);
+    assert.match(result.stderr, /Usage:/);
+  }
+
+  const valid = await runCli(['--select=linkedin', '--no-open']);
+  assert.strictEqual(valid.code, 0);
+  assert.match(valid.stdout, /Link: https:\/\/www\.linkedin\.com/);
 });
 
 test('CLI one-shot --json preserves the complete gateway response', async () => {
@@ -320,4 +470,31 @@ test('CLI rejects promptless non-TTY and promptless JSON chat locally', async ()
   assert.strictEqual(json.code, 1);
   assert.strictEqual(json.stdout, '');
   assert.match(json.stderr, /does not support --json/i);
+});
+
+test('CLI one-shot, --json and piped runs never create the history file', async () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'otekin-cli-history-'));
+  const file = path.join(directory, 'state', 'history.json');
+  try {
+    await withServer((request, response) => {
+      request.resume();
+      response.writeHead(200, { 'Content-Type': 'application/json' });
+      response.end(JSON.stringify({ message: 'Answer.' }));
+    }, async (endpoint) => {
+      for (const args of [
+        ['chat', 'Question'],
+        ['--json', 'chat', 'Question'],
+        ['chat', 'Question', '--no-history'],
+        ['chat'],
+        ['--select', 'chat'],
+        []
+      ]) {
+        const result = await runCli(args, { OTEKIN_CHAT_API_URL: endpoint, OTEKIN_HISTORY_FILE: file });
+        assert.notStrictEqual(result.signal, 'SIGTERM', args.join(' '));
+        assert.strictEqual(fs.existsSync(path.dirname(file)), false, args.join(' '));
+      }
+    });
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
 });
