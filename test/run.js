@@ -10,6 +10,7 @@ require('./chat-client.test');
 require('./chat-format.test');
 require('./terminal.test');
 require('./browser.test');
+require('./profile.test');
 require('./fullscreen.test');
 require('./cli.test');
 

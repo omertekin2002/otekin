@@ -12,15 +12,11 @@ const { formatChatResponse } = require('../lib/chat-format');
 const { saveGeneratedImages } = require('../lib/chat-images');
 const { browserCommand } = require('../lib/browser');
 const { cleanText, createTheme, startProgress, createActivityDisplay } = require('../lib/terminal');
+const profile = require('../lib/profile');
 
 const outputTheme = createTheme(process.stdout);
 
-const MESSAGE = "Hello! I'm Ömer, I'm a law & business student currently studying at Koç University";
-const LINKS = {
-  website: 'https://omertekin2002.github.io',
-  linkedin: 'https://www.linkedin.com/in/ömer-tekin/',
-  cv: 'https://omertekin2002.github.io/resume'
-};
+const LINKS = profile.links;
 
 function printHelp(stream = process.stdout) {
   const help = `
@@ -319,7 +315,7 @@ async function main() {
   }
 
   if (opts.json) {
-    process.stdout.write(JSON.stringify({ message: MESSAGE, links: LINKS }, null, 2) + '\n');
+    process.stdout.write(JSON.stringify({ message: `${profile.greeting} ${profile.tagline}`, links: LINKS }, null, 2) + '\n');
     return;
   }
 
@@ -329,10 +325,10 @@ async function main() {
   }
 
   if (outputTheme.interactive) {
-    process.stdout.write('\n  ' + outputTheme.strong('Ömer Tekin') + outputTheme.muted(' / otekin') + '\n');
-    process.stdout.write('  ' + outputTheme.muted('Law & business student at Koç University') + '\n\n');
+    process.stdout.write('\n  ' + outputTheme.strong(profile.name) + outputTheme.muted(' / otekin') + '\n');
+    process.stdout.write('  ' + outputTheme.muted(profile.tagline) + '\n\n');
   } else {
-    process.stdout.write(MESSAGE + '\n\n');
+    process.stdout.write(`${profile.greeting}\n${profile.tagline}\n\n`);
   }
 
   const selectedFromFlag = normalizeSelect(opts.select);

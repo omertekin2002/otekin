@@ -8,7 +8,8 @@ const pkg = require('../package.json');
 
 const ROOT = path.resolve(__dirname, '..');
 const CLI = path.join(ROOT, 'bin', 'otekin.js');
-const PROFILE_MESSAGE = "Hello! I'm Ömer, I'm a law & business student currently studying at Koç University";
+const GREETING = "Hi, I'm Ömer Tekin.";
+const TAGLINE = 'Law & business student at Koç University.';
 
 function runCli(args, env) {
   return new Promise((resolve, reject) => {
@@ -127,7 +128,7 @@ test('CLI preserves bare profile JSON output', async () => {
   const result = await runCli(['--json']);
   assert.strictEqual(result.code, 0);
   assert.deepStrictEqual(JSON.parse(result.stdout), {
-    message: PROFILE_MESSAGE,
+    message: `${GREETING} ${TAGLINE}`,
     links: {
       website: 'https://omertekin2002.github.io',
       linkedin: 'https://www.linkedin.com/in/ömer-tekin/',
@@ -140,8 +141,21 @@ test('CLI preserves bare profile JSON output', async () => {
 test('CLI preserves profile, CV, and LinkedIn commands', async () => {
   const profile = await runCli([]);
   assert.strictEqual(profile.code, 0);
-  assert.match(profile.stdout, new RegExp(PROFILE_MESSAGE.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
-  assert.match(profile.stdout, /Links:/);
+  assert.strictEqual(profile.stdout, [
+    GREETING,
+    TAGLINE,
+    '',
+    'Links:',
+    '- Website: https://omertekin2002.github.io',
+    '- LinkedIn: https://www.linkedin.com/in/ömer-tekin/',
+    '- CV: https://omertekin2002.github.io/resume',
+    ''
+  ].join('\n'));
+  assert.strictEqual(profile.stderr, '');
+
+  const nonInteractive = await runCli(['--non-interactive']);
+  assert.strictEqual(nonInteractive.code, 0);
+  assert.strictEqual(nonInteractive.stdout, profile.stdout);
 
   const cv = await runCli(['cv', '--no-open']);
   assert.strictEqual(cv.code, 0);
@@ -176,7 +190,7 @@ test('CLI one-shot chat sends the joined prompt and prints only the answer', asy
     assert.strictEqual(result.code, 0);
     assert.strictEqual(result.stdout, 'A concise answer.\n');
     assert.strictEqual(result.stderr, '');
-    assert.doesNotMatch(result.stdout, /Hello! I'm Ömer/);
+    assert.doesNotMatch(result.stdout, /Hi, I'm Ömer|Koç University/);
     const requests = fixture.getRequests();
     assert.deepStrictEqual(
       requests.map((request) => `${request.method} ${request.url}`),
