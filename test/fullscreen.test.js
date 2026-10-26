@@ -3,7 +3,12 @@
 const assert = require('assert');
 const {PassThrough, Writable} = require('stream');
 const {Terminal} = require('@xterm/headless');
+const crypto = require('crypto');
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
 const client = require('../lib/chat-client');
+const chatHistory = require('../lib/chat-history');
 
 const LINKS = {
   website: 'https://example.com/website',
@@ -54,7 +59,7 @@ async function terminalApp(options = {}) {
     }
     await new Promise(resolve => setTimeout(resolve, 40));
   };
-  await waitFor(() => screen().includes('Ready when you are'));
+  await waitFor(() => /Ready when you are|Restored your last conversation/.test(screen()));
   return {
     screen, type, opened, stdout, stdin, emulator, rawModes, raw: () => raw,
     async resize(width, height) {
@@ -638,6 +643,200 @@ test('scrolled-up conversations stay in place while provisional text grows', asy
     }
     await ui.type('\u001b[1;5F');
     assert.match(ui.screen(), /Streamed line 3/);
+  } finally {
+    await ui.close();
+  }
+});
+
+function historyDirectory() {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'otekin-fullscreen-history-'));
+  return {directory, file: path.join(directory, 'state', 'history.json')};
+}
+
+const checksum = file => crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex');
+
+test('saved history restores the conversation, prompt recall and sources, and /clear deletes it', async () => {
+  const {directory, file} = historyDirectory();
+  const requests = [];
+  const sources = [{title: 'Source', url: 'https://example.com/source'}];
+  const services = {
+    ...client, ensureChatServiceAwake: async () => {},
+    requestChat: async messages => {
+      requests.push(messages);
+      return requests.length === 1
+        ? {message: 'Saved answer [1].', model: 'fixture-model', webSources: sources}
+        : {message: `Answer ${requests.length}.`};
+    }
+  };
+  try {
+    const first = await terminalApp({services, historyFile: file});
+    try {
+      assert.match(first.screen(), /Ready when you are/);
+      await first.type('Remember this question\r');
+      await waitFor(() => first.screen().includes('Saved answer'));
+      await waitFor(() => fs.existsSync(file));
+    } finally {
+      await first.close();
+    }
+
+    const second = await terminalApp({columns: 80, services, historyFile: file});
+    try {
+      assert.match(second.screen(), /Restored your last conversation · \/clear to forget it/);
+      assert.match(second.screen(), /YOU\n\s*Remember this question/);
+      assert.match(second.screen(), /fixture-model\n\s*Saved answer \[1\]\./);
+      await second.type('\u001b[A');
+      assert.match(second.screen(), /│ › Remember this question/);
+      await second.type('\u0015Follow up\r');
+      await waitFor(() => second.screen().includes('Answer 2.'));
+      assert.deepStrictEqual(requests[1].map(message => message.content),
+        ['Remember this question', 'Saved answer [1].', 'Follow up']);
+      assert.deepStrictEqual(requests[1][1].webSources, sources);
+      await waitFor(() => chatHistory.loadHistory(file)?.prompts.length === 2);
+      await second.type('/clear\r');
+      await waitFor(() => second.screen().includes("Hi, I'm Ömer"));
+      assert.strictEqual(fs.existsSync(file), false);
+      await second.type('\u001b[A');
+      assert.match(second.screen(), /│ › Ask anything/, '/clear forgets saved prompts too');
+    } finally {
+      await second.close();
+    }
+
+    const third = await terminalApp({services, historyFile: file});
+    try {
+      assert.match(third.screen(), /Ready when you are/);
+      assert.match(third.screen(), /Hi, I'm Ömer/);
+      assert.doesNotMatch(third.screen(), /Remember this question|Follow up/);
+    } finally {
+      await third.close();
+    }
+  } finally {
+    fs.rmSync(directory, {recursive: true, force: true});
+  }
+});
+
+test('--no-history and OTEKIN_NO_HISTORY neither read nor write the history file', async () => {
+  const {directory, file} = historyDirectory();
+  const services = {
+    ...client, ensureChatServiceAwake: async () => {},
+    requestChat: async messages => ({message: `Unsaved answer ${messages.length}.`})
+  };
+  try {
+    chatHistory.saveHistory(file, {
+      history: [{role: 'user', content: 'Old question'}, {role: 'assistant', content: 'Old answer'}],
+      messages: [{role: 'user', content: 'Old question'}, {role: 'assistant', model: 'OTEKIN', content: 'Old answer'}],
+      prompts: ['Old question']
+    });
+    const before = checksum(file);
+    for (const [options, env] of [[{noHistory: true}, {}], [{}, {OTEKIN_NO_HISTORY: '1'}]]) {
+      const historyFile = chatHistory.historyFileFor(options, {OTEKIN_HISTORY_FILE: file, ...env});
+      assert.strictEqual(historyFile, null);
+      const ui = await terminalApp({services, historyFile});
+      try {
+        assert.match(ui.screen(), /Ready when you are/);
+        assert.doesNotMatch(ui.screen(), /Old question/);
+        await ui.type('\u001b[A');
+        assert.match(ui.screen(), /│ › Ask anything/);
+        await ui.type('New question\r');
+        await waitFor(() => ui.screen().includes('Unsaved answer'));
+        await ui.type('/clear\r');
+        await waitFor(() => ui.screen().includes("Hi, I'm Ömer"));
+      } finally {
+        await ui.close();
+      }
+      assert.strictEqual(checksum(file), before);
+    }
+    fs.rmSync(file);
+    const ui = await terminalApp({services, historyFile: chatHistory.historyFileFor({noHistory: true}, {OTEKIN_HISTORY_FILE: file})});
+    try {
+      await ui.type('New question\r');
+      await waitFor(() => ui.screen().includes('Unsaved answer'));
+    } finally {
+      await ui.close();
+    }
+    assert.strictEqual(fs.existsSync(file), false);
+  } finally {
+    fs.rmSync(directory, {recursive: true, force: true});
+  }
+});
+
+test('unusable history files start an empty session and still restore the terminal', async () => {
+  const {directory, file} = historyDirectory();
+  fs.mkdirSync(path.dirname(file), {recursive: true});
+  const valid = {version: 1, history: [], messages: [{role: 'user', content: 'Hidden'}], prompts: ['Hidden']};
+  try {
+    for (const text of ['{corrupt', JSON.stringify({...valid, version: 99}),
+      JSON.stringify({...valid, padding: 'x'.repeat(chatHistory.MAX_FILE_BYTES)})]) {
+      fs.writeFileSync(file, text);
+      const ui = await terminalApp({historyFile: file});
+      try {
+        assert.match(ui.screen(), /Ready when you are/);
+        assert.match(ui.screen(), /Hi, I'm Ömer/);
+        assert.doesNotMatch(ui.screen(), /Hidden/);
+        await ui.type('\u0003');
+        await waitFor(() => ui.emulator.buffer.active.type === 'normal');
+        assert.strictEqual(ui.rawModes[ui.rawModes.length - 1], false);
+      } finally {
+        await ui.close();
+      }
+    }
+  } finally {
+    fs.rmSync(directory, {recursive: true, force: true});
+  }
+});
+
+test('restored history never renders terminal escapes from disk', async () => {
+  const {directory, file} = historyDirectory();
+  fs.mkdirSync(path.dirname(file), {recursive: true});
+  fs.writeFileSync(file, JSON.stringify({
+    version: 1,
+    history: [],
+    messages: [
+      {role: 'user', content: 'Title\u001b]0;pwned-title\u0007 question'},
+      {role: 'assistant', model: '\u001b[31mspoofed', content: 'Wiped\u001b[2J answer \u001b]8;;https://evil.example\u0007link\u001b]8;;\u0007'}
+    ],
+    prompts: ['\u001b[2JRecalled']
+  }));
+  try {
+    const ui = await terminalApp({columns: 80, historyFile: file});
+    try {
+      assert.match(ui.screen(), /Title question/);
+      assert.match(ui.screen(), /OTEKIN\n\s*Wiped answer link/);
+      await ui.type('\u001b[A');
+      assert.match(ui.screen(), /│ › Recalled/);
+      assert.doesNotMatch(ui.raw(), /pwned-title|evil\.example|spoofed/);
+      assert.doesNotMatch(ui.raw(), /\u001b\[2J/);
+      assert.strictEqual(ui.emulator.buffer.active.type, 'alternate');
+    } finally {
+      await ui.close();
+    }
+  } finally {
+    fs.rmSync(directory, {recursive: true, force: true});
+  }
+});
+
+test('a failed save shows a status notice and the chat keeps working', async () => {
+  const saves = [];
+  const historyStore = {
+    ...chatHistory,
+    loadHistory: () => null,
+    saveHistory(file, state) {
+      saves.push(state);
+      throw Object.assign(new Error('denied /secret/path'), {code: 'EACCES'});
+    }
+  };
+  const ui = await terminalApp({historyFile: '/unused/history.json', historyStore, services: {
+    ...client, ensureChatServiceAwake: async () => {},
+    requestChat: async messages => ({message: `Answer ${messages.length}.`})
+  }});
+  try {
+    await ui.type('First\r');
+    await waitFor(() => ui.screen().includes('Could not save chat history (EACCES). The chat still works.'));
+    assert.doesNotMatch(ui.screen(), /secret/);
+    await ui.type('Second\r');
+    await waitFor(() => ui.screen().includes('Answer 3.'));
+    assert.strictEqual(saves.length, 2);
+    assert.deepStrictEqual(saves[1].prompts, ['First', 'Second']);
+    assert.strictEqual(saves[1].history.length, 4);
   } finally {
     await ui.close();
   }
