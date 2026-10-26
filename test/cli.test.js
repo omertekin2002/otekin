@@ -114,6 +114,7 @@ test('CLI help and version include chat without changing version behavior', asyn
   assert.match(help.stdout, /otekin chat/);
   assert.match(help.stdout, /\/clear/);
   assert.doesNotMatch(help.stdout, /--research/);
+  assert.match(help.stdout, /otekin chat -- "-5°C in °F\?"/);
   assert.strictEqual(help.stderr, '');
 
   const version = await runCli(['--version']);
@@ -213,6 +214,77 @@ test('CLI treats the removed --research flag like any other unknown option', asy
     { messages: [{ role: 'user', content: 'Find sources always' }], stream: false },
     { messages: [{ role: 'user', content: 'Find sources' }], stream: false }
   ]);
+});
+
+test('CLI sends dash-leading prompts and treats arguments after -- as positional', async () => {
+  const bodies = [];
+  await withServer(async (request, response) => {
+    bodies.push(JSON.parse(await readBody(request)));
+    response.writeHead(200, { 'Content-Type': 'application/json' });
+    response.end(JSON.stringify({ message: 'Answer.' }));
+  }, async (endpoint) => {
+    for (const args of [
+      ['chat', '-5°C in °F?'],
+      ['chat', '-', 'bullet', '--- x', '--a b=c'],
+      ['chat', '--', '--help', 'me'],
+      ['chat', 'Explain', '--', '--select', '-h', '--'],
+      ['chat', 'Explain this', '--no-open']
+    ]) {
+      const result = await runCli(args, { OTEKIN_CHAT_API_URL: endpoint });
+      assert.strictEqual(result.code, 0, args.join(' '));
+      assert.strictEqual(result.stdout, 'Answer.\n');
+      assert.strictEqual(result.stderr, '');
+    }
+  });
+
+  assert.deepStrictEqual(bodies.map((body) => body.messages[0].content), [
+    '-5°C in °F?',
+    '- bullet --- x --a b=c',
+    '--help me',
+    'Explain --select -h --',
+    'Explain this'
+  ]);
+  assert.deepStrictEqual(bodies[0], {
+    messages: [{ role: 'user', content: '-5°C in °F?' }],
+    stream: false
+  });
+});
+
+test('CLI parses options before -- and keeps options after prompt words', async () => {
+  const gatewayResponse = { message: 'JSON answer', provider: 'fixture' };
+  const bodies = [];
+  await withServer(async (request, response) => {
+    bodies.push(JSON.parse(await readBody(request)));
+    response.writeHead(200, { 'Content-Type': 'application/json' });
+    response.end(JSON.stringify(gatewayResponse));
+  }, async (endpoint) => {
+    for (const args of [['--json', 'chat', '--', '-v'], ['chat', 'Explain this', '--json']]) {
+      const result = await runCli(args, { OTEKIN_CHAT_API_URL: endpoint });
+      assert.strictEqual(result.code, 0);
+      assert.deepStrictEqual(JSON.parse(result.stdout), gatewayResponse);
+      assert.strictEqual(result.stderr, '');
+    }
+  });
+  assert.deepStrictEqual(bodies.map((body) => body.messages[0].content), ['-v', 'Explain this']);
+
+  const cv = await runCli(['--no-open', '--', 'cv']);
+  assert.strictEqual(cv.code, 0);
+  assert.match(cv.stdout, /Link: https:\/\/omertekin2002\.github\.io\/resume/);
+  assert.strictEqual(cv.stderr, '');
+});
+
+test('CLI rejects --select without a value', async () => {
+  for (const args of [['--select'], ['--select', '--'], ['-s'], ['--select='], ['--select', '--', 'cv']]) {
+    const result = await runCli(args);
+    assert.strictEqual(result.code, 1, args.join(' '));
+    assert.strictEqual(result.stdout, '');
+    assert.match(result.stderr, /^Missing value for --select\n/);
+    assert.match(result.stderr, /Usage:/);
+  }
+
+  const valid = await runCli(['--select=linkedin', '--no-open']);
+  assert.strictEqual(valid.code, 0);
+  assert.match(valid.stdout, /Link: https:\/\/www\.linkedin\.com/);
 });
 
 test('CLI one-shot --json preserves the complete gateway response', async () => {
