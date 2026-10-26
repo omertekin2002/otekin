@@ -42,7 +42,10 @@ npx otekin chat "What happened today?"
 npx otekin chat
 npx otekin chat "Explain this" --json
 npx otekin --select chat
+npx otekin chat -- "-5°C in °F?"
 ```
+
+Prompt words that start with `-` are sent as text unless they look like an option, such as `-x` or `--name`. Everything after `--` is always sent as prompt text, so `npx otekin chat -- --help me` asks about `--help me`.
 
 Use these commands in the composer:
 
@@ -78,6 +81,7 @@ When the service has optional image generation enabled, ask for an image in the 
 - `--select <website|linkedin|cv|chat|exit>`: choose an option directly.
 - `--json`: output profile JSON, or preserve the complete response object for a one-shot chat.
 - `--help`, `--version`: print CLI help or the package version.
+- `--`: end options. Later arguments are prompt text after `chat`, or a choice such as `cv`.
 
 ## Examples
 
