@@ -44,6 +44,9 @@ Options:
   -s, --select <choice>   Select directly: website | linkedin | cv | chat | exit
   --                      End options; later arguments are prompt text or a choice
 
+Prompt words that look like options, such as -x or --name, are rejected as
+unknown options unless they come after --.
+
 Examples:
   npx otekin
   npx otekin cv
@@ -80,6 +83,13 @@ Environment:
 
 const OPTION_SHAPE = /^--?[A-Za-z][^\s=]*(=.*)?$/;
 
+function unknownOptionError(arg) {
+  // Drop any `=value` so pasted values are never echoed back.
+  const name = cleanText(arg.split('=')[0]);
+  return `Unknown option: ${name}\n` +
+    `Run "otekin --help" to see the options. To send text that starts with "-", put it after "--": otekin chat -- "${name}"`;
+}
+
 function parseArgs(argv) {
   const opts = {
     help: false,
@@ -90,7 +100,8 @@ function parseArgs(argv) {
     select: null,
     command: null,
     commandArgs: [],
-    error: null
+    error: null,
+    errorHelp: false
   };
   let optionsEnded = false;
 
@@ -110,9 +121,11 @@ function parseArgs(argv) {
     else if (a === '-s' || a === '--select' || a.startsWith('--select=')) {
       const value = a.startsWith('--select=') ? a.slice('--select='.length) : argv[(i += 1)];
       if (value && value !== '--') opts.select = value;
-      else opts.error = 'Missing value for --select';
-    }
-    // Other option-shaped arguments are unknown and deliberately ignored.
+      else if (!opts.error) {
+        opts.error = 'Missing value for --select';
+        opts.errorHelp = true;
+      }
+    } else if (!opts.error) opts.error = unknownOptionError(a);
   }
 
   return opts;
@@ -267,7 +280,7 @@ async function main() {
 
   if (opts.error) {
     process.stderr.write(opts.error + '\n');
-    printHelp(process.stderr);
+    if (opts.errorHelp) printHelp(process.stderr);
     process.exitCode = 1;
     return;
   }

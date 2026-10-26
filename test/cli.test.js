@@ -189,31 +189,89 @@ test('CLI one-shot chat sends the joined prompt and prints only the answer', asy
   });
 });
 
-test('CLI treats the removed --research flag like any other unknown option', async () => {
+test('CLI rejects unknown options without sending anything', async () => {
+  await withServer((request, response) => {
+    request.resume();
+    response.writeHead(200, { 'Content-Type': 'application/json' });
+    response.end(JSON.stringify({ message: 'Should not be reached.' }));
+  }, async (endpoint, fixture) => {
+    for (const [args, name] of [
+      [['--reserch'], '--reserch'],
+      [['chat', 'Find', 'sources', '--research', 'always'], '--research'],
+      [['chat', 'Find', '--research=never'], '--research'],
+      [['chat', '-x', 'hi'], '-x'],
+      [['chat', 'hi', '--reserch'], '--reserch'],
+      [['--research=secret', 'chat', 'hi'], '--research'],
+      [['--help', '--unknown-flag'], '--unknown-flag'],
+      [['--json', 'chat', 'hi', '--unknown-flag', '--select'], '--unknown-flag']
+    ]) {
+      const result = await runCli(args, { OTEKIN_CHAT_API_URL: endpoint });
+      assert.strictEqual(result.code, 1, args.join(' '));
+      assert.strictEqual(result.stdout, '', args.join(' '));
+      assert.strictEqual(
+        result.stderr,
+        `Unknown option: ${name}\n` +
+          `Run "otekin --help" to see the options. To send text that starts with "-", put it after "--": otekin chat -- "${name}"\n`,
+        args.join(' ')
+      );
+      assert.doesNotMatch(result.stderr, /secret|never|Usage:/);
+    }
+    assert.deepStrictEqual(fixture.getRequests(), []);
+  });
+
+  const control = await runCli(['chat', 'hi', '--bad\u001B[31m']);
+  assert.strictEqual(control.code, 1);
+  assert.doesNotMatch(control.stderr, /\u001B/);
+  assert.match(control.stderr, /^Unknown option: --bad\n/);
+});
+
+test('CLI sends option-like words after -- as the prompt', async () => {
   const bodies = [];
   await withServer(async (request, response) => {
     bodies.push(JSON.parse(await readBody(request)));
     response.writeHead(200, { 'Content-Type': 'application/json' });
     response.end(JSON.stringify({ message: 'Answer.' }));
   }, async (endpoint) => {
-    // Unknown dash-prefixed options are ignored; bare words after `chat` join the prompt.
-    for (const args of [
-      ['chat', 'Find', 'sources', '--research=never'],
-      ['chat', 'Find', 'sources', '--research', 'always'],
-      ['chat', 'Find', 'sources', '--unknown-flag']
-    ]) {
+    for (const args of [['chat', '--', '--research', 'always'], ['chat', '--', '--reserch', 'hi']]) {
       const result = await runCli(args, { OTEKIN_CHAT_API_URL: endpoint });
-      assert.strictEqual(result.code, 0);
+      assert.strictEqual(result.code, 0, args.join(' '));
       assert.strictEqual(result.stdout, 'Answer.\n');
       assert.strictEqual(result.stderr, '');
     }
   });
 
-  assert.deepStrictEqual(bodies, [
-    { messages: [{ role: 'user', content: 'Find sources' }], stream: false },
-    { messages: [{ role: 'user', content: 'Find sources always' }], stream: false },
-    { messages: [{ role: 'user', content: 'Find sources' }], stream: false }
-  ]);
+  assert.deepStrictEqual(bodies.map((body) => body.messages[0].content), ['--research always', '--reserch hi']);
+});
+
+test('CLI accepts every known option', async () => {
+  for (const args of [['-h'], ['--help']]) {
+    const result = await runCli(args);
+    assert.strictEqual(result.code, 0, args.join(' '));
+    assert.match(result.stdout, /Usage:/);
+    assert.match(result.stdout, /rejected as\s+unknown options unless they come after --/);
+    assert.doesNotMatch(result.stdout, /ignored/);
+    assert.strictEqual(result.stderr, '');
+  }
+
+  for (const args of [['-v'], ['--version']]) {
+    const result = await runCli(args);
+    assert.strictEqual(result.code, 0, args.join(' '));
+    assert.strictEqual(result.stdout, `${pkg.version}\n`);
+  }
+
+  for (const args of [['--non-interactive'], ['--no-interactive']]) {
+    const result = await runCli(args);
+    assert.strictEqual(result.code, 0, args.join(' '));
+    assert.match(result.stdout, /Links:/);
+    assert.strictEqual(result.stderr, '');
+  }
+
+  for (const args of [['--cv', '--no-open'], ['--resume', '--no-open'], ['-s', 'cv', '--no-open'], ['--select', 'cv', '--no-open'], ['--select=cv', '--no-open']]) {
+    const result = await runCli(args);
+    assert.strictEqual(result.code, 0, args.join(' '));
+    assert.match(result.stdout, /Link: https:\/\/omertekin2002\.github\.io\/resume/);
+    assert.strictEqual(result.stderr, '');
+  }
 });
 
 test('CLI sends dash-leading prompts and treats arguments after -- as positional', async () => {
