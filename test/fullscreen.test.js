@@ -119,6 +119,36 @@ test('full-screen app fills an alternate buffer, resizes, and restores the termi
   }
 });
 
+test('welcome, /profile, and the sidebar show the same name and tagline at every size', async () => {
+  const name = 'Ömer Tekin';
+  const tagline = 'Law & business student at Koç University.';
+  for (const [columns, rows] of [[120, 40], [80, 24]]) {
+    const ui = await terminalApp({columns, rows});
+    // Below the header, the 27-column sidebar follows the app's one-column left padding.
+    const body = () => ui.screen().split('\n').slice(2, -1);
+    const main = () => body().map(line => line.slice(columns >= 100 ? 28 : 1).trim());
+    try {
+      assert(main().includes("Hi, I'm Ömer Tekin."), `welcome greeting at ${columns}×${rows}`);
+      assert(main().includes(tagline), `welcome tagline at ${columns}×${rows}`);
+      if (columns >= 100) {
+        const sidebar = body().map(line => line.slice(1, 28).trimEnd());
+        assert.strictEqual(sidebar[1], name.toUpperCase());
+        const wrapped = sidebar.slice(2, sidebar.indexOf('WORKSPACE'));
+        assert.deepStrictEqual(wrapped, ['Law & business student at', 'Koç University.']);
+        assert(wrapped.every(line => line.length <= 25), 'the tagline stays inside the sidebar padding');
+      } else {
+        assert.doesNotMatch(ui.screen(), /ÖMER TEKIN|WORKSPACE/);
+      }
+      await ui.type('/profile\r');
+      assert.match(ui.screen(), /About Ömer/);
+      assert(main().includes(name), `/profile name at ${columns}×${rows}`);
+      assert(main().includes(tagline), `/profile tagline at ${columns}×${rows}`);
+    } finally {
+      await ui.close();
+    }
+  }
+});
+
 test('command palette, navigation, and profile links work without leaving the app', async () => {
   const ui = await terminalApp();
   try {
