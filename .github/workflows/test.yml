@@ -37,4 +37,4 @@ jobs:
 
       - name: Verify published files
         run: |
-          node -e "const files = require('./pack-result.json')[0].files.map((item) => item.path); if (['bin/otekin.js', 'lib/chat-client.js', 'lib/fullscreen.mjs', 'lib/editor.mjs', 'lib/profile.js'].some(file => !files.includes(file)) || files.some(file => file.startsWith('test/'))) process.exit(1)"
+          node -e "const files = require('./pack-result.json')[0].files.map((item) => item.path); if (['bin/otekin.js', 'lib/chat-client.js', 'lib/chat-history.js', 'lib/fullscreen.mjs', 'lib/editor.mjs', 'lib/profile.js'].some(file => !files.includes(file)) || files.some(file => file.startsWith('test/'))) process.exit(1)"

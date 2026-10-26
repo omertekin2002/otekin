@@ -2,7 +2,9 @@
 
 const assert = require('assert');
 const { spawn } = require('child_process');
+const fs = require('fs');
 const http = require('http');
+const os = require('os');
 const path = require('path');
 const pkg = require('../package.json');
 
@@ -116,6 +118,10 @@ test('CLI help and version include chat without changing version behavior', asyn
   assert.match(help.stdout, /\/clear/);
   assert.doesNotMatch(help.stdout, /--research/);
   assert.match(help.stdout, /otekin chat -- "-5°C in °F\?"/);
+  assert.match(help.stdout, /--no-history/);
+  assert.match(help.stdout, /OTEKIN_NO_HISTORY=1/);
+  assert.match(help.stdout, /OTEKIN_HISTORY_FILE/);
+  assert.doesNotMatch(help.stdout, /memory only|current session/i);
   assert.strictEqual(help.stderr, '');
 
   const version = await runCli(['--version']);
@@ -273,7 +279,7 @@ test('CLI accepts every known option', async () => {
     assert.strictEqual(result.stdout, `${pkg.version}\n`);
   }
 
-  for (const args of [['--non-interactive'], ['--no-interactive']]) {
+  for (const args of [['--non-interactive'], ['--no-interactive'], ['--no-history', '--non-interactive']]) {
     const result = await runCli(args);
     assert.strictEqual(result.code, 0, args.join(' '));
     assert.match(result.stdout, /Links:/);
@@ -464,4 +470,31 @@ test('CLI rejects promptless non-TTY and promptless JSON chat locally', async ()
   assert.strictEqual(json.code, 1);
   assert.strictEqual(json.stdout, '');
   assert.match(json.stderr, /does not support --json/i);
+});
+
+test('CLI one-shot, --json and piped runs never create the history file', async () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'otekin-cli-history-'));
+  const file = path.join(directory, 'state', 'history.json');
+  try {
+    await withServer((request, response) => {
+      request.resume();
+      response.writeHead(200, { 'Content-Type': 'application/json' });
+      response.end(JSON.stringify({ message: 'Answer.' }));
+    }, async (endpoint) => {
+      for (const args of [
+        ['chat', 'Question'],
+        ['--json', 'chat', 'Question'],
+        ['chat', 'Question', '--no-history'],
+        ['chat'],
+        ['--select', 'chat'],
+        []
+      ]) {
+        const result = await runCli(args, { OTEKIN_CHAT_API_URL: endpoint, OTEKIN_HISTORY_FILE: file });
+        assert.notStrictEqual(result.signal, 'SIGTERM', args.join(' '));
+        assert.strictEqual(fs.existsSync(path.dirname(file)), false, args.join(' '));
+      }
+    });
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
 });

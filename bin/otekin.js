@@ -11,6 +11,7 @@ const {
 const { formatChatResponse } = require('../lib/chat-format');
 const { saveGeneratedImages } = require('../lib/chat-images');
 const { browserCommand } = require('../lib/browser');
+const { historyFileFor } = require('../lib/chat-history');
 const { cleanText, createTheme, startProgress, createActivityDisplay } = require('../lib/terminal');
 const profile = require('../lib/profile');
 
@@ -36,6 +37,7 @@ Options:
   --non-interactive       Print text + links and exit (no prompt)
   --json                  Output profile or one-shot chat JSON and exit
   --no-open               Don't open links in a browser (print them instead)
+  --no-history            Don't load or save full-screen chat history this run
   --cv, --resume          Open the CV download link directly
   -s, --select <choice>   Select directly: website | linkedin | cv | chat | exit
   --                      End options; later arguments are prompt text or a choice
@@ -64,7 +66,7 @@ Interactive terminal (Node.js 22+):
   /help                    Show all keyboard shortcuts
   /profile                 About Ömer
   /website, /linkedin, /cv  Open profile links
-  /clear                   Clear conversation history
+  /clear                   Clear the conversation and delete saved history
   /exit, /quit             End the chat session
   //text                   Send a message that starts with /
 
@@ -72,6 +74,11 @@ Environment:
   NO_COLOR                Disable terminal colors
   OTEKIN_CHAT_API_URL      Override the HTTP(S) chat endpoint (no API key required)
   OTEKIN_CHAT_HEALTH_URL   Override its HTTP(S) health endpoint (defaults to /healthz)
+  OTEKIN_NO_HISTORY=1      Never load or save full-screen chat history
+  OTEKIN_HISTORY_FILE      Save full-screen chat history to this file instead
+
+The full-screen chat saves its conversation and recent prompts so they come back
+next time. One-shot, --json and piped chat never read or write it.
 `.trim();
 
   stream.write(help + '\n');
@@ -93,6 +100,7 @@ function parseArgs(argv) {
     nonInteractive: false,
     json: false,
     noOpen: false,
+    noHistory: false,
     select: null,
     command: null,
     commandArgs: [],
@@ -113,6 +121,7 @@ function parseArgs(argv) {
     else if (a === '--non-interactive' || a === '--no-interactive') opts.nonInteractive = true;
     else if (a === '--json') opts.json = true;
     else if (a === '--no-open') opts.noOpen = true;
+    else if (a === '--no-history') opts.noHistory = true;
     else if (a === '--cv' || a === '--resume') opts.select = 'cv';
     else if (a === '-s' || a === '--select' || a.startsWith('--select=')) {
       const value = a.startsWith('--select=') ? a.slice('--select='.length) : argv[(i += 1)];
@@ -268,7 +277,13 @@ async function runOneShotChat(prompt, opts) {
 
 async function runInteractiveChat(opts) {
   const { runTerminalApp } = await import('../lib/fullscreen.mjs');
-  await runTerminalApp({ links: LINKS, version: pkg.version, options: opts, openInBrowser });
+  await runTerminalApp({
+    links: LINKS,
+    version: pkg.version,
+    options: opts,
+    openInBrowser,
+    historyFile: historyFileFor(opts)
+  });
 }
 
 async function main() {
