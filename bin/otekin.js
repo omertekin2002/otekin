@@ -66,6 +66,8 @@ Interactive terminal (Node.js 22+):
   /help                    Show all keyboard shortcuts
   /profile                 About Ömer
   /website, /linkedin, /cv  Open profile links
+  /retry                   Send your last message again
+  /save                    Save the conversation as a Markdown file
   /clear                   Clear the conversation and delete saved history
   /exit, /quit             End the chat session
   //text                   Send a message that starts with /
