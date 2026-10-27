@@ -883,37 +883,43 @@ test('/retry sends a failed or cancelled prompt again with the same request mess
 test('/retry after a reply replaces that turn in the request, transcript and saved history', async () => {
   const {directory, file} = historyDirectory();
   const requests = [];
+  const firstSource = {title: 'First', url: 'https://example.com/first'};
   let release;
   const services = {
     ...client, ensureChatServiceAwake: async () => {},
     async requestChat(messages) {
       requests.push(messages);
       if (requests.length === 3) await new Promise(resolve => {release = resolve;});
-      return {message: ['First answer.', 'Old answer.', 'New answer.'][requests.length - 1]};
+      const reply = requests.length - 1;
+      return {
+        message: ['First answer [1].', 'Old answer [2].', 'New answer [2].'][reply],
+        webSources: [[firstSource], [firstSource, {title: 'Second', url: 'https://example.com/second'}]][Math.min(reply, 1)]
+      };
     }
   };
   try {
     const ui = await terminalApp({services, historyFile: file});
     try {
       await ui.type('First question\r');
-      await waitFor(() => ui.screen().includes('First answer.'));
+      await waitFor(() => ui.screen().includes('First answer [1].'));
       await ui.type('Second question\r');
-      await waitFor(() => ui.screen().includes('Old answer.'));
+      await waitFor(() => ui.screen().includes('Old answer [2].'));
       await ui.type('/retry\r');
       await waitFor(() => requests.length === 3 && release);
       assert.deepStrictEqual(requests[2], requests[1]);
-      assert.deepStrictEqual(requests[2].map(message => message.content), ['First question', 'First answer.', 'Second question']);
-      assert.match(ui.screen(), /Old answer\./, 'the answered turn stays until its replacement arrives');
+      assert.deepStrictEqual(requests[2].map(message => message.content), ['First question', 'First answer [1].', 'Second question']);
+      assert.deepStrictEqual(requests[2][1].webSources, [firstSource]);
+      assert.match(ui.screen(), /Old answer \[2\]\./, 'the answered turn stays until its replacement arrives');
       release();
-      await waitFor(() => ui.screen().includes('New answer.'));
+      await waitFor(() => ui.screen().includes('New answer [2].'));
       assert.doesNotMatch(ui.screen(), /Old answer/);
       assert.strictEqual(ui.screen().match(/Second question/g).length, 1);
-      await waitFor(() => chatHistory.loadHistory(file)?.history.length === 4);
+      await waitFor(() => chatHistory.loadHistory(file)?.history[3]?.content === 'New answer [2].');
       const saved = chatHistory.loadHistory(file);
       assert.deepStrictEqual(saved.history.map(message => message.content),
-        ['First question', 'First answer.', 'Second question', 'New answer.']);
+        ['First question', 'First answer [1].', 'Second question', 'New answer [2].']);
       assert.deepStrictEqual(saved.messages.map(message => message.content),
-        ['First question', 'First answer.', 'Second question', 'New answer.']);
+        ['First question', 'First answer [1].\n\nSources: [1] First', 'Second question', 'New answer [2].\n\nSources: [1] First · [2] Second']);
       assert.deepStrictEqual(saved.prompts, ['First question', 'Second question']);
     } finally {
       await ui.close();
@@ -927,7 +933,7 @@ test('/retry after a reply replaces that turn in the request, transcript and sav
     try {
       await restored.type('/retry\r');
       await waitFor(() => restored.screen().includes('Restored retry.'));
-      assert.deepStrictEqual(requests[3].map(message => message.content), ['First question', 'First answer.', 'Second question']);
+      assert.deepStrictEqual(requests[3], requests[1], 'the earlier turn keeps its source catalog after a restart');
       assert.doesNotMatch(restored.screen(), /New answer/);
     } finally {
       await restored.close();

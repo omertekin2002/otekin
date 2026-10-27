@@ -85,6 +85,24 @@ test('chat history round-trips a conversation as plain text', () => {
   }
 });
 
+test('chat history keeps the catalog before the newest one, as the live session does', () => {
+  const first = [{ title: 'First', url: 'https://example.com/first' }];
+  const second = first.concat({ title: 'Second', url: 'https://example.com/second' });
+  const history = [
+    { role: 'user', content: 'One' },
+    { role: 'assistant', content: 'Answer one [1].', webSources: first },
+    { role: 'user', content: 'Two' },
+    { role: 'assistant', content: 'Answer two [2].', webSources: second }
+  ];
+  const parse = (items) => store.parseHistory(JSON.stringify({ version: 1, history: items, messages: [], prompts: [] }));
+  assert.deepStrictEqual(parse(history).history, history);
+  // Older catalogs are still dropped, and a last turn without sources needs nothing restored.
+  const older = [{ role: 'user', content: 'Zero' }, { role: 'assistant', content: 'Answer zero.', webSources: first }];
+  assert.strictEqual(parse(older.concat(history)).history[1].webSources, undefined);
+  const plain = history.slice(0, 2).concat({ role: 'user', content: 'Two' }, { role: 'assistant', content: 'No sources.' });
+  assert.deepStrictEqual(parse(plain).history, plain);
+});
+
 test('chat history keeps the in-memory bounds', () => {
   const { directory, file } = tempFile();
   try {
