@@ -52,6 +52,8 @@ Use these commands in the composer:
 - `/help` shows commands and keyboard shortcuts.
 - `/profile` shows Ömer's profile.
 - `/website`, `/linkedin`, and `/cv` open profile links. With `--no-open`, they display the URL in the conversation.
+- `/retry` sends your last message again. After a failed or cancelled reply, it sends the same request. After a reply arrived, the new reply replaces it, in the conversation and in what is sent to the gateway on later turns.
+- `/save` writes the conversation to a new Markdown file in the current directory, such as `otekin-chat-20261027-141500.md`, and shows its path. It contains your messages and the replies, headed by the model that answered, with numbered sources as Markdown links. Notices, errors and tool activity are left out, and replies restored from saved history have no source links. An existing file is never replaced: a second save in the same second adds a number such as `-2`.
 - `/clear` clears the conversation. With saved history on, it also deletes the history file and forgets recalled prompts.
 - `/exit` or `/quit` ends the session.
 
@@ -61,7 +63,7 @@ Each reply is labeled with the name of the model that answered, as reported by t
 
 Blank input is ignored. In a terminal, chat shows live tool activity: search queries, pages being read, API requests, and image generation. A status line shows the current operation and elapsed time; completed steps remain above the answer, and failed tools are marked explicitly. In the full-screen chat, the reply text appears as it streams in, marked as provisional, with terminal escapes removed and inline image data hidden. When the gateway finishes, it is replaced by the canonical answer with citations and image output. One-shot, piped and `--json` output still print only the final answer. The CLI allows up to five minutes per chat request after the health check succeeds.
 
-The terminal interface uses subtle color, clear speaker labels, and lightweight Markdown styling. Set `NO_COLOR=1` to disable color. Piped output stays plain, and `--json` returns the complete response without progress output. One-shot activity goes to stderr so stdout remains usable in pipelines. JSON and fully redirected requests continue to use the non-streaming endpoint contract. Gateways that return JSON to a streaming request display their completed tool activity after the reply arrives.
+The terminal interface uses subtle color, clear speaker labels, and lightweight Markdown styling. Set `NO_COLOR=1` to disable color, including in the full-screen workspace. Piped output stays plain, and `--json` returns the complete response without progress output. One-shot activity goes to stderr so stdout remains usable in pipelines. JSON and fully redirected requests continue to use the non-streaming endpoint contract. Gateways that return JSON to a streaming request display their completed tool activity after the reply arrives.
 
 Research is automatic: the CLI uses the gateway's default `auto` behavior, in which the answering model decides when to search, read pages or PDFs, or fetch public API data. Search results are leads; the model opens sources before citing them. Fresh retrieval does not guarantee that every claim is supported.
 
@@ -102,7 +104,7 @@ npx otekin --json chat "What changed recently in EU AI regulation?"
 
 ## Chat service and privacy
 
-Chat uses the public SLgateway endpoint at `https://signloop-chat-api.vercel.app/v1/chat`, hosted on Vercel, and requires no API key. The model chooses its research tools and can continue after a tool failure. Bounded conversation history, including tool replay and source catalogs, is sent again on subsequent turns. The full-screen chat also saves it on your computer, as described below. Generated image files are saved separately as described above. The CLI accepts responses up to 24 MiB to accommodate optional images. Streaming transfers are capped at 48 MiB because image data can appear in both a provisional delta and the final reply; each individual event remains limited to 24 MiB.
+Chat uses the public SLgateway endpoint at `https://signloop-chat-api.vercel.app/v1/chat`, hosted on Vercel, and requires no API key. The model chooses its research tools and can continue after a tool failure. Bounded conversation history, including tool replay and source catalogs, is sent again on subsequent turns. The full-screen chat also saves it on your computer, as described below. `/save` writes a separate Markdown copy of the conversation to the current directory, even with saved history off. On macOS and Linux only you can read it, and `/clear` leaves it in place. Generated image files are saved separately as described above. The CLI accepts responses up to 24 MiB to accommodate optional images. Streaming transfers are capped at 48 MiB because image data can appear in both a provisional delta and the final reply; each individual event remains limited to 24 MiB.
 
 Conversation content is transmitted to SLgateway and its configured model providers. Tool use can send search queries to search providers, URLs to hosted readers, requests to public API targets, and image prompts to the image provider. Calling the public endpoint can consume those providers' resources. Do not send sensitive content you would not want processed by those services.
 
