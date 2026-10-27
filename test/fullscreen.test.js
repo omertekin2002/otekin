@@ -841,3 +841,198 @@ test('a failed save shows a status notice and the chat keeps working', async () 
     await ui.close();
   }
 });
+
+test('/retry sends a failed or cancelled prompt again with the same request messages', async () => {
+  const requests = [];
+  const replies = [];
+  const services = {
+    ...client, ensureChatServiceAwake: async () => {},
+    requestChat(messages, options) {
+      requests.push(messages);
+      if (requests.length === 1) return Promise.reject(new Error('Gateway timed out.'));
+      if (requests.length === 2) {
+        return new Promise((resolve, reject) => options.signal.addEventListener('abort', () => reject(new Error('aborted'))));
+      }
+      return new Promise(resolve => replies.push(resolve));
+    }
+  };
+  const ui = await terminalApp({services});
+  try {
+    await ui.type('Flaky question\r');
+    await waitFor(() => ui.screen().includes('Gateway timed out.'));
+    await ui.type('/retry\r');
+    await waitFor(() => requests.length === 2);
+    assert.deepStrictEqual(requests[1], requests[0]);
+    await ui.type('/retry\r');
+    await waitFor(() => ui.screen().includes('A reply is on the way. Esc cancels it, then /retry sends it again.'));
+    assert.strictEqual(requests.length, 2, 'no second request while a reply is in progress');
+    await ui.type('\u001b');
+    await waitFor(() => ui.screen().includes('Cancelled. Ready for your next message.'));
+    await ui.type('/retry\r');
+    await waitFor(() => replies.length === 1);
+    assert.deepStrictEqual(requests[2], requests[0]);
+    replies[0]({message: 'Finally answered.', model: 'retry-model'});
+    await waitFor(() => ui.screen().includes('Finally answered.'));
+    assert.match(ui.screen(), /retry-model\n\s*Finally answered\./);
+    assert.deepStrictEqual(requests[0].map(message => message.content), ['Flaky question']);
+  } finally {
+    await ui.close();
+  }
+});
+
+test('/retry after a reply replaces that turn in the request, transcript and saved history', async () => {
+  const {directory, file} = historyDirectory();
+  const requests = [];
+  const firstSource = {title: 'First', url: 'https://example.com/first'};
+  let release;
+  const services = {
+    ...client, ensureChatServiceAwake: async () => {},
+    async requestChat(messages) {
+      requests.push(messages);
+      if (requests.length === 3) await new Promise(resolve => {release = resolve;});
+      const reply = requests.length - 1;
+      return {
+        message: ['First answer [1].', 'Old answer [2].', 'New answer [2].'][reply],
+        webSources: [[firstSource], [firstSource, {title: 'Second', url: 'https://example.com/second'}]][Math.min(reply, 1)]
+      };
+    }
+  };
+  try {
+    const ui = await terminalApp({services, historyFile: file});
+    try {
+      await ui.type('First question\r');
+      await waitFor(() => ui.screen().includes('First answer [1].'));
+      await ui.type('Second question\r');
+      await waitFor(() => ui.screen().includes('Old answer [2].'));
+      await ui.type('/retry\r');
+      await waitFor(() => requests.length === 3 && release);
+      assert.deepStrictEqual(requests[2], requests[1]);
+      assert.deepStrictEqual(requests[2].map(message => message.content), ['First question', 'First answer [1].', 'Second question']);
+      assert.deepStrictEqual(requests[2][1].webSources, [firstSource]);
+      assert.match(ui.screen(), /Old answer \[2\]\./, 'the answered turn stays until its replacement arrives');
+      release();
+      await waitFor(() => ui.screen().includes('New answer [2].'));
+      assert.doesNotMatch(ui.screen(), /Old answer/);
+      assert.strictEqual(ui.screen().match(/Second question/g).length, 1);
+      await waitFor(() => chatHistory.loadHistory(file)?.history[3]?.content === 'New answer [2].');
+      const saved = chatHistory.loadHistory(file);
+      assert.deepStrictEqual(saved.history.map(message => message.content),
+        ['First question', 'First answer [1].', 'Second question', 'New answer [2].']);
+      assert.deepStrictEqual(saved.messages.map(message => message.content),
+        ['First question', 'First answer [1].\n\nSources: [1] First', 'Second question', 'New answer [2].\n\nSources: [1] First · [2] Second']);
+      assert.deepStrictEqual(saved.prompts, ['First question', 'Second question']);
+    } finally {
+      await ui.close();
+    }
+
+    // A restored conversation can retry its last turn too.
+    const restored = await terminalApp({services: {...services, requestChat: async messages => {
+      requests.push(messages);
+      return {message: 'Restored retry.'};
+    }}, historyFile: file});
+    try {
+      await restored.type('/retry\r');
+      await waitFor(() => restored.screen().includes('Restored retry.'));
+      assert.deepStrictEqual(requests[3], requests[1], 'the earlier turn keeps its source catalog after a restart');
+      assert.doesNotMatch(restored.screen(), /New answer/);
+    } finally {
+      await restored.close();
+    }
+  } finally {
+    fs.rmSync(directory, {recursive: true, force: true});
+  }
+});
+
+test('/retry with nothing to retry, including after /clear, sends nothing', async () => {
+  const requests = [];
+  const services = {
+    ...client, ensureChatServiceAwake: async () => {},
+    requestChat: async messages => {
+      requests.push(messages);
+      return {message: 'Answer.'};
+    }
+  };
+  const ui = await terminalApp({services});
+  try {
+    await ui.type('/retry\r');
+    await waitFor(() => ui.screen().includes('Nothing to retry yet. Send a message first.'));
+    await ui.type('Question\r');
+    await waitFor(() => ui.screen().includes('Answer.'));
+    await ui.type('/clear\r');
+    await waitFor(() => ui.screen().includes("Hi, I'm Ömer"));
+    await ui.type('/retry\r');
+    await waitFor(() => ui.screen().includes('Nothing to retry yet. Send a message first.'));
+    assert.strictEqual(requests.length, 1);
+  } finally {
+    await ui.close();
+  }
+});
+
+test('/save writes the conversation to a new Markdown file without terminal escapes', async () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'otekin-fullscreen-save-'));
+  const services = {
+    ...client, ensureChatServiceAwake: async () => {},
+    requestChat: async () => ({
+      message: 'A **sourced** answer [1].\n\nSources:\n1. [Example](https://example.com/source)',
+      model: 'save-model',
+      webSources: [{title: 'Example source', url: 'https://example.com/source'}]
+    })
+  };
+  const saved = () => fs.readdirSync(directory).filter(name => /^otekin-chat-\d{8}-\d{6}(?:-\d+)?\.md$/.test(name)).sort();
+  try {
+    const ui = await terminalApp({services, saveDirectory: directory});
+    try {
+      await ui.type('/save\r');
+      await waitFor(() => ui.screen().includes('Nothing to save yet. Send a message first.'));
+      assert.deepStrictEqual(fs.readdirSync(directory), []);
+      await ui.type('Find a source\r');
+      await waitFor(() => ui.screen().includes('Sources: [1] Example source'));
+      await ui.type('/website\r');
+      await ui.type('/save\r');
+      await waitFor(() => ui.screen().includes('Saved the conversation to'));
+      assert.strictEqual(saved().length, 1);
+      assert(ui.screen().replace(/\s+/g, '').includes(path.join(directory, saved()[0]).replace(/\s+/g, '')));
+      const text = fs.readFileSync(path.join(directory, saved()[0]), 'utf8');
+      assert.doesNotMatch(text, /[\u0000-\u0009\u000B-\u001F\u007F-\u009F]/);
+      assert.match(text, /^# otekin chat · \d{4}-\d{2}-\d{2} \d{2}:\d{2}\n\n## You\n\nFind a source\n\n## save-model\n\n/);
+      assert.match(text, /A \*\*sourced\*\* answer \[1\]\.\n\nSources: \[\\\[1\\\] Example source\]\(https:\/\/example\.com\/source\)\n$/);
+      assert.doesNotMatch(text, /website:/, 'notices are left out');
+      await ui.type('/save\r');
+      await waitFor(() => saved().length === 2);
+      assert.strictEqual(fs.readFileSync(path.join(directory, saved()[1]), 'utf8'), text);
+    } finally {
+      await ui.close();
+    }
+
+    const failing = await terminalApp({services, saveDirectory: path.join(directory, 'missing', 'dir')});
+    try {
+      await failing.type('Question\r');
+      await waitFor(() => failing.screen().includes('A sourced answer'));
+      await failing.type('/save\r');
+      await waitFor(() => failing.screen().includes('Could not save the conversation (ENOENT). The chat still works.'));
+      assert.doesNotMatch(failing.screen(), /missing/);
+      assert.strictEqual(failing.emulator.buffer.active.type, 'alternate');
+      await failing.type('Again\r');
+      await waitFor(() => failing.screen().match(/A sourced answer/g)?.length === 2);
+    } finally {
+      await failing.close();
+    }
+  } finally {
+    fs.rmSync(directory, {recursive: true, force: true});
+  }
+});
+
+test('/retry and /save appear in /help and the command picker', async () => {
+  const ui = await terminalApp();
+  try {
+    await ui.type('/help\r');
+    assert.match(ui.screen(), /\/retry\s+Send your last message again/);
+    assert.match(ui.screen(), /\/save\s+Save the conversation as Markdown/);
+    await ui.type('/re');
+    assert.match(ui.screen(), /› \/retry\s+Send your last message again/);
+    await ui.type('\u0015/sa');
+    assert.match(ui.screen(), /› \/save\s+Save the conversation as Markdown/);
+  } finally {
+    await ui.close();
+  }
+});
