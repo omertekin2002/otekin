@@ -116,6 +116,8 @@ test('CLI help and version include chat without changing version behavior', asyn
   assert.strictEqual(help.code, 0);
   assert.match(help.stdout, /otekin chat/);
   assert.match(help.stdout, /\/clear/);
+  assert.match(help.stdout, /\/retry\s+Send your last message again/);
+  assert.match(help.stdout, /\/save\s+Save the conversation as a Markdown file/);
   assert.doesNotMatch(help.stdout, /--research/);
   assert.match(help.stdout, /otekin chat -- "-5°C in °F\?"/);
   assert.match(help.stdout, /--no-history/);

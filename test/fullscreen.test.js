@@ -7,6 +7,8 @@ const crypto = require('crypto');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
+const {createRequire} = require('module');
+const {pathToFileURL} = require('url');
 const client = require('../lib/chat-client');
 const chatHistory = require('../lib/chat-history');
 
@@ -21,6 +23,23 @@ async function waitFor(check, message) {
   while (!check()) {
     if (Date.now() > deadline) throw new Error(message || 'Terminal did not update in time.');
     await new Promise(resolve => setTimeout(resolve, 15));
+  }
+}
+
+// Matches any SGR sequence (color, dim, bold, inverse, reset...).
+const SGR = /\u001b\[[0-9;]*m/;
+
+// Chalk turns Ink's colors off when the test runner's stdout is not a terminal.
+// Force a color level on the chalk that Ink itself loads, so its styling reaches raw output.
+async function withInkColor(run) {
+  const chalkPath = createRequire(require.resolve('ink')).resolve('chalk');
+  const {default: chalk} = await import(pathToFileURL(chalkPath).href);
+  const level = chalk.level;
+  chalk.level = 1;
+  try {
+    return await run();
+  } finally {
+    chalk.level = level;
   }
 }
 
@@ -43,7 +62,7 @@ async function terminalApp(options = {}) {
   Object.assign(stdin, {isTTY: true, setRawMode(value) {rawModes.push(value);}, ref() {}, unref() {}});
   const opened = [];
   const app = render(React.createElement(TerminalApp, {
-    links: LINKS, version: 'test', openInBrowser: async url => opened.push(url), ...options
+    links: LINKS, version: 'test', openInBrowser: async url => opened.push(url), env: {}, ...options
   }), {
     stdout, stdin, stderr: stdout, alternateScreen: true, interactive: true,
     exitOnCtrlC: false, incrementalRendering: true, maxFps: 60
@@ -1035,4 +1054,77 @@ test('/retry and /save appear in /help and the command picker', async () => {
   } finally {
     await ui.close();
   }
+});
+
+test('NO_COLOR keeps the full-screen workspace free of SGR codes and focus still visible', async () => {
+  await withInkColor(async () => {
+    const {state, services} = streamingServices();
+    const ui = await terminalApp({services, env: {NO_COLOR: '1'}});
+    const lines = () => ui.screen().split('\n');
+    try {
+      assert.match(ui.screen(), /Hi, I'm Ömer Tekin\./);
+      assert.match(ui.screen(), /› Chat/);
+      assert(lines().some(line => line.includes('│ › Ask anything')), 'focused composer shows its › marker');
+      assert.match(ui.screen(), /╭/);
+      assert.doesNotMatch(ui.raw(), SGR, 'welcome screen');
+
+      await ui.type('/');
+      assert.match(ui.screen(), /› \/help\s+Keyboard shortcuts/);
+      assert.match(ui.screen(), /  \/profile\s+Meet Ömer/);
+      await ui.type('\u001b[B');
+      assert.match(ui.screen(), /› \/profile\s+Meet Ömer/);
+      assert.match(ui.screen(), /  \/help\s+Keyboard shortcuts/);
+      assert.doesNotMatch(ui.raw(), SGR, 'command palette');
+      await ui.type('\u0015\u001b');
+
+      await ui.type('\t\u001b[B');
+      assert.match(ui.screen(), /› About Ömer/);
+      assert.doesNotMatch(ui.screen(), /› Chat/);
+      assert(!lines().some(line => line.includes('│ ›')), 'unfocused composer hides its › marker');
+      assert.match(ui.screen(), /┌/);
+      assert.doesNotMatch(ui.screen(), /╭/);
+      assert.doesNotMatch(ui.raw(), SGR, 'navigation focus');
+      await ui.type('\t');
+      assert(lines().some(line => line.includes('│ › Ask anything')), 'composer focus returns');
+
+      await ui.type('Stream please\r');
+      await waitFor(() => Boolean(state.onDelta));
+      state.onActivity({id: 'search', tool: 'search_web', query: 'live answers', status: 'running'});
+      state.onDelta('Provisional words');
+      await waitFor(() => ui.screen().includes('Provisional words'));
+      assert.match(ui.screen(), /WRITING · provisional/);
+      assert.doesNotMatch(ui.raw(), SGR, 'streaming reply');
+      state.resolve({message: 'Canonical **answer** [1].', webSources: [{title: 'Source', url: 'https://example.com/source'}]});
+      await waitFor(() => ui.screen().includes('Canonical'));
+      assert.doesNotMatch(ui.raw(), SGR, 'finished reply');
+
+      await ui.resize(20, 6);
+      assert.match(ui.screen(), /Resize to at least/);
+      assert.doesNotMatch(ui.raw(), SGR, 'small terminal');
+    } finally {
+      await ui.close();
+    }
+  });
+});
+
+test('without NO_COLOR the full-screen workspace keeps its colors', async () => {
+  await withInkColor(async () => {
+    const ui = await terminalApp();
+    try {
+      const header = ui.emulator.buffer.active.getLine(0);
+      assert(header.getCell(1).isFgPalette() && header.getCell(1).isBold(), 'cyan bold brand');
+      assert.match(ui.raw(), /\u001b\[36m/);
+      assert.match(ui.raw(), /\u001b\[2m/);
+      assert.match(ui.screen(), /╭/);
+      assert(ui.screen().split('\n').some(line => line.includes('│ › Ask anything')));
+      await ui.type('\t');
+      // The focused navigation item is drawn inverse; the composer keeps its round border and marker.
+      const row = ui.screen().split('\n').findIndex(line => line.includes('› Chat'));
+      assert(ui.emulator.buffer.active.getLine(row).getCell(1).isInverse());
+      assert.match(ui.screen(), /╭/);
+      assert(ui.screen().split('\n').some(line => line.includes('│ › Ask anything')));
+    } finally {
+      await ui.close();
+    }
+  });
 });
