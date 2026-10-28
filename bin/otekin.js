@@ -13,6 +13,7 @@ const { saveGeneratedImages } = require('../lib/chat-images');
 const { browserCommand } = require('../lib/browser');
 const { historyFileFor } = require('../lib/chat-history');
 const { cleanText, createTheme, startProgress, createActivityDisplay } = require('../lib/terminal');
+const { createStreamPreview } = require('../lib/stream-preview');
 const profile = require('../lib/profile');
 
 const outputTheme = createTheme(process.stdout);
@@ -78,6 +79,10 @@ Environment:
   OTEKIN_CHAT_HEALTH_URL   Override its HTTP(S) health endpoint (defaults to /healthz)
   OTEKIN_NO_HISTORY=1      Never load or save full-screen chat history
   OTEKIN_HISTORY_FILE      Save full-screen chat history to this file instead
+
+In a terminal, one-shot chat shows the reply as it streams in, then replaces it
+with the final answer. Ctrl+C cancels it and exits with code 130. Piped, --json
+and TERM=dumb output print only the final answer.
 
 The full-screen chat saves its conversation and recent prompts so they come back
 next time. One-shot, --json and piped chat never read or write it.
@@ -255,10 +260,34 @@ async function runOneShotChat(prompt, opts) {
   }
 
   const activity = !opts.json && process.stderr.isTTY ? createActivityDisplay(process.stderr) : null;
+  // On a terminal, the reply streams in as a provisional preview under the AI header.
+  const preview = !opts.json && outputTheme.interactive
+    ? await createStreamPreview(process.stdout, {
+      theme: outputTheme,
+      startedAt: activity ? activity.startedAt : undefined,
+      statusLabel: () => activity && activity.runningLabel(),
+      onShow: () => activity && activity.pause()
+    })
+    : null;
+  const controller = new AbortController();
+  // Ctrl+C erases the preview and exits with 130; a second Ctrl+C exits at once.
+  const onInterrupt = () => {
+    if (controller.signal.aborted) {
+      preview.clear();
+      process.exit(130);
+    }
+    controller.abort();
+  };
+  if (preview) process.on('SIGINT', onInterrupt);
   try {
     const response = await requestChat(messages, {
-      onActivity: activity ? activity.onActivity : undefined
+      signal: preview ? controller.signal : undefined,
+      onActivity: activity && preview
+        ? (event) => preview.around(() => activity.onActivity(event))
+        : activity ? activity.onActivity : undefined,
+      onDelta: preview ? preview.update : undefined
     });
+    if (preview) preview.clear();
     if (activity) activity.finish(response);
     if (opts.json) {
       process.stdout.write(JSON.stringify(response, null, 2) + '\n');
@@ -271,9 +300,16 @@ async function runOneShotChat(prompt, opts) {
       if (outputTheme.interactive) process.stdout.write('\n');
     }
   } catch (error) {
+    if (preview) preview.clear();
     if (activity) activity.stop();
+    if (controller.signal.aborted) {
+      process.exitCode = 130;
+      return;
+    }
     process.stderr.write(`Chat error: ${errorMessage(error)}\n`);
     process.exitCode = 1;
+  } finally {
+    if (preview) process.removeListener('SIGINT', onInterrupt);
   }
 }
 
