@@ -6,21 +6,29 @@ const fs = require('fs');
 const http = require('http');
 const os = require('os');
 const path = require('path');
+const { Terminal } = require('@xterm/headless');
 const pkg = require('../package.json');
 
 const ROOT = path.resolve(__dirname, '..');
 const CLI = path.join(ROOT, 'bin', 'otekin.js');
 const GREETING = "Hi, I'm Ömer Tekin.";
 const TAGLINE = 'Law & business student at Koç University.';
+const TTY_STDOUT = ['-r', path.join(__dirname, 'tty-stdout.js')];
+const SGR = /\u001b\[[0-9;]*m/;
 
-function runCli(args, env) {
+// `nodeArgs` such as `-r <preload>` go before the CLI; an `undefined` env value unsets it.
+function runCli(args, env, nodeArgs) {
   return new Promise((resolve, reject) => {
-    const child = spawn(process.execPath, [CLI].concat(args), {
+    const childEnv = Object.assign({}, process.env, {
+      OTEKIN_CHAT_API_URL: 'http://127.0.0.1:1/v1/chat',
+      OTEKIN_CHAT_HEALTH_URL: ''
+    }, env || {});
+    Object.keys(childEnv).forEach((key) => {
+      if (childEnv[key] === undefined) delete childEnv[key];
+    });
+    const child = spawn(process.execPath, (nodeArgs || []).concat(CLI, args), {
       cwd: ROOT,
-      env: Object.assign({}, process.env, {
-        OTEKIN_CHAT_API_URL: 'http://127.0.0.1:1/v1/chat',
-        OTEKIN_CHAT_HEALTH_URL: ''
-      }, env || {}),
+      env: childEnv,
       stdio: ['pipe', 'pipe', 'pipe']
     });
     const stdout = [];
@@ -118,6 +126,8 @@ test('CLI help and version include chat without changing version behavior', asyn
   assert.match(help.stdout, /\/clear/);
   assert.match(help.stdout, /\/retry\s+Send your last message again/);
   assert.match(help.stdout, /\/save\s+Save the conversation as a Markdown file/);
+  assert.match(help.stdout, /one-shot chat shows the reply as it streams in/);
+  assert.match(help.stdout, /exits with code 130/);
   assert.doesNotMatch(help.stdout, /--research/);
   assert.match(help.stdout, /otekin chat -- "-5°C in °F\?"/);
   assert.match(help.stdout, /--no-history/);
@@ -499,4 +509,92 @@ test('CLI one-shot, --json and piped runs never create the history file', async 
   } finally {
     fs.rmSync(directory, { recursive: true, force: true });
   }
+});
+
+// Runs a one-shot chat whose stdout claims to be a 60x15 terminal, and replays it in xterm.
+async function runTtyChat(args, env) {
+  const result = await runCli(args, Object.assign({ TERM: 'xterm-256color', NO_COLOR: undefined }, env), TTY_STDOUT);
+  const emulator = new Terminal({ cols: 60, rows: 15, convertEol: true, allowProposedApi: true, scrollback: 0 });
+  await new Promise((resolve) => emulator.write(result.stdout, resolve));
+  const buffer = emulator.buffer.active;
+  result.screen = Array.from({ length: 15 }, (_, index) =>
+    buffer.getLine(buffer.viewportY + index).translateToString(true)).join('\n').replace(/\s+$/, '');
+  emulator.dispose();
+  return result;
+}
+
+function streamReply(events) {
+  return async (request, response) => {
+    const body = JSON.parse(await readBody(request));
+    assert.strictEqual(body.stream, true);
+    response.writeHead(200, { 'Content-Type': 'application/x-ndjson' });
+    for (const event of events) {
+      if (typeof event === 'number') await new Promise((resolve) => setTimeout(resolve, event));
+      else response.write(JSON.stringify(event) + '\n');
+    }
+    response.end();
+  };
+}
+
+test('CLI one-shot chat on a terminal streams a preview, then prints only the canonical answer', async () => {
+  await withServer(streamReply([
+    { type: 'delta', text: 'Provisional \u001b]52;c;ZXZpbA==\u0007text' },
+    250,
+    { type: 'delta', text: ' and \u001b[31mmore\u001b[0m' },
+    250,
+    { type: 'done', message: 'Canonical answer.' }
+  ]), async (endpoint) => {
+    const result = await runTtyChat(['chat', 'hi'], { OTEKIN_CHAT_API_URL: endpoint });
+    assert.strictEqual(result.code, 0);
+    assert.strictEqual(result.stderr, '');
+    const provisional = result.stdout.indexOf('Provisional text and more');
+    assert(provisional >= 0 && provisional < result.stdout.indexOf('Canonical answer.'));
+    assert.doesNotMatch(result.stdout, /\u001b\]52|ZXZpbA|\u001b\[31m/);
+    // After the erase, the bytes are exactly what a terminal got before streaming.
+    assert(result.stdout.endsWith('\u001b[?25h\n\u001b[1m  AI\u001b[0m\n\nCanonical answer.\n\n'));
+    assert.strictEqual(result.screen, '\n  AI\n\nCanonical answer.');
+  });
+});
+
+test('CLI one-shot preview is erased when the stream fails or ends early', async () => {
+  for (const ending of [[], [{ type: 'error', error: 'raw provider failure' }]]) {
+    await withServer(streamReply([{ type: 'delta', text: 'Half an answer' }, 250].concat(ending)), async (endpoint) => {
+      const result = await runTtyChat(['chat', 'hi'], { OTEKIN_CHAT_API_URL: endpoint });
+      assert.strictEqual(result.code, 1);
+      assert.match(result.stdout, /Half an answer/);
+      assert.match(result.stderr, /^Chat error: /);
+      assert.doesNotMatch(result.stderr, /raw provider failure/);
+      assert.strictEqual(result.screen, '');
+      assert.match(result.stdout, /\u001b\[\?25h$/);
+    });
+  }
+});
+
+test('CLI one-shot preview follows NO_COLOR', async () => {
+  await withServer(streamReply([{ type: 'delta', text: 'Plain preview' }, 250, { type: 'done', message: '**Plain** answer.' }]),
+    async (endpoint) => {
+      const result = await runTtyChat(['chat', 'hi'], { OTEKIN_CHAT_API_URL: endpoint, NO_COLOR: '1' });
+      assert.strictEqual(result.code, 0);
+      assert.match(result.stdout, /Plain preview/);
+      assert.doesNotMatch(result.stdout, SGR);
+      assert.strictEqual(result.screen, '\n  AI\n\n**Plain** answer.');
+    });
+});
+
+test('CLI one-shot on a dumb terminal or with --json keeps the non-streaming output', async () => {
+  const bodies = [];
+  await withServer(async (request, response) => {
+    bodies.push(JSON.parse(await readBody(request)));
+    response.writeHead(200, { 'Content-Type': 'application/json' });
+    response.end(JSON.stringify({ message: 'A concise answer.\n\n', provider: 'fixture' }));
+  }, async (endpoint) => {
+    const dumb = await runTtyChat(['chat', 'hi'], { OTEKIN_CHAT_API_URL: endpoint, TERM: 'dumb' });
+    assert.strictEqual(dumb.code, 0);
+    assert.strictEqual(dumb.stdout, 'A concise answer.\n');
+    const json = await runTtyChat(['chat', 'hi', '--json'], { OTEKIN_CHAT_API_URL: endpoint });
+    assert.strictEqual(json.code, 0);
+    assert.deepStrictEqual(JSON.parse(json.stdout), { message: 'A concise answer.\n\n', provider: 'fixture' });
+    assert.strictEqual(dumb.stderr + json.stderr, '');
+  });
+  assert.deepStrictEqual(bodies.map((body) => body.stream), [false, false]);
 });

@@ -19,6 +19,7 @@ require('./chat-history.test');
 require('./chat-format.test');
 require('./chat-export.test');
 require('./terminal.test');
+require('./stream-preview.test');
 require('./browser.test');
 require('./profile.test');
 require('./fullscreen.test');
