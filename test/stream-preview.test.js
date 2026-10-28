@@ -226,6 +226,24 @@ test('stream preview keeps output above it when the terminal narrows under a lon
   }
 });
 
+test('stream preview erases wide-character rows that wrap early after the terminal narrows', async () => {
+  const term = fakeTerminal({ columns: 80, rows: 24 });
+  const preview = await createStreamPreview(term.stream, { theme: createTheme(term.stream, {}) });
+  try {
+    // Each 78-cell row fits at 80 columns. At 39 it needs three rows, not two, because
+    // a wide character that does not fit in a row's last cell wraps to the next row.
+    preview.update(Array.from({ length: 4 }, () => '界'.repeat(38)).join('\n'));
+    await tick();
+    assert.match(await term.screen(), /界/);
+    term.resize(39, 24);
+    preview.clear();
+    assert.strictEqual(await term.screen(), PROMPT);
+  } finally {
+    preview.clear();
+    term.dispose();
+  }
+});
+
 test('stream preview never erases output above it after an emoji reply reflows', async () => {
   const term = fakeTerminal({ columns: 80, rows: 24 });
   const preview = await createStreamPreview(term.stream, { theme: createTheme(term.stream, {}) });
