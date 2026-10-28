@@ -207,3 +207,21 @@ test('tool activity and the preview share one terminal without overwriting each 
     term.dispose();
   }
 });
+
+test('stream preview keeps output above it when the terminal narrows under a long status row', async () => {
+  const term = fakeTerminal({ columns: 80, rows: 12 });
+  const theme = createTheme(term.stream, {});
+  const label = 'Reading page  ' + 'example.com/'.repeat(4) + 'report';
+  const preview = await createStreamPreview(term.stream, { theme, statusLabel: () => label });
+  try {
+    preview.update('Short preview');
+    await tick();
+    assert.match(await term.screen(), /Reading page {2}example\.com/);
+    term.resize(25, 12);
+    preview.clear();
+    assert.strictEqual(await term.screen(), PROMPT);
+  } finally {
+    preview.clear();
+    term.dispose();
+  }
+});
