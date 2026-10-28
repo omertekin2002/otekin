@@ -225,3 +225,22 @@ test('stream preview keeps output above it when the terminal narrows under a lon
     term.dispose();
   }
 });
+
+test('stream preview never erases output above it after an emoji reply reflows', async () => {
+  const term = fakeTerminal({ columns: 80, rows: 24 });
+  const preview = await createStreamPreview(term.stream, { theme: createTheme(term.stream, {}) });
+  try {
+    preview.update('👨‍👩‍👧‍👦'.repeat(8) + ' ' + '界'.repeat(30));
+    await tick();
+    term.resize(25, 24);
+    // The periodic redraw erases at the new width too.
+    await tick();
+    assert.strictEqual((await term.lines())[0], PROMPT);
+    preview.clear();
+    assert.strictEqual((await term.lines())[0], PROMPT);
+    assert.doesNotMatch(await term.screen(), /界/);
+  } finally {
+    preview.clear();
+    term.dispose();
+  }
+});
