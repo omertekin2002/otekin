@@ -20,6 +20,7 @@ const outputTheme = createTheme(process.stdout);
 
 const LINKS = profile.links;
 
+/** @param {NodeJS.WritableStream} [stream] */
 function printHelp(stream = process.stdout) {
   const help = `
 otekin — full-screen terminal workspace & AI chat
