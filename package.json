@@ -22,6 +22,7 @@
   },
   "scripts": {
     "start": "node ./bin/otekin.js",
+    "lint": "eslint .",
     "test": "node ./test/run.js"
   },
   "keywords": [
@@ -39,6 +40,10 @@
     "wrap-ansi": "^10.0.2"
   },
   "devDependencies": {
-    "@xterm/headless": "^6.0.0"
+    "@eslint/js": "^9.39.5",
+    "@xterm/headless": "^6.0.0",
+    "eslint": "^9.39.5",
+    "eslint-plugin-react-hooks": "^7.1.1",
+    "globals": "^17.13.0"
   }
 }

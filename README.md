@@ -148,7 +148,8 @@ The CLI treats the file as untrusted. A file that is damaged, from another versi
 ```bash
 npm ci
 npm start
+npm run lint
 npm test
 ```
 
-`npm start` opens the local version in your terminal. The terminal tests use a headless xterm emulator to check the actual rendered screen, keyboard input, resizing, scrolling, and cleanup.
+`npm start` opens the local version in your terminal. `npm run lint` runs ESLint, which CI also runs on every pull request and before publishing. The terminal tests use a headless xterm emulator to check the actual rendered screen, keyboard input, resizing, scrolling, and cleanup.
