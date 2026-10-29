@@ -148,7 +148,9 @@ The CLI treats the file as untrusted. A file that is damaged, from another versi
 ```bash
 npm ci
 npm start
+npm run lint
+npm run typecheck
 npm test
 ```
 
-`npm start` opens the local version in your terminal. The terminal tests use a headless xterm emulator to check the actual rendered screen, keyboard input, resizing, scrolling, and cleanup.
+`npm start` opens the local version in your terminal. `npm run lint` runs ESLint, which CI also runs on every pull request and before publishing. `npm run typecheck` checks the JavaScript in `bin/` and `lib/` with TypeScript's `checkJs` against the Node 22 API, and CI runs it alongside the linter. The terminal tests use a headless xterm emulator to check the actual rendered screen, keyboard input, resizing, scrolling, and cleanup.
