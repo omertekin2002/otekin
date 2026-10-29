@@ -211,13 +211,17 @@ function normalizeSelect(v) {
 function showCursor() {
   try {
     process.stdout.write('\u001B[?25h');
-  } catch {}
+  } catch {
+    // Ignored: the terminal may already be gone while we restore it.
+  }
 }
 
 function restoreTerminal() {
   try {
     if (process.stdin.isTTY && process.stdin.isRaw) process.stdin.setRawMode(false);
-  } catch {}
+  } catch {
+    // Ignored: the terminal may already be gone while we restore it.
+  }
   if (process.stdout.isTTY) showCursor();
 }
 

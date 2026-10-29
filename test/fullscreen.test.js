@@ -185,7 +185,7 @@ test('command palette, navigation, and profile links work without leaving the ap
     assert.deepStrictEqual(ui.opened, [LINKS.linkedin]);
     await ui.type('/profile\r');
     assert.match(ui.screen(), /About Ömer/);
-    assert.match(ui.screen(), /Website   https:\/\/example.com/);
+    assert.match(ui.screen(), /Website {3}https:\/\/example.com/);
     await ui.type('/help\r');
     assert.match(ui.screen(), /Make yourself at home/);
     await ui.type('\t\u001b[B\r');
@@ -1070,10 +1070,10 @@ test('NO_COLOR keeps the full-screen workspace free of SGR codes and focus still
 
       await ui.type('/');
       assert.match(ui.screen(), /› \/help\s+Keyboard shortcuts/);
-      assert.match(ui.screen(), /  \/profile\s+Meet Ömer/);
+      assert.match(ui.screen(), / {2}\/profile\s+Meet Ömer/);
       await ui.type('\u001b[B');
       assert.match(ui.screen(), /› \/profile\s+Meet Ömer/);
-      assert.match(ui.screen(), /  \/help\s+Keyboard shortcuts/);
+      assert.match(ui.screen(), / {2}\/help\s+Keyboard shortcuts/);
       assert.doesNotMatch(ui.raw(), SGR, 'command palette');
       await ui.type('\u0015\u001b');
 
