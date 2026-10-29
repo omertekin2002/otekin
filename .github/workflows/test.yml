@@ -24,6 +24,8 @@ jobs:
 
       - run: npm run lint
 
+      - run: npm run typecheck
+
   test:
     runs-on: ${{ matrix.os }}
     strategy:

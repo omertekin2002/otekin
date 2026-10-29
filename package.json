@@ -23,6 +23,7 @@
   "scripts": {
     "start": "node ./bin/otekin.js",
     "lint": "eslint .",
+    "typecheck": "tsc -p .",
     "test": "node ./test/run.js"
   },
   "keywords": [
@@ -41,9 +42,11 @@
   },
   "devDependencies": {
     "@eslint/js": "^9.39.5",
+    "@types/node": "^22.20.5",
     "@xterm/headless": "^6.0.0",
     "eslint": "^9.39.5",
     "eslint-plugin-react-hooks": "^7.1.1",
-    "globals": "^17.13.0"
+    "globals": "^17.13.0",
+    "typescript": "^5.9.3"
   }
 }

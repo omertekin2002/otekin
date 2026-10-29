@@ -1,0 +1,19 @@
+{
+  // Type-checks the plain JavaScript in bin/ and lib/ against the Node 22 API.
+  // Nothing is emitted: the CLI still runs straight from source.
+  // test/ is left out for now; checking it needs the `test` global from
+  // test/run.js declared and the mocks tightened, which is a later slice.
+  "compilerOptions": {
+    "allowJs": true,
+    "checkJs": true,
+    "noEmit": true,
+    "strict": false,
+    "target": "es2023",
+    "lib": ["es2023"],
+    "module": "nodenext",
+    "moduleResolution": "nodenext",
+    "skipLibCheck": true,
+    "types": ["node"]
+  },
+  "include": ["bin/**/*.js", "lib/**/*.js", "lib/**/*.mjs"]
+}
