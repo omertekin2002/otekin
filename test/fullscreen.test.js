@@ -733,6 +733,120 @@ test('saved history restores the conversation, prompt recall and sources, and /c
   }
 });
 
+// Every clickable label in the output, as "url label".
+const terminalLinks = raw => [...new Set([...raw.matchAll(/\u001b\]8;;(https?:[^\u0007]+)\u0007([^\u001b]*)\u001b\]8;;\u0007/g)]
+  .map(([, url, label]) => `${url} ${label}`))].sort();
+
+test('restored replies keep their clickable sources, /save links and /retry replacement', async () => {
+  const {directory, file} = historyDirectory();
+  const saveDirectory = path.join(directory, 'saved');
+  fs.mkdirSync(saveDirectory);
+  const replies = [
+    {
+      message: 'Cited **answer** [1][2].\n\nSources:\n- [1] [First footer](<https://example.com/first>)\n- [2] [Second footer](<https://example.com/second?q=(x)>)',
+      model: 'fixture-model',
+      webSources: [
+        {number: 1, title: 'First source', url: 'https://example.com/first'},
+        {number: 2, title: 'Second source', url: 'https://example.com/second?q=(x)'}
+      ]
+    },
+    {message: 'Retried answer [3].', model: 'fixture-model', webSources: [{number: 3, title: 'Third source', url: 'https://example.com/third'}]}
+  ];
+  const requests = [];
+  const services = {
+    ...client, ensureChatServiceAwake: async () => {},
+    requestChat: async messages => {
+      requests.push(messages);
+      return replies[requests.length - 1];
+    }
+  };
+  const savedFiles = () => fs.readdirSync(saveDirectory).sort();
+  // The transcript without its timestamped heading.
+  const savedBody = name => fs.readFileSync(path.join(saveDirectory, name), 'utf8').replace(/^# .*\n/, '');
+  const expected = [
+    'https://example.com/first [1] First source',
+    'https://example.com/second?q=(x) [2] Second source'
+  ];
+  try {
+    const first = await terminalApp({services, historyFile: file, saveDirectory});
+    let liveLinks;
+    try {
+      await first.type('Cite something\r');
+      await waitFor(() => first.screen().includes('Sources: [1] First source · [2] Second source'));
+      liveLinks = terminalLinks(first.raw());
+      assert.deepStrictEqual(liveLinks, expected);
+      await waitFor(() => chatHistory.loadHistory(file)?.messages.length === 2);
+      await first.type('/save\r');
+      await waitFor(() => savedFiles().length === 1);
+    } finally {
+      await first.close();
+    }
+    const live = savedBody(savedFiles()[0]);
+    assert.match(live, /Sources: \[\\\[1\\\] First source\]\(https:\/\/example\.com\/first\) · \[\\\[2\\\] Second source\]\(https:\/\/example\.com\/second\?q=%28x%29\)\n$/);
+
+    const second = await terminalApp({columns: 80, services, historyFile: file, saveDirectory});
+    try {
+      assert.match(second.screen(), /Restored your last conversation/);
+      assert.match(second.screen(), /fixture-model\n\s*Cited answer \[1\]\[2\]\.\n\s*\n\s*Sources: \[1\] First source · \[2\] Second source/);
+      assert.deepStrictEqual(terminalLinks(second.raw()), liveLinks);
+      assert.match(second.raw(), /\u001b\[1manswer/, 'restored replies keep their styling');
+      await second.type('/save\r');
+      await waitFor(() => savedFiles().length === 2);
+      assert.strictEqual(savedBody(savedFiles()[1]), live);
+
+      await second.type('/retry\r');
+      await waitFor(() => second.screen().includes('Retried answer [3].'));
+      assert.doesNotMatch(second.screen(), /Cited answer/);
+      const savedReplies = () => chatHistory.loadHistory(file)?.messages.filter(message => message.role === 'assistant');
+      await waitFor(() => savedReplies()?.[0]?.answer === 'Retried answer [3].');
+      assert.strictEqual(savedReplies().length, 1);
+      assert.deepStrictEqual(savedReplies()[0].sources, [{number: 3, title: 'Third source', url: 'https://example.com/third'}]);
+    } finally {
+      await second.close();
+    }
+
+    const third = await terminalApp({columns: 80, services, historyFile: file, saveDirectory});
+    try {
+      assert.match(third.screen(), /Retried answer \[3\]\.\n\s*\n\s*Sources: \[3\] Third source/);
+      assert.deepStrictEqual(terminalLinks(third.raw()), ['https://example.com/third [3] Third source']);
+    } finally {
+      await third.close();
+    }
+  } finally {
+    fs.rmSync(directory, {recursive: true, force: true});
+  }
+});
+
+test('restored replies without color keep their links, and bad saved sources stay plain text', async () => {
+  const {directory, file} = historyDirectory();
+  const reply = (sources, extra = {}) => ({
+    role: 'assistant', model: 'fixture-model', content: 'Plain answer [1].\n\nSources: [1] Saved', answer: 'Linked **answer** [1].', sources, ...extra
+  });
+  try {
+    fs.mkdirSync(path.dirname(file), {recursive: true});
+    fs.writeFileSync(file, JSON.stringify({version: 1, history: [], prompts: [], messages: [
+      {role: 'user', content: 'Good'},
+      reply([{number: 1, title: 'Saved', url: 'https://example.com/saved'}]),
+      {role: 'user', content: 'Bad'},
+      reply([{number: 1, title: '\u001b]0;pwned\u0007Evil', url: 'javascript:alert(1)'}], {content: 'Unlinked answer [1].'})
+    ]}));
+    await withInkColor(async () => {
+      const ui = await terminalApp({columns: 80, historyFile: file, env: {NO_COLOR: '1'}});
+      try {
+        assert.match(ui.screen(), /Linked \*\*answer\*\* \[1\]\.\n\s*\n\s*Sources: \[1\] Saved/);
+        assert.match(ui.screen(), /Unlinked answer \[1\]\./);
+        assert.deepStrictEqual(terminalLinks(ui.raw()), ['https://example.com/saved [1] Saved']);
+        assert.doesNotMatch(ui.raw(), SGR);
+        assert.doesNotMatch(ui.raw(), /pwned|javascript|Evil/);
+      } finally {
+        await ui.close();
+      }
+    });
+  } finally {
+    fs.rmSync(directory, {recursive: true, force: true});
+  }
+});
+
 test('--no-history and OTEKIN_NO_HISTORY neither read nor write the history file', async () => {
   const {directory, file} = historyDirectory();
   const services = {

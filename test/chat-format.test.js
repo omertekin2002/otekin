@@ -3,6 +3,8 @@
 const assert = require('assert');
 const {
   formatChatResponse,
+  resolveChatResponse,
+  formatResolvedResponse,
   splitSourceBlock,
   parseSourceBlock
 } = require('../lib/chat-format');
@@ -307,4 +309,31 @@ test('terminal answers style Markdown without altering code blocks or plain outp
   assert.match(styled, /\u001b\[1mImportant/);
   assert.match(styled, /const x = "\*\*literal\*\*";/);
   assert.strictEqual(formatChatResponse({ message }), message);
+});
+
+test('a resolved answer and its sources render exactly like the response they came from', () => {
+  const responses = [
+    { message: 'Plain answer.\n\n' },
+    { message: '# Cited **answer** [1][2]\n\nSources:\n- [1] [Footer one](<https://footer.test/one>)\n- [2] [Footer two](<https://footer.test/two>)' },
+    { message: 'Answer [1].', webSources: [{ title: 'Source\u001b]0;x\u0007', url: 'https://example.com/source' }, { title: 'Bad', url: 'javascript:alert(1)' }] }
+  ];
+  for (const response of responses) {
+    const resolved = resolveChatResponse(response);
+    for (const options of [{}, { hyperlinks: true }, { hyperlinks: true, color: true }]) {
+      assert.strictEqual(formatResolvedResponse(resolved, options), formatChatResponse(response, options));
+    }
+  }
+  assert.deepStrictEqual(resolveChatResponse(responses[0]), { answer: 'Plain answer.', sources: [] });
+  assert.deepStrictEqual(resolveChatResponse(responses[1]), {
+    answer: '# Cited **answer** [1][2]',
+    sources: [
+      { number: 1, title: 'Footer one', url: 'https://footer.test/one' },
+      { number: 2, title: 'Footer two', url: 'https://footer.test/two' }
+    ]
+  });
+  assert.deepStrictEqual(resolveChatResponse(responses[2]).sources, [
+    // Titles lose their control characters, so no escape sequence survives.
+    { number: 1, title: 'Source]0;x', url: 'https://example.com/source' },
+    { number: 2, title: 'Bad', url: null }
+  ]);
 });

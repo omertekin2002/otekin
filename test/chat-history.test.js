@@ -139,6 +139,128 @@ test('chat history keeps the in-memory bounds', () => {
   }
 });
 
+function sourcedReply(extra) {
+  return {
+    role: 'assistant',
+    model: 'fixture-model',
+    content: 'Cited answer [1][2].\n\nSources: [1] First · [2] Second',
+    answer: 'Cited **answer** [1][2].',
+    sources: [
+      { number: 1, title: 'First', url: 'https://example.com/first' },
+      { number: 2, title: 'Second', url: null }
+    ],
+    ...extra
+  };
+}
+
+test('chat history keeps a reply\'s answer and sources so its links can be rebuilt', () => {
+  const { directory, file } = tempFile();
+  try {
+    const state = conversation();
+    state.messages.push({ role: 'user', content: 'Cite it' },
+      sourcedReply({ markdown: 'never saved \u001b]8;;https://example.com/first\u0007[1] First\u001b]8;;\u0007' }));
+    store.saveHistory(file, state);
+    const saved = JSON.parse(fs.readFileSync(file, 'utf8'));
+    assert.strictEqual(saved.version, 1);
+    assert.deepStrictEqual(saved.messages[4], {
+      role: 'assistant',
+      content: 'Cited answer [1][2].\n\nSources: [1] First · [2] Second',
+      model: 'fixture-model',
+      answer: 'Cited **answer** [1][2].',
+      sources: [{ number: 1, title: 'First', url: 'https://example.com/first' }, { number: 2, title: 'Second' }]
+    });
+    assert.deepStrictEqual(store.loadHistory(file).messages[4], sourcedReply());
+    // A reply without sources, as from an older version, stays plain text.
+    assert.deepStrictEqual(store.loadHistory(file).messages[2],
+      { role: 'assistant', model: 'fixture-model', content: 'A lot changed [1].' });
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('chat history drops malformed reply sources and keeps the reply as plain text', () => {
+  const source = { number: 1, title: 'First', url: 'https://example.com/first' };
+  const plain = { role: 'assistant', model: 'fixture-model', content: 'Cited answer [1][2].\n\nSources: [1] First · [2] Second' };
+  const cases = [
+    { sources: [{ ...source, url: 'javascript:alert(1)' }] },
+    { sources: [{ ...source, url: 'ftp://example.com/file' }] },
+    { sources: [{ ...source, url: 'file:///etc/passwd' }] },
+    { sources: [{ ...source, url: '/relative/path' }] },
+    { sources: [{ ...source, url: 'https://example.com/a b' }] },
+    { sources: [{ ...source, url: 'https://example.com/\u001b]8;;x' }] },
+    { sources: [{ ...source, url: 'https://example.com/\u0085' }] },
+    { sources: [{ ...source, url: 'HTTPS://Example.com' }] },
+    { sources: [{ ...source, url: `https://example.com/${'a'.repeat(store.MAX_SOURCE_URL_CHARACTERS)}` }] },
+    { sources: [{ ...source, url: 7 }] },
+    { sources: [{ ...source, number: 1.5 }] },
+    { sources: [{ ...source, number: 0 }] },
+    { sources: [{ ...source, number: -1 }] },
+    { sources: [{ ...source, number: '1' }] },
+    { sources: [{ ...source, number: 2 ** 53 }] },
+    { sources: [source, { ...source, title: 'Again' }] },
+    { sources: [{ ...source, title: 'x'.repeat(store.MAX_SOURCE_TITLE_CHARACTERS + 1) }] },
+    { sources: [{ ...source, title: 'Two\nlines' }] },
+    { sources: [{ ...source, title: 'Tab\there' }] },
+    { sources: [{ ...source, title: '\u001b]0;pwned\u0007Title' }] },
+    { sources: [{ ...source, title: '\u001b[31mRed' }] },
+    { sources: [{ ...source, title: null }] },
+    { sources: Array.from({ length: store.MAX_SOURCES + 1 }, (_, index) => ({ ...source, number: index + 1 })) },
+    { sources: [] },
+    { sources: {} },
+    { sources: 'https://example.com/first' },
+    { sources: [null] },
+    { sources: [[1, 'First', 'https://example.com/first']] },
+    { answer: 7 },
+    { answer: undefined },
+    { sources: undefined }
+  ];
+  for (const extra of cases) {
+    const restored = store.parseHistory(JSON.stringify({
+      version: 1,
+      history: [],
+      messages: [{ role: 'user', content: 'Cite it' }, sourcedReply(extra)],
+      prompts: []
+    }));
+    assert(restored, JSON.stringify(extra).slice(0, 80));
+    assert.deepStrictEqual(restored.messages, [{ role: 'user', content: 'Cite it' }, plain], JSON.stringify(extra).slice(0, 80));
+    // Nothing invalid is written back either.
+    const saved = JSON.parse(store.serializeHistory({ history: [], messages: [sourcedReply(extra)], prompts: [] }));
+    assert.strictEqual(saved.messages[0].sources, undefined, JSON.stringify(extra).slice(0, 80));
+  }
+  // Sources on any other role are ignored.
+  const restored = store.parseHistory(JSON.stringify({
+    version: 1, history: [], messages: [{ ...sourcedReply(), role: 'user' }], prompts: []
+  }));
+  assert.deepStrictEqual(restored.messages, [{ role: 'user', content: plain.content }]);
+  // Terminal escapes in a stored answer are removed.
+  const escaped = store.parseHistory(JSON.stringify({
+    version: 1, history: [], messages: [sourcedReply({ answer: 'Safe\u001b]0;x\u0007 answer\u001b[2J' })], prompts: []
+  }));
+  assert.strictEqual(escaped.messages[0].answer, 'Safe answer');
+});
+
+test('chat history stays under its size cap with many large source lists', () => {
+  const { directory, file } = tempFile();
+  try {
+    const sources = Array.from({ length: store.MAX_SOURCES }, (_, index) => ({
+      number: index + 1,
+      title: 't'.repeat(store.MAX_SOURCE_TITLE_CHARACTERS),
+      url: `https://example.com/${String(index).padStart(4, '0')}${'u'.repeat(store.MAX_SOURCE_URL_CHARACTERS - 25)}`
+    }));
+    assert(sources.every((source) => source.url.length <= store.MAX_SOURCE_URL_CHARACTERS));
+    const messages = Array.from({ length: 100 }, (_, index) => sourcedReply({ content: `Reply ${index}`, sources }));
+    store.saveHistory(file, { history: [], messages, prompts: ['Last prompt'] });
+    assert(fs.statSync(file).size <= store.MAX_FILE_BYTES);
+    const restored = store.loadHistory(file);
+    assert(restored.messages.length > 0 && restored.messages.length < 100);
+    const last = restored.messages[restored.messages.length - 1];
+    assert.strictEqual(last.content, 'Reply 99');
+    assert.deepStrictEqual(last.sources, sources);
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
 test('chat history ignores corrupt, oversized, wrong-version and malformed files', () => {
   const { directory, file } = tempFile();
   const write = (text) => {
