@@ -337,3 +337,18 @@ test('a resolved answer and its sources render exactly like the response they ca
     { number: 2, title: 'Bad', url: null }
   ]);
 });
+
+test('source titles lose C1 control characters, so saved history keeps them', () => {
+  const store = require('../lib/chat-history');
+  const resolved = resolveChatResponse({
+    message: 'Answer [1].\n\nSources:\n- [1] [Footer](https://example.com/news)',
+    webSources: [{ number: 1, title: 'News\u0085Title\u009b31m', url: 'https://example.com/news' }]
+  });
+  assert.deepStrictEqual(resolved.sources, [{ number: 1, title: 'NewsTitle31m', url: 'https://example.com/news' }]);
+  assert.doesNotMatch(formatResolvedResponse(resolved, { hyperlinks: true }), /[\u0080-\u009F]/);
+  // The cleaned title is one that saved history accepts, so the reply keeps its link.
+  const saved = JSON.parse(store.serializeHistory({
+    history: [], messages: [{ role: 'assistant', content: 'x', ...resolved }], prompts: []
+  }));
+  assert.deepStrictEqual(saved.messages[0].sources, resolved.sources);
+});
