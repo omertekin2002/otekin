@@ -197,14 +197,13 @@ test('chat history drops malformed reply sources and keeps the reply as plain te
     { sources: [{ ...source, number: -1 }] },
     { sources: [{ ...source, number: '1' }] },
     { sources: [{ ...source, number: 2 ** 53 }] },
-    { sources: [source, { ...source, title: 'Again' }] },
     { sources: [{ ...source, title: 'x'.repeat(store.MAX_SOURCE_TITLE_CHARACTERS + 1) }] },
     { sources: [{ ...source, title: 'Two\nlines' }] },
     { sources: [{ ...source, title: 'Tab\there' }] },
     { sources: [{ ...source, title: '\u001b]0;pwned\u0007Title' }] },
     { sources: [{ ...source, title: '\u001b[31mRed' }] },
     { sources: [{ ...source, title: null }] },
-    { sources: Array.from({ length: store.MAX_SOURCES + 1 }, (_, index) => ({ ...source, number: index + 1 })) },
+    { sources: [{ ...source, title: 'News\u0085Title' }] },
     { sources: [] },
     { sources: {} },
     { sources: 'https://example.com/first' },
@@ -237,6 +236,34 @@ test('chat history drops malformed reply sources and keeps the reply as plain te
     version: 1, history: [], messages: [sourcedReply({ answer: 'Safe\u001b]0;x\u0007 answer\u001b[2J' })], prompts: []
   }));
   assert.strictEqual(escaped.messages[0].answer, 'Safe answer');
+});
+
+test('chat history drops only the unusable sources of a reply and keeps the rest', () => {
+  const sources = [1, 2, 3, 4, 5].map((number) => ({ number, title: `Source ${number}`, url: `https://example.com/${number}` }));
+  const long = `https://example.com/track?id=${'a'.repeat(2100)}`;
+  const reply = (list) => sourcedReply({ answer: 'Cited [1][2][3][4][5].', sources: list });
+  const restore = (list) => store.parseHistory(JSON.stringify({
+    version: 1, history: [], messages: [reply(list)], prompts: []
+  })).messages[0].sources;
+  const kept = (...numbers) => sources.filter((source) => numbers.includes(source.number));
+
+  // One long tracking link loses only that source; the others keep their numbers and links.
+  const withLong = sources.map((source) => (source.number === 3 ? { ...source, url: long } : source));
+  assert.deepStrictEqual(restore(withLong), kept(1, 2, 4, 5));
+  const saved = JSON.parse(store.serializeHistory({ history: [], messages: [reply(withLong)], prompts: [] }));
+  assert.strictEqual(saved.messages[0].answer, 'Cited [1][2][3][4][5].');
+  assert.deepStrictEqual(saved.messages[0].sources, kept(1, 2, 4, 5));
+
+  // Every other kind of bad entry is dropped alone too.
+  assert.deepStrictEqual(restore([
+    sources[0], null, { ...sources[1], url: 'javascript:alert(1)' }, { ...sources[2], title: 'Bad\u0085title' },
+    { ...sources[3], number: 0 }, sources[4], { ...sources[0], title: 'Same number' }
+  ]), kept(1, 5));
+
+  // A list longer than the cap keeps its first sources.
+  const many = Array.from({ length: store.MAX_SOURCES + 5 }, (_, index) =>
+    ({ number: index + 1, title: `Source ${index + 1}`, url: `https://example.com/${index + 1}` }));
+  assert.deepStrictEqual(restore(many), many.slice(0, store.MAX_SOURCES));
 });
 
 test('chat history stays under its size cap with many large source lists', () => {
