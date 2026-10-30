@@ -53,7 +53,7 @@ Use these commands in the composer:
 - `/profile` shows Ömer's profile.
 - `/website`, `/linkedin`, and `/cv` open profile links. With `--no-open`, they display the URL in the conversation.
 - `/retry` sends your last message again. After a failed or cancelled reply, it sends the same request. After a reply arrived, the new reply replaces it, in the conversation and in what is sent to the gateway on later turns.
-- `/save` writes the conversation to a new Markdown file in the current directory, such as `otekin-chat-20261027-141500.md`, and shows its path. It contains your messages and the replies, headed by the model that answered, with numbered sources as Markdown links. Notices, errors and tool activity are left out, and replies restored from saved history have no source links. An existing file is never replaced: a second save in the same second adds a number such as `-2`.
+- `/save` writes the conversation to a new Markdown file in the current directory, such as `otekin-chat-20261027-141500.md`, and shows its path. It contains your messages and the replies, headed by the model that answered, with numbered sources as Markdown links. Notices, errors and tool activity are left out. Replies restored from saved history keep their source links. An existing file is never replaced: a second save in the same second adds a number such as `-2`.
 - `/clear` clears the conversation. With saved history on, it also deletes the history file and forgets recalled prompts.
 - `/exit` or `/quit` ends the session.
 
@@ -130,7 +130,7 @@ CORS restrictions do not affect this Node.js CLI. The override must use an HTTP 
 
 The full-screen chat saves the conversation after each completed reply, so it is still there the next time you open it. One-shot `chat "…"`, `--json` and piped runs never read or write it.
 
-- **What is stored:** the bounded history sent back to the gateway (your messages, its replies, tool replay and the source catalog), the last 100 transcript entries as plain text, and your last 50 prompts. Restored replies lose their color and clickable links. Generated images stay in their own files.
+- **What is stored:** the bounded history sent back to the gateway (your messages, its replies, tool replay and the source catalog), the last 100 transcript entries as plain text, and your last 50 prompts. Each cited reply is also stored with its answer text and numbered sources (title and `http`/`https` link), so restored replies keep their styling and clickable source labels, and `/save` writes their sources as Markdown links. Tool activity is restored as plain text. Generated images stay in their own files.
 - **Where:** one JSON file, `history.json`, in:
   - Linux and others: `$XDG_STATE_HOME/otekin/`, or `~/.local/state/otekin/` when `XDG_STATE_HOME` isn't set
   - macOS: `~/Library/Application Support/otekin/`
@@ -141,7 +141,7 @@ The full-screen chat saves the conversation after each completed reply, so it is
 - **Forgetting it:** `/clear` deletes the file. Deleting it yourself works too.
 - **Turning it off:** `--no-history` skips loading and saving for one run and leaves any existing file untouched. Set `OTEKIN_NO_HISTORY=1` to turn it off for good. With history off, the conversation lasts only for the current session.
 
-The CLI treats the file as untrusted. A file that is damaged, from another version, or over 2 MiB is ignored and the chat starts empty; terminal control sequences in it are never displayed. If a save fails, the status line says so and the chat keeps working.
+The CLI treats the file as untrusted. A file that is damaged, from another version, or over 2 MiB is ignored and the chat starts empty; terminal control sequences in it are never displayed. A reply whose stored sources are malformed, too many or too long is restored as plain text, without links. If a save fails, the status line says so and the chat keeps working.
 
 ## Develop locally
 
