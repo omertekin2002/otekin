@@ -1278,12 +1278,13 @@ test('/save writes the conversation to a new Markdown file without terminal esca
   }
 });
 
-test('/retry and /save appear in /help and the command picker', async () => {
+test('/retry, /save and /sources appear in /help and the command picker', async () => {
   const ui = await terminalApp();
   try {
     await ui.type('/help\r');
     assert.match(ui.screen(), /\/retry\s+Send your last message again/);
     assert.match(ui.screen(), /\/save\s+Save the conversation as Markdown/);
+    assert.match(ui.screen(), /\/sources\s+Show the full titles and links of cited sources/);
     await ui.type('/re');
     assert.match(ui.screen(), /› \/retry\s+Send your last message again/);
     await ui.type('\u0015/sa');
@@ -1364,4 +1365,265 @@ test('without NO_COLOR the full-screen workspace keeps its colors', async () => 
       await ui.close();
     }
   });
+});
+
+// A cited reply as the gateway sends it: a numbered source footer and the matching webSources.
+function citedReply(answer, sources, model = 'fixture-model') {
+  const footer = sources.map(({number, title, url}) => `- [${number}] [${title.replace(/[[\]]/g, '')}](<${url || 'https://example.com/footer'}>)`);
+  return {message: `${answer}\n\nSources:\n${footer.join('\n')}`, model, webSources: sources};
+}
+
+const LONG_TITLE = 'A remarkably long source title that keeps going well past the forty-eight characters the source row shows';
+const LONG_URL = `https://example.com/articles/${'deep-path-segment/'.repeat(6)}final-page?query=value&another=parameter`;
+
+test('/sources lists cited replies in full and Esc restores the draft and chat scroll', async () => {
+  const replies = [
+    citedReply('First cited [1][2].', [
+      {number: 1, title: LONG_TITLE, url: LONG_URL},
+      {number: 2, title: 'Second source', url: 'https://example.com/second'}
+    ]),
+    citedReply(Array.from({length: 50}, (_,index) => `Answer line ${index + 1}`).join('\n') + ' [3]', [
+      {number: 3, title: 'Third source', url: 'https://example.com/third'}
+    ])
+  ];
+  const requests = [];
+  const ui = await terminalApp({columns: 80, services: {
+    ...client, ensureChatServiceAwake: async () => {},
+    requestChat: async messages => replies[requests.push(messages) - 1]
+  }});
+  const viewport = () => ui.screen().split('\n').slice(2, 25).join('\n');
+  const flat = () => ui.screen().replace(/\s+/g, '');
+  const composer = () => ui.screen().split('\n').find(line => line.includes('│ ›'));
+  try {
+    await ui.type('First question\r');
+    await waitFor(() => ui.screen().includes('First cited'));
+    assert.match(ui.screen(), /Sources: \[1\] A remarkably long source title that keeps going…/);
+    await ui.type('Second question\r');
+    await waitFor(() => ui.screen().includes('Answer line 50'));
+    await ui.type('\u001b[5~');
+    const before = viewport();
+    const scrolled = ui.screen().match(/↑ \d+ lines/)[0];
+    assert.doesNotMatch(before, /Answer line 50/);
+
+    await ui.type('/so');
+    assert.match(ui.screen(), /› \/sources\s+Show the full titles and links of cited sources/);
+    await ui.type('\r');
+    await waitFor(() => ui.screen().includes('Sources · reply 2 of 2'));
+    assert.match(ui.screen(), /\/ Sources/);
+    assert.match(ui.screen(), /Sources · reply 2 of 2 · fixture-model · \d{2}:\d{2}/);
+    assert.match(ui.screen(), /› \[3\] Third source\n\s*https:\/\/example\.com\/third/);
+    assert.doesNotMatch(ui.screen(), /\[1\]/);
+    assert.match(ui.screen(), /Esc back to chat/);
+
+    await ui.type('\u001b[D');
+    assert.match(ui.screen(), /Sources · reply 1 of 2 · fixture-model/);
+    // The whole title and link, wrapped to the terminal and never shortened.
+    assert(flat().includes(`[1]${LONG_TITLE.replace(/\s+/g, '')}${LONG_URL}`), ui.screen());
+    assert.doesNotMatch(viewport(), /…/);
+    assert.match(ui.screen(), /› \[1\] A remarkably/);
+    assert.match(ui.screen(), / {2}\[2\] Second source\n\s*https:\/\/example\.com\/second/);
+    await ui.type('\u001b[B');
+    assert.match(ui.screen(), /› \[2\] Second source/);
+    assert.match(ui.screen(), / {2}\[1\] A remarkably/);
+    await ui.type('\u001b[B\u001b[D');
+    assert.match(ui.screen(), /Sources · reply 1 of 2/, 'the first reply stays put');
+    assert.match(ui.screen(), /› \[2\] Second source/, 'the selection stays put at either end');
+    await ui.type('\u001b[C');
+    assert.match(ui.screen(), /Sources · reply 2 of 2/);
+    await ui.type('\u001b[C');
+    assert.match(ui.screen(), /Sources · reply 2 of 2/);
+
+    // Typing, editing keys and paste never reach the draft while the inspector is open.
+    await ui.type('typed text\u0015\u007f\u0017');
+    await ui.type('\u001b[200~pasted\u001b[201~');
+    assert.doesNotMatch(ui.screen(), /typed text|pasted/);
+    await ui.type('\u001b');
+    await waitFor(() => !ui.screen().includes('Sources · reply'));
+    assert.match(ui.screen(), /\/ Chat/);
+    assert.strictEqual(viewport(), before);
+    assert.match(ui.screen(), new RegExp(scrolled));
+    assert.match(composer(), /│ › Ask anything/);
+    assert.strictEqual(requests.length, 2);
+
+    await ui.type('abc\u001b[D');
+    assert.match(composer(), /│ › abc/);
+    const row = ui.screen().split('\n').indexOf(composer());
+    assert.strictEqual(ui.emulator.buffer.active.cursorY, row);
+    assert.strictEqual(ui.emulator.buffer.active.cursorX, composer().indexOf('abc') + 2);
+  } finally {
+    await ui.close();
+  }
+});
+
+test('/sources keeps the chat in place when a reply arrives while it is open', async () => {
+  const {state, services} = streamingServices();
+  const ui = await terminalApp({services});
+  const viewport = () => ui.screen().split('\n').slice(2, 25).join('\n');
+  try {
+    await ui.type('First question\r');
+    await waitFor(() => Boolean(state.resolve));
+    state.resolve(citedReply(Array.from({length: 50}, (_,index) => `Answer line ${index + 1}`).join('\n') + ' [1]', [
+      {number: 1, title: 'First source', url: 'https://example.com/first'}
+    ]));
+    await waitFor(() => ui.screen().includes('Answer line 50'));
+    state.resolve = null;
+    await ui.type('Second question\r');
+    await waitFor(() => Boolean(state.resolve));
+    await ui.type('\u001b[5~');
+    const before = viewport();
+    await ui.type('/sources\r');
+    await waitFor(() => ui.screen().includes('Sources · reply 1 of 1'));
+    state.resolve(citedReply(Array.from({length: 10}, (_,index) => `Second answer ${index + 1}`).join('\n') + ' [2]', [
+      {number: 2, title: 'Second source', url: 'https://example.com/second'}
+    ]));
+    await waitFor(() => ui.screen().includes('Sources · reply 1 of 2'));
+    assert.match(ui.screen(), /› \[1\] First source/);
+    await ui.type('\u001b');
+    await waitFor(() => !ui.screen().includes('Sources · reply'));
+    assert.strictEqual(viewport(), before);
+    await ui.type('\u001b[1;5F');
+    assert.match(ui.screen(), /Second answer 10/);
+
+    // At the bottom of the chat, it returns to the bottom.
+    await ui.type('/sources\r');
+    await waitFor(() => ui.screen().includes('Sources · reply 2 of 2'));
+    await ui.type('\u001b');
+    await waitFor(() => !ui.screen().includes('Sources · reply'));
+    assert.match(ui.screen(), /Second answer 10/);
+    assert.doesNotMatch(ui.screen(), /↑ \d+ lines/);
+  } finally {
+    await ui.close();
+  }
+});
+
+test('/sources opens the selected link, or shows it with --no-open, and never shows escapes', async () => {
+  const sources = [
+    {number: 1, title: 'Escaped \u001b]8;;https://evil.test\u0007Title\u001b]8;;\u0007 \u001b[31mRed', url: 'https://example.com/one'},
+    {number: 2, title: 'Unlinked source', url: 'javascript:alert(1)'},
+    ...Array.from({length: 10}, (_,index) => ({number: index + 3, title: `Source ${index + 3}`, url: `https://example.com/${index + 3}`}))
+  ];
+  const services = {...client, ensureChatServiceAwake: async () => {}, requestChat: async () => ({message: 'Many sources [1].', webSources: sources})};
+  const opened = [];
+  let fail = false;
+  const ui = await terminalApp({columns: 80, services, openInBrowser: async url => {
+    if (fail) throw new Error('no browser');
+    opened.push(url);
+  }});
+  try {
+    await ui.type('Cite a lot\r');
+    await waitFor(() => ui.screen().includes('Many sources [1].'));
+    const raw = ui.raw().length;
+    await ui.type('/sources\r');
+    await waitFor(() => ui.screen().includes('Sources · reply 1 of 1'));
+    assert.match(ui.screen(), /› \[1\] Escaped/);
+    assert.doesNotMatch(ui.raw().slice(raw), /\u001b\]8;;https:\/\/evil|\u001b\[31m/);
+    assert.match(ui.screen(), /\[2\] Unlinked source\n\s*\(no link\)/);
+    assert.doesNotMatch(ui.screen(), /\[12\]/);
+
+    await ui.type('\r');
+    await waitFor(() => opened.length === 1);
+    assert.deepStrictEqual(opened, ['https://example.com/one']);
+    await waitFor(() => ui.screen().includes('Opened [1] in your browser'));
+    await ui.type('\u001b[B\r');
+    await waitFor(() => ui.screen().includes('[2] has no link.'));
+    assert.strictEqual(opened.length, 1);
+
+    // ↓ keeps the selection in view; Page Up and Down scroll the list.
+    for (let index = 0; index < 10; index += 1) await ui.type('\u001b[B');
+    assert.match(ui.screen(), /› \[12\] Source 12/);
+    assert.doesNotMatch(ui.screen(), /Sources · reply/);
+    await ui.type('\u001b[5~');
+    assert.match(ui.screen(), /Sources · reply 1 of 1/);
+    assert.doesNotMatch(ui.screen(), /\[12\]/);
+    await ui.type('\u001b[6~');
+    assert.match(ui.screen(), /\[12\] Source 12/);
+
+    fail = true;
+    await ui.type('\r');
+    await waitFor(() => ui.screen().includes('Could not open a browser. The link is shown above.'));
+    assert.match(ui.screen(), /› \[12\] Source 12/, 'the inspector stays open');
+    assert.strictEqual(opened.length, 1);
+  } finally {
+    await ui.close();
+  }
+
+  const quiet = await terminalApp({services, options: {noOpen: true}});
+  try {
+    await quiet.type('Cite a lot\r');
+    await waitFor(() => quiet.screen().includes('Many sources [1].'));
+    await quiet.type('/sources\r');
+    await waitFor(() => quiet.screen().includes('Sources · reply 1 of 1'));
+    await quiet.type('\r');
+    await waitFor(() => quiet.screen().includes('[1] https://example.com/one'));
+    await quiet.type('\u001b[B\r');
+    await waitFor(() => quiet.screen().includes('[2] has no link.'));
+    assert.deepStrictEqual(quiet.opened, []);
+  } finally {
+    await quiet.close();
+  }
+});
+
+test('/sources without a cited reply adds a notice and stays in chat', async () => {
+  const ui = await terminalApp({services: {
+    ...client, ensureChatServiceAwake: async () => {}, requestChat: async () => ({message: 'Uncited answer.'})
+  }});
+  try {
+    await ui.type('/sources\r');
+    await waitFor(() => ui.screen().includes('No sources yet. Ask a question that needs research first.'));
+    assert.match(ui.screen(), /\/ Chat/);
+    await ui.type('Question\r');
+    await waitFor(() => ui.screen().includes('Uncited answer.'));
+    await ui.type('/sources\r');
+    await waitFor(() => ui.screen().match(/No sources yet/g)?.length === 2);
+    assert.match(ui.screen(), /\/ Chat/);
+    await ui.type('hello');
+    assert.match(ui.screen(), /│ › hello/);
+  } finally {
+    await ui.close();
+  }
+});
+
+test('/sources inspects replies restored from saved history, and NO_COLOR still shows the selection', async () => {
+  const {directory, file} = historyDirectory();
+  try {
+    fs.mkdirSync(path.dirname(file), {recursive: true});
+    fs.writeFileSync(file, JSON.stringify({version: 1, history: [], prompts: [], messages: [
+      {role: 'user', content: 'Saved question'},
+      {role: 'assistant', model: 'saved-model', content: 'Saved answer [1][2].', answer: 'Saved answer [1][2].', answeredAt: '2026-10-30T12:15:00.000Z', sources: [
+        {number: 1, title: LONG_TITLE, url: LONG_URL},
+        {number: 2, title: 'Saved without a link'}
+      ]}
+    ]}));
+    await withInkColor(async () => {
+      const ui = await terminalApp({columns: 80, historyFile: file, env: {NO_COLOR: '1'}});
+      try {
+        await ui.type('/sources\r');
+        await waitFor(() => ui.screen().includes('Sources · reply 1 of 1'));
+        assert.match(ui.screen(), /Sources · reply 1 of 1 · saved-model · (\d+ \w{3}( \d{4})? )?\d{2}:\d{2}/);
+        assert(ui.screen().replace(/\s+/g, '').includes(`[1]${LONG_TITLE.replace(/\s+/g, '')}${LONG_URL}`), ui.screen());
+        assert.match(ui.screen(), /› \[1\] A remarkably/);
+        assert.match(ui.screen(), / {2}\[2\] Saved without a link\n\s*\(no link\)/);
+        await ui.type('\u001b[B');
+        assert.match(ui.screen(), /› \[2\] Saved without a link/);
+        assert.match(ui.screen(), / {2}\[1\] A remarkably/);
+        assert.doesNotMatch(ui.raw(), SGR);
+      } finally {
+        await ui.close();
+      }
+    });
+    await withInkColor(async () => {
+      const ui = await terminalApp({historyFile: file});
+      try {
+        await ui.type('/sources\r');
+        await waitFor(() => ui.screen().includes('Sources · reply 1 of 1'));
+        const row = ui.screen().split('\n').findIndex(line => line.includes('› [1]'));
+        const column = ui.screen().split('\n')[row].indexOf('› [1]');
+        assert(ui.emulator.buffer.active.getLine(row).getCell(column).isInverse());
+      } finally {
+        await ui.close();
+      }
+    });
+  } finally {
+    fs.rmSync(directory, {recursive: true, force: true});
+  }
 });
