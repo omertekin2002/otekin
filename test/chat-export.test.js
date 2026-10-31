@@ -5,7 +5,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const { formatChatResponse } = require('../lib/chat-format');
-const { transcriptMarkdown, saveTranscript } = require('../lib/chat-export');
+const { answerTimeLabel, transcriptMarkdown, saveTranscript } = require('../lib/chat-export');
 
 const DATE = new Date(2026, 9, 27, 14, 5, 9);
 const CONTROLS = /[\u0000-\u0009\u000B-\u001F\u007F-\u009F]/;
@@ -68,6 +68,55 @@ test('transcriptMarkdown strips terminal escapes, OSC 8 links to other schemes a
   assert.doesNotMatch(markdown, /pwned|javascript/);
   assert.match(markdown, /## You\n\nTitle question\n/);
   assert.match(markdown, /## spoofed\n\nBold click \[\\\[1\\\] Ok\]\(https:\/\/example\.com\/ok\)\n$/);
+});
+
+test('transcriptMarkdown heads timed replies with their local answer time and leaves the rest alone', () => {
+  const answeredAt = new Date(2026, 9, 26, 9, 7, 45).toISOString();
+  const markdown = transcriptMarkdown([
+    { role: 'user', content: 'Question', answeredAt },
+    { role: 'assistant', model: 'timed-model', content: 'Timed answer', answeredAt },
+    { role: 'assistant', model: 'legacy-model', content: 'Untimed answer' },
+    { role: 'assistant', model: 'bad-model', content: 'Unreadable time', answeredAt: 'not a date' },
+    { role: 'assistant', model: 'odd-model', content: 'Not a string', answeredAt: 1761466065000 }
+  ], { date: DATE });
+  assert.strictEqual(markdown, [
+    '# otekin chat · 2026-10-27 14:05',
+    '',
+    '## You',
+    '',
+    'Question',
+    '',
+    '## timed-model · 2026-10-26 09:07',
+    '',
+    'Timed answer',
+    '',
+    '## legacy-model',
+    '',
+    'Untimed answer',
+    '',
+    '## bad-model',
+    '',
+    'Unreadable time',
+    '',
+    '## odd-model',
+    '',
+    'Not a string',
+    ''
+  ].join('\n'));
+});
+
+test('answerTimeLabel shows the local time today, the day on earlier days and the year in other years', () => {
+  const now = new Date(2026, 9, 31, 14, 15, 0);
+  const at = (...parts) => new Date(...parts).toISOString();
+  assert.strictEqual(answerTimeLabel(at(2026, 9, 31, 14, 15, 59), now), '14:15');
+  assert.strictEqual(answerTimeLabel(at(2026, 9, 31, 0, 0), now.getTime()), '00:00');
+  assert.strictEqual(answerTimeLabel(at(2026, 9, 30, 23, 59), now), '30 Oct 23:59');
+  assert.strictEqual(answerTimeLabel(at(2026, 0, 2, 8, 5), now), '2 Jan 08:05');
+  assert.strictEqual(answerTimeLabel(at(2025, 11, 31, 23, 0), now), '31 Dec 2025 23:00');
+  assert.strictEqual(answerTimeLabel(at(2026, 10, 1, 1, 30), now), '1 Nov 01:30', 'a time slightly ahead shows its day');
+  for (const value of [undefined, null, '', 'soon', 42, {}, `2026-10-31T14:15:00.000Z${' '.repeat(64)}`]) {
+    assert.strictEqual(answerTimeLabel(value, now), '', String(value));
+  }
 });
 
 test('transcriptMarkdown returns null when nothing was said', () => {

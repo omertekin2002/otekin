@@ -266,6 +266,53 @@ test('chat history drops only the unusable sources of a reply and keeps the rest
   assert.deepStrictEqual(restore(many), many.slice(0, store.MAX_SOURCES));
 });
 
+test('chat history keeps a reply\'s answer time and drops only an unusable one', () => {
+  const { directory, file } = tempFile();
+  const answeredAt = '2026-10-31T09:15:00.000Z';
+  const now = Date.parse('2026-10-31T10:00:00.000Z');
+  const parse = (messages) => store.parseHistory(JSON.stringify({ version: 1, history: [], messages, prompts: [] }), now);
+  try {
+    const state = conversation();
+    state.messages.push({ role: 'user', content: 'Cite it', answeredAt }, sourcedReply({ answeredAt }));
+    store.saveHistory(file, state);
+    const saved = JSON.parse(fs.readFileSync(file, 'utf8'));
+    assert.strictEqual(saved.version, 1);
+    assert.strictEqual(saved.messages[3].answeredAt, undefined, 'user messages get no time');
+    assert.strictEqual(saved.messages[4].answeredAt, answeredAt);
+    assert.strictEqual(saved.messages[2].answeredAt, undefined, 'a reply without a time gets none');
+    assert.deepStrictEqual(store.loadHistory(file).messages[4], sourcedReply({ answeredAt }));
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+
+  // Any other readable time is kept in the same UTC form.
+  assert.strictEqual(parse([sourcedReply({ answeredAt: '2026-10-31T12:15:00+03:00' })]).messages[0].answeredAt, answeredAt);
+  assert.strictEqual(parse([sourcedReply({ answeredAt: '2020-01-01T00:00:00.000Z' })]).messages[0].answeredAt,
+    '2020-01-01T00:00:00.000Z');
+  assert.strictEqual(parse([sourcedReply({ answeredAt: '2026-11-01T10:00:00.000Z' })]).messages[0].answeredAt,
+    '2026-11-01T10:00:00.000Z', 'up to a day ahead is allowed');
+
+  for (const bad of ['', 'yesterday', '2026-13-45T00:00:00Z', `${answeredAt}${' '.repeat(64)}`, 'x'.repeat(10000),
+    '2019-12-31T23:59:59.999Z', '1970-01-01T00:00:00.000Z', '2026-11-01T10:00:00.001Z', '+275760-09-13T00:00:00.000Z',
+    1761902100000, null, true, {}, [answeredAt]]) {
+    const restored = parse([{ role: 'user', content: 'Cite it' }, sourcedReply({ answeredAt: bad })]);
+    assert(restored, JSON.stringify(bad).slice(0, 80));
+    assert.deepStrictEqual(restored.messages, [{ role: 'user', content: 'Cite it' }, sourcedReply()],
+      JSON.stringify(bad).slice(0, 80));
+    const plain = parse([{ role: 'assistant', model: 'm', content: 'Plain', answeredAt: bad }]);
+    assert.deepStrictEqual(plain.messages, [{ role: 'assistant', model: 'm', content: 'Plain' }]);
+    const written = JSON.parse(store.serializeHistory({ history: [], messages: [sourcedReply({ answeredAt: bad })], prompts: [] }));
+    assert.strictEqual(written.messages[0].answeredAt, undefined, JSON.stringify(bad).slice(0, 80));
+    assert.deepStrictEqual(written.messages[0].sources, sourcedReply().sources.map(({ number, title, url }) =>
+      (url ? { number, title, url } : { number, title })));
+  }
+
+  // A time on any other role is ignored.
+  for (const role of ['user', 'tools', 'notice', 'error']) {
+    assert.deepStrictEqual(parse([{ role, content: 'Line', answeredAt }]).messages, [{ role, content: 'Line' }]);
+  }
+});
+
 test('chat history stays under its size cap with many large source lists', () => {
   const { directory, file } = tempFile();
   try {

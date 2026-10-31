@@ -338,16 +338,16 @@ test('slash-prefixed text is sent as chat unless it is a single command word', a
     await ui.type('/r/law is debating this\r');
     await waitFor(() => ui.screen().includes('Reply 1.'));
     assert.strictEqual(requests[0][0].content, '/r/law is debating this');
-    assert.match(ui.screen(), /gpt-6\.1-sol\n\s*Reply 1\./);
+    assert.match(ui.screen(), /gpt-6\.1-sol · [\w ]*\d{2}:\d{2}\n\s*Reply 1\./);
     await ui.type('//etc\r');
     await waitFor(() => ui.screen().includes('Reply 2.'));
     assert.strictEqual(requests[1][2].content, '/etc');
-    assert.match(ui.screen(), /OTEKIN\n\s*Reply 2\./);
+    assert.match(ui.screen(), /OTEKIN · [\w ]*\d{2}:\d{2}\n\s*Reply 2\./);
     await ui.type('\u001b[A');
     assert.match(ui.screen(), /│ › \/\/etc/);
     await ui.type('\u0015Third\r');
     await waitFor(() => ui.screen().includes('Reply 3.'));
-    assert.match(ui.screen(), /OTEKIN\n\s*Reply 3\./);
+    assert.match(ui.screen(), /OTEKIN · [\w ]*\d{2}:\d{2}\n\s*Reply 3\./);
     assert.doesNotMatch(ui.screen(), /spoofed/);
     await ui.type('/HELP\r');
     assert.match(ui.screen(), /Make yourself at home/);
@@ -702,7 +702,7 @@ test('saved history restores the conversation, prompt recall and sources, and /c
     try {
       assert.match(second.screen(), /Restored your last conversation · \/clear to forget it/);
       assert.match(second.screen(), /YOU\n\s*Remember this question/);
-      assert.match(second.screen(), /fixture-model\n\s*Saved answer \[1\]\./);
+      assert.match(second.screen(), /fixture-model · [\w ]*\d{2}:\d{2}\n\s*Saved answer \[1\]\./);
       await second.type('\u001b[A');
       assert.match(second.screen(), /│ › Remember this question/);
       await second.type('\u0015Follow up\r');
@@ -787,7 +787,7 @@ test('restored replies keep their clickable sources, /save links and /retry repl
     const second = await terminalApp({columns: 80, services, historyFile: file, saveDirectory});
     try {
       assert.match(second.screen(), /Restored your last conversation/);
-      assert.match(second.screen(), /fixture-model\n\s*Cited answer \[1\]\[2\]\.\n\s*\n\s*Sources: \[1\] First source · \[2\] Second source/);
+      assert.match(second.screen(), /fixture-model · [\w ]*\d{2}:\d{2}\n\s*Cited answer \[1\]\[2\]\.\n\s*\n\s*Sources: \[1\] First source · \[2\] Second source/);
       assert.deepStrictEqual(terminalLinks(second.raw()), liveLinks);
       assert.match(second.raw(), /\u001b\[1manswer/, 'restored replies keep their styling');
       await second.type('/save\r');
@@ -840,6 +840,112 @@ test('restored replies without color keep their links, and bad saved sources sta
         assert.doesNotMatch(ui.raw(), /pwned|javascript|Evil/);
       } finally {
         await ui.close();
+      }
+    });
+  } finally {
+    fs.rmSync(directory, {recursive: true, force: true});
+  }
+});
+
+test('replies show their answer time after the model label, after a restart, /retry and in /save', async () => {
+  const {directory, file} = historyDirectory();
+  const saveDirectory = path.join(directory, 'saved');
+  fs.mkdirSync(saveDirectory);
+  let clock = new Date(2026, 9, 30, 14, 15, 30).getTime();
+  const now = () => clock;
+  let answers = 0;
+  const services = {
+    ...client, ensureChatServiceAwake: async () => {},
+    requestChat: async () => ({message: `Answer ${++answers}.`, model: 'time-model'})
+  };
+  const savedReply = () => chatHistory.loadHistory(file)?.messages.find(message => message.role === 'assistant');
+  try {
+    const first = await terminalApp({columns: 80, services, historyFile: file, now});
+    try {
+      await first.type('When was this?\r');
+      await waitFor(() => first.screen().includes('Answer 1.'));
+      assert.match(first.screen(), /time-model · 14:15\n\s*Answer 1\./);
+      assert.match(first.screen(), /YOU\n\s*When was this\?/, 'user messages have no time');
+      await waitFor(() => savedReply()?.answeredAt === new Date(clock).toISOString());
+    } finally {
+      await first.close();
+    }
+
+    // The next day, the same reply shows its date too.
+    clock = new Date(2026, 9, 31, 9, 5, 0).getTime();
+    const second = await terminalApp({columns: 80, services, historyFile: file, saveDirectory, now});
+    try {
+      assert.match(second.screen(), /Restored your last conversation/);
+      assert.match(second.screen(), /time-model · 30 Oct 14:15\n\s*Answer 1\./);
+      await second.type('/save\r');
+      await waitFor(() => fs.readdirSync(saveDirectory).length === 1);
+      const saved = fs.readFileSync(path.join(saveDirectory, fs.readdirSync(saveDirectory)[0]), 'utf8');
+      assert.match(saved, /\n## You\n\nWhen was this\?\n\n## time-model · 2026-10-30 14:15\n\nAnswer 1\.\n$/);
+
+      await second.type('/retry\r');
+      await waitFor(() => second.screen().includes('Answer 2.'));
+      assert.match(second.screen(), /time-model · 09:05\n\s*Answer 2\./);
+      assert.doesNotMatch(second.screen(), /30 Oct/);
+      await waitFor(() => savedReply()?.answeredAt === new Date(clock).toISOString());
+    } finally {
+      await second.close();
+    }
+
+    const third = await terminalApp({columns: 80, services, historyFile: file, now});
+    try {
+      assert.match(third.screen(), /time-model · 09:05\n\s*Answer 2\./);
+    } finally {
+      await third.close();
+    }
+  } finally {
+    fs.rmSync(directory, {recursive: true, force: true});
+  }
+});
+
+test('saved replies without an answer time show none, and NO_COLOR shows times as plain text', async () => {
+  const {directory, file} = historyDirectory();
+  const now = () => new Date(2026, 9, 31, 9, 5, 0).getTime();
+  const write = messages => {
+    fs.mkdirSync(path.dirname(file), {recursive: true});
+    fs.writeFileSync(file, JSON.stringify({version: 1, history: [], prompts: [], messages}));
+  };
+  try {
+    // Today's format, from before answer times were saved.
+    write([
+      {role: 'user', content: 'Old question'},
+      {role: 'assistant', model: 'legacy-model', content: 'Legacy answer [1].\n\nSources: [1] Saved',
+        answer: 'Legacy answer [1].', sources: [{number: 1, title: 'Saved', url: 'https://example.com/saved'}]},
+      {role: 'assistant', model: 'bad-time-model', content: 'Bad time answer.', answeredAt: 'yesterday'}
+    ]);
+    const legacy = await terminalApp({columns: 80, historyFile: file, now});
+    try {
+      assert.match(legacy.screen(), /legacy-model\n\s*Legacy answer \[1\]\.\n\s*\n\s*Sources: \[1\] Saved/);
+      assert.match(legacy.screen(), /bad-time-model\n\s*Bad time answer\./);
+      assert.doesNotMatch(legacy.screen(), / · \d/);
+      assert.deepStrictEqual(terminalLinks(legacy.raw()), ['https://example.com/saved [1] Saved']);
+    } finally {
+      await legacy.close();
+    }
+
+    write([
+      {role: 'user', content: 'Question'},
+      {role: 'assistant', model: 'plain-model', content: 'Answered last year.', answeredAt: new Date(2025, 9, 30, 14, 15).toISOString()},
+      {role: 'assistant', model: 'plain-model', content: 'Answered today.', answeredAt: new Date(2026, 9, 31, 8, 0).toISOString()}
+    ]);
+    await withInkColor(async () => {
+      const plain = await terminalApp({columns: 80, historyFile: file, now, env: {NO_COLOR: '1'}});
+      try {
+        assert.match(plain.screen(), /plain-model · 30 Oct 2025 14:15\n\s*Answered last year\./);
+        assert.match(plain.screen(), /plain-model · 08:00\n\s*Answered today\./);
+        assert.doesNotMatch(plain.raw(), SGR);
+      } finally {
+        await plain.close();
+      }
+      const colored = await terminalApp({columns: 80, historyFile: file, now});
+      try {
+        assert.match(colored.raw(), /\u001b\[2m · 08:00/, 'the time is muted');
+      } finally {
+        await colored.close();
       }
     });
   } finally {
@@ -1006,7 +1112,7 @@ test('/retry sends a failed or cancelled prompt again with the same request mess
     assert.deepStrictEqual(requests[2], requests[0]);
     replies[0]({message: 'Finally answered.', model: 'retry-model'});
     await waitFor(() => ui.screen().includes('Finally answered.'));
-    assert.match(ui.screen(), /retry-model\n\s*Finally answered\./);
+    assert.match(ui.screen(), /retry-model · [\w ]*\d{2}:\d{2}\n\s*Finally answered\./);
     assert.deepStrictEqual(requests[0].map(message => message.content), ['Flaky question']);
   } finally {
     await ui.close();
@@ -1127,7 +1233,7 @@ test('/save writes the conversation to a new Markdown file without terminal esca
       assert(ui.screen().replace(/\s+/g, '').includes(path.join(directory, saved()[0]).replace(/\s+/g, '')));
       const text = fs.readFileSync(path.join(directory, saved()[0]), 'utf8');
       assert.doesNotMatch(text, /[\u0000-\u0009\u000B-\u001F\u007F-\u009F]/);
-      assert.match(text, /^# otekin chat · \d{4}-\d{2}-\d{2} \d{2}:\d{2}\n\n## You\n\nFind a source\n\n## save-model\n\n/);
+      assert.match(text, /^# otekin chat · \d{4}-\d{2}-\d{2} \d{2}:\d{2}\n\n## You\n\nFind a source\n\n## save-model · \d{4}-\d{2}-\d{2} \d{2}:\d{2}\n\n/);
       assert.match(text, /A \*\*sourced\*\* answer \[1\]\.\n\nSources: \[\\\[1\\\] Example source\]\(https:\/\/example\.com\/source\)\n$/);
       assert.doesNotMatch(text, /website:/, 'notices are left out');
       await ui.type('/save\r');
