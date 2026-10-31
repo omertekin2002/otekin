@@ -126,6 +126,7 @@ test('CLI help and version include chat without changing version behavior', asyn
   assert.match(help.stdout, /\/clear/);
   assert.match(help.stdout, /\/retry\s+Send your last message again/);
   assert.match(help.stdout, /\/save\s+Save the conversation as a Markdown file/);
+  assert.match(help.stdout, /\/sources\s+Show the full titles and links of a reply's sources/);
   assert.match(help.stdout, /one-shot chat shows the reply as it streams in/);
   assert.match(help.stdout, /exits with code 130/);
   assert.doesNotMatch(help.stdout, /--research/);
