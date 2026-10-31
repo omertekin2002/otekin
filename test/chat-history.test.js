@@ -301,7 +301,7 @@ test('chat history keeps a reply\'s answer time and drops only an unusable one',
       JSON.stringify(bad).slice(0, 80));
     const plain = parse([{ role: 'assistant', model: 'm', content: 'Plain', answeredAt: bad }]);
     assert.deepStrictEqual(plain.messages, [{ role: 'assistant', model: 'm', content: 'Plain' }]);
-    const written = JSON.parse(store.serializeHistory({ history: [], messages: [sourcedReply({ answeredAt: bad })], prompts: [] }));
+    const written = JSON.parse(store.serializeHistory({ history: [], messages: [sourcedReply({ answeredAt: bad })], prompts: [] }, now));
     assert.strictEqual(written.messages[0].answeredAt, undefined, JSON.stringify(bad).slice(0, 80));
     assert.deepStrictEqual(written.messages[0].sources, sourcedReply().sources.map(({ number, title, url }) =>
       (url ? { number, title, url } : { number, title })));

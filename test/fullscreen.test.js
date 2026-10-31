@@ -902,6 +902,23 @@ test('replies show their answer time after the model label, after a restart, /re
   }
 });
 
+test('an open chat dates its earlier replies once the local day changes', async () => {
+  let clock = new Date(2026, 9, 30, 23, 59, 59, 500).getTime();
+  const ui = await terminalApp({columns: 80, now: () => clock, services: {
+    ...client, ensureChatServiceAwake: async () => {},
+    requestChat: async () => ({message: 'Late answer.', model: 'night-model'})
+  }});
+  try {
+    await ui.type('Still up?\r');
+    await waitFor(() => ui.screen().includes('Late answer.'));
+    assert.match(ui.screen(), /night-model · 23:59\n/);
+    clock = new Date(2026, 9, 31, 0, 0, 1).getTime();
+    await waitFor(() => ui.screen().includes('night-model · 30 Oct 23:59'), 'the label did not change at midnight');
+  } finally {
+    await ui.close();
+  }
+});
+
 test('saved replies without an answer time show none, and NO_COLOR shows times as plain text', async () => {
   const {directory, file} = historyDirectory();
   const now = () => new Date(2026, 9, 31, 9, 5, 0).getTime();
