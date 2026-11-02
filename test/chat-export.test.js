@@ -5,7 +5,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const { formatChatResponse } = require('../lib/chat-format');
-const { answerTimeLabel, transcriptMarkdown, saveTranscript } = require('../lib/chat-export');
+const { answerDate, answerTimeLabel, transcriptMarkdown, saveTranscript } = require('../lib/chat-export');
 
 const DATE = new Date(2026, 9, 27, 14, 5, 9);
 const CONTROLS = /[\u0000-\u0009\u000B-\u001F\u007F-\u009F]/;
@@ -114,9 +114,18 @@ test('answerTimeLabel shows the local time today, the day on earlier days and th
   assert.strictEqual(answerTimeLabel(at(2026, 0, 2, 8, 5), now), '2 Jan 08:05');
   assert.strictEqual(answerTimeLabel(at(2025, 11, 31, 23, 0), now), '31 Dec 2025 23:00');
   assert.strictEqual(answerTimeLabel(at(2026, 10, 1, 1, 30), now), '1 Nov 01:30', 'a time slightly ahead shows its day');
-  for (const value of [undefined, null, '', 'soon', 42, {}, `2026-10-31T14:15:00.000Z${' '.repeat(64)}`]) {
+  for (const value of [undefined, null, '', 'soon', 42, {}, `2026-10-31T14:15:00.000Z${' '.repeat(64)}`,
+    '2026-02-30T00:00:00Z', '2025-02-29T00:00:00Z', '2026-10-31T09:15:00', 'Oct 31 2026 09:15']) {
     assert.strictEqual(answerTimeLabel(value, now), '', String(value));
   }
+});
+
+test('answerDate accepts real ISO dates with explicit zones, including leap days and expanded years', () => {
+  for (const [input, expected] of [
+    ['2024-02-29T23:30:00-03:00', '2024-03-01T02:30:00.000Z'],
+    ['2026-10-31T12:15:00+03:00', '2026-10-31T09:15:00.000Z'],
+    ['+010000-02-29T00:00:00Z', '+010000-02-29T00:00:00.000Z']
+  ]) assert.strictEqual(answerDate(input).toISOString(), expected);
 });
 
 test('transcriptMarkdown returns null when nothing was said', () => {

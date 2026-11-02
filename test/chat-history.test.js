@@ -293,6 +293,7 @@ test('chat history keeps a reply\'s answer time and drops only an unusable one',
     '2026-11-01T10:00:00.000Z', 'up to a day ahead is allowed');
 
   for (const bad of ['', 'yesterday', '2026-13-45T00:00:00Z', `${answeredAt}${' '.repeat(64)}`, 'x'.repeat(10000),
+    '2026-02-30T00:00:00Z', '2025-02-29T00:00:00Z', '2026-10-31T09:15:00', 'Oct 31 2026 09:15',
     '2019-12-31T23:59:59.999Z', '1970-01-01T00:00:00.000Z', '2026-11-01T10:00:00.001Z', '+275760-09-13T00:00:00.000Z',
     1761902100000, null, true, {}, [answeredAt]]) {
     const restored = parse([{ role: 'user', content: 'Cite it' }, sourcedReply({ answeredAt: bad })]);
