@@ -352,3 +352,23 @@ test('source titles lose C1 control characters, so saved history keeps them', ()
   }));
   assert.deepStrictEqual(saved.messages[0].sources, resolved.sources);
 });
+
+test('sources keep their whole title, up to what saved history accepts, while the source row shortens it', () => {
+  const store = require('../lib/chat-history');
+  const long = 'A remarkably long source title that keeps going well past the forty-eight characters';
+  const huge = 'word '.repeat(80).trim();
+  const resolved = resolveChatResponse({
+    message: 'Answer [1][2].',
+    webSources: [{ number: 1, title: long, url: 'https://example.com/long' }, { number: 2, title: huge, url: 'https://example.com/huge' }]
+  });
+  assert.strictEqual(resolved.sources[0].title, long);
+  assert(resolved.sources[1].title.length <= store.MAX_SOURCE_TITLE_CHARACTERS);
+  assert(resolved.sources[1].title.length > 240);
+  assert.match(resolved.sources[1].title, /^word word .*…$/);
+  assert.strictEqual(formatResolvedResponse(resolved),
+    'Answer [1][2].\n\nSources: [1] A remarkably long source title that keeps going… · [2] word word word word word word word word word wo…');
+  const saved = JSON.parse(store.serializeHistory({
+    history: [], messages: [{ role: 'assistant', content: 'x', ...resolved }], prompts: []
+  }));
+  assert.deepStrictEqual(saved.messages[0].sources, resolved.sources);
+});
