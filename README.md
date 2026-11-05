@@ -33,6 +33,40 @@ You can write your next draft while a reply is in progress. Pasted multiline tex
 
 Pipes, `TERM=dumb`, and `--non-interactive` use plain profile output. Direct link commands, one-shot chat, and JSON output remain available without entering full-screen mode.
 
+## Install Pilcrow
+
+[Pilcrow](https://github.com/omertekin2002/Pilcrow) exports readable companion files
+for Word documents so you can review their text changes in Git.
+
+```bash
+npx otekin pilcrow
+pilcrow --help
+```
+
+This installs `pilcrow-docx` from PyPI in a persistent, isolated user environment,
+outside npx's cache. It reuses `uv` from PATH or downloads Astral's official uv
+0.13.7 installer into otekin's user data directory if needed. uv downloads Python
+3.12 when unavailable. Linux, macOS, and Windows are supported; no administrator
+permissions or preinstalled Python are needed. Internet access is required for
+downloads. On Linux/macOS, the uv installer also needs `sh` and `curl` or `wget`;
+on Windows it uses PowerShell.
+
+The command verifies the installed executable and prints its location. If its
+directory is not on PATH, add the printed directory to PATH and reopen your
+terminal before running `pilcrow`. Shell profiles are not changed automatically.
+
+Running the command again keeps the existing installation. To request an upgrade:
+
+```bash
+npx otekin pilcrow --upgrade
+```
+
+`npx otekin pilcrow --help` displays installer help without downloading anything.
+`--version` prints otekin's version; use `pilcrow --version` for Pilcrow's version.
+Pilcrow arguments such as `export` and `check` belong to the installed `pilcrow`
+command, not to this installer. Existing uv storage settings such as
+`UV_TOOL_DIR` and `UV_TOOL_BIN_DIR` are respected.
+
 ## AI chat
 
 No API key is required. Ask a one-shot question or open the full-screen chat directly:

@@ -15,6 +15,7 @@ const { historyFileFor } = require('../lib/chat-history');
 const { cleanText, createTheme, startProgress, createActivityDisplay } = require('../lib/terminal');
 const { createStreamPreview } = require('../lib/stream-preview');
 const profile = require('../lib/profile');
+const { installPilcrow } = require('../lib/install-pilcrow');
 
 const outputTheme = createTheme(process.stdout);
 
@@ -29,6 +30,7 @@ Usage:
   npx otekin
   npx otekin cv
   npx otekin linkedin
+  npx otekin pilcrow
   npx otekin chat "What happened today?"
   npx otekin chat
   npx otekin chat -- "-5°C in °F?"
@@ -95,6 +97,23 @@ next time. One-shot, --json and piped chat never read or write it.
 
 const OPTION_SHAPE = /^--?[A-Za-z][^\s=]*(=.*)?$/;
 
+function printPilcrowHelp() {
+  process.stdout.write(`Usage: npx otekin pilcrow [--upgrade]
+
+Install Pilcrow, the DOCX companion-file tool, for your user account.
+Downloads uv from astral.sh if missing; uv installs Python 3.12 when needed.
+Installs pilcrow-docx from PyPI outside the npx cache and verifies the executable.
+
+Options:
+  --upgrade          Upgrade an existing Pilcrow installation
+  -h, --help         Show this help without installing anything
+  --non-interactive  Install without a terminal (no prompts)
+
+After installation, run: pilcrow --help
+If the executable directory is not on PATH, setup instructions are printed.
+`);
+}
+
 function unknownOptionError(arg) {
   // Drop any `=value` so pasted values are never echoed back.
   const name = cleanText(arg.split('=')[0]);
@@ -110,6 +129,7 @@ function parseArgs(argv) {
     json: false,
     noOpen: false,
     noHistory: false,
+    upgrade: false,
     select: null,
     command: null,
     commandArgs: [],
@@ -122,8 +142,8 @@ function parseArgs(argv) {
     const a = argv[i];
     if (optionsEnded || !OPTION_SHAPE.test(a)) {
       if (a === '--' && !optionsEnded) optionsEnded = true;
-      else if (opts.command === 'chat') opts.commandArgs.push(a);
-      else if (a.toLowerCase() === 'chat' && !opts.select) opts.command = 'chat';
+      else if (opts.command) opts.commandArgs.push(a);
+      else if (['chat', 'pilcrow'].includes(a.toLowerCase()) && !opts.select) opts.command = a.toLowerCase();
       else if (!opts.select) opts.select = a;
     } else if (a === '-h' || a === '--help') opts.help = true;
     else if (a === '-v' || a === '--version') opts.version = true;
@@ -131,6 +151,7 @@ function parseArgs(argv) {
     else if (a === '--json') opts.json = true;
     else if (a === '--no-open') opts.noOpen = true;
     else if (a === '--no-history') opts.noHistory = true;
+    else if (a === '--upgrade' && opts.command === 'pilcrow') opts.upgrade = true;
     else if (a === '--cv' || a === '--resume') opts.select = 'cv';
     else if (a === '-s' || a === '--select' || a.startsWith('--select=')) {
       const value = a.startsWith('--select=') ? a.slice('--select='.length) : argv[(i += 1)];
@@ -341,12 +362,28 @@ async function main() {
   }
 
   if (opts.help) {
-    printHelp();
+    if (opts.command === 'pilcrow') printPilcrowHelp();
+    else printHelp();
     return;
   }
 
   if (opts.version) {
     process.stdout.write(String(pkg.version) + '\n');
+    return;
+  }
+
+  if (opts.command === 'pilcrow') {
+    if (opts.commandArgs.length || opts.select || opts.json || opts.noOpen || opts.noHistory) {
+      process.stderr.write('Pilcrow installation accepts only --upgrade, --help, --version, and --non-interactive. Run "otekin pilcrow --help".\n');
+      process.exitCode = 1;
+      return;
+    }
+    try {
+      await installPilcrow({ upgrade: opts.upgrade });
+    } catch (error) {
+      process.stderr.write(`Pilcrow installation failed: ${cleanText(error.message)}\n`);
+      process.exitCode = error.exitCode || 1;
+    }
     return;
   }
 

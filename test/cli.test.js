@@ -123,6 +123,7 @@ test('CLI help and version include chat without changing version behavior', asyn
   const help = await runCli(['--help']);
   assert.strictEqual(help.code, 0);
   assert.match(help.stdout, /otekin chat/);
+  assert.match(help.stdout, /otekin pilcrow/);
   assert.match(help.stdout, /\/clear/);
   assert.match(help.stdout, /\/retry\s+Send your last message again/);
   assert.match(help.stdout, /\/save\s+Save the conversation as a Markdown file/);
@@ -141,6 +142,42 @@ test('CLI help and version include chat without changing version behavior', asyn
   assert.strictEqual(version.code, 0);
   assert.strictEqual(version.stdout, `${pkg.version}\n`);
   assert.strictEqual(version.stderr, '');
+});
+
+test('Pilcrow CLI dispatches installation and upgrade without entering chat', async () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'otekin-pilcrow-cli-'));
+  const preload = path.join(directory, 'installer.cjs');
+  fs.writeFileSync(preload, `require(${JSON.stringify(path.join(ROOT, 'lib/install-pilcrow.js'))}).installPilcrow = async (opts) => {
+    if (process.env.TEST_INSTALL_FAILURE) throw Object.assign(new Error('fixture failure'), { exitCode: 7 });
+    process.stdout.write('INSTALL:' + JSON.stringify(opts) + '\\n');
+  };`);
+  const invoke = (args, env) => runCli(args, env, ['-r', preload]);
+  try {
+    const install = await invoke(['pilcrow']);
+    assert.strictEqual(install.code, 0);
+    assert.strictEqual(install.stdout, 'INSTALL:{"upgrade":false}\n');
+    const upgrade = await invoke(['pilcrow', '--upgrade', '--non-interactive']);
+    assert.strictEqual(upgrade.code, 0);
+    assert.strictEqual(upgrade.stdout, 'INSTALL:{"upgrade":true}\n');
+    const help = await invoke(['pilcrow', '--help']);
+    assert.strictEqual(help.code, 0);
+    assert.match(help.stdout, /Usage: npx otekin pilcrow/);
+    assert.doesNotMatch(help.stdout, /INSTALL:/);
+    const version = await invoke(['pilcrow', '--version']);
+    assert.strictEqual(version.stdout, pkg.version + '\n');
+    for (const args of [['pilcrow', 'export'], ['pilcrow', '--json'], ['--json', 'pilcrow'],
+      ['pilcrow', '--no-open'], ['pilcrow', '--no-history'], ['pilcrow', '--cv'],
+      ['pilcrow', '--unknown'], ['pilcrow', '--', '--upgrade'], ['--upgrade']]) {
+      const result = await invoke(args);
+      assert.strictEqual(result.code, 1, args.join(' '));
+      assert.doesNotMatch(result.stdout, /INSTALL:/);
+    }
+    const failure = await invoke(['pilcrow'], { TEST_INSTALL_FAILURE: '1' });
+    assert.strictEqual(failure.code, 7);
+    assert.match(failure.stderr, /Pilcrow installation failed: fixture failure/);
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
 });
 
 test('CLI preserves bare profile JSON output', async () => {

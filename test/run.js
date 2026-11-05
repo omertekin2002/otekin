@@ -24,6 +24,7 @@ require('./browser.test');
 require('./profile.test');
 require('./fullscreen.test');
 require('./cli.test');
+require('./install-pilcrow.test');
 
 (async () => {
   let failed = 0;
