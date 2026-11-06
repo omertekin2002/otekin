@@ -155,10 +155,10 @@ test('Pilcrow CLI dispatches installation and upgrade without entering chat', as
   try {
     const install = await invoke(['pilcrow']);
     assert.strictEqual(install.code, 0);
-    assert.strictEqual(install.stdout, 'INSTALL:{"upgrade":false}\n');
+    assert.strictEqual(install.stdout, 'INSTALL:{"upgrade":false,"nonInteractive":false}\n');
     const upgrade = await invoke(['pilcrow', '--upgrade', '--non-interactive']);
     assert.strictEqual(upgrade.code, 0);
-    assert.strictEqual(upgrade.stdout, 'INSTALL:{"upgrade":true}\n');
+    assert.strictEqual(upgrade.stdout, 'INSTALL:{"upgrade":true,"nonInteractive":true}\n');
     const help = await invoke(['pilcrow', '--help']);
     assert.strictEqual(help.code, 0);
     assert.match(help.stdout, /Usage: npx otekin pilcrow/);

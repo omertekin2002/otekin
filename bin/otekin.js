@@ -101,13 +101,14 @@ function printPilcrowHelp() {
   process.stdout.write(`Usage: npx otekin pilcrow [--upgrade]
 
 Install Pilcrow, the DOCX companion-file tool, for your user account.
-Downloads uv from astral.sh if missing; uv installs Python 3.12 when needed.
+If uv is missing, asks "Install uv? [y/N]" before downloading its installer.
+uv installs Python 3.12 when needed. Enter or "n" cancels without installing.
 Installs pilcrow-docx from PyPI outside the npx cache and verifies the executable.
 
 Options:
   --upgrade          Upgrade an existing Pilcrow installation
   -h, --help         Show this help without installing anything
-  --non-interactive  Install without a terminal (no prompts)
+  --non-interactive  Install without prompts; uv must already be installed
 
 After installation, run: pilcrow --help
 If the executable directory is not on PATH, setup instructions are printed.
@@ -379,7 +380,7 @@ async function main() {
       return;
     }
     try {
-      await installPilcrow({ upgrade: opts.upgrade });
+      await installPilcrow({ upgrade: opts.upgrade, nonInteractive: opts.nonInteractive });
     } catch (error) {
       process.stderr.write(`Pilcrow installation failed: ${cleanText(error.message)}\n`);
       process.exitCode = error.exitCode || 1;

@@ -3,7 +3,8 @@
 const assert = require('assert');
 const fs = require('fs');
 const path = require('path');
-const { installPilcrow, runCommand } = require('../lib/install-pilcrow');
+const { PassThrough } = require('stream');
+const { installPilcrow, runCommand, confirmUvInstall } = require('../lib/install-pilcrow');
 
 function fixture({ platform = 'linux', available = 'path', failure = '', onBootstrap } = {}) {
   const windows = platform === 'win32';
@@ -18,6 +19,7 @@ function fixture({ platform = 'linux', available = 'path', failure = '', onBoots
     platform, home,
     env: { PATH: bin },
     stdout: { write: (text) => { output += text; } },
+    confirm: async () => { calls.push({ confirmation: true }); return true; },
     fetchImpl: async (url) => {
       calls.push({ url });
       return { ok: failure !== 'download', status: 503, text: async () => '# official installer fixture' };
@@ -59,6 +61,7 @@ test('Pilcrow uses existing uv, installs the PyPI package, and verifies its actu
   assert.match(f.output(), /Pilcrow 0\.1\.1 is installed/);
   assert.doesNotMatch(f.output(), /Add this directory/);
   assert.ok(!f.calls.some((call) => call.url));
+  assert.ok(!f.calls.some((call) => call.confirmation));
   await installPilcrow({}, f.deps);
   assert.ok(!f.calls.some((call) => call.args?.includes('--upgrade')));
 });
@@ -87,10 +90,72 @@ test('Pilcrow bootstraps uv on Linux, macOS, and Windows without interpolating p
       else assert.strictEqual(args.length, 1);
     } });
     await installPilcrow({}, f.deps);
+    assert.ok(f.calls.findIndex((call) => call.confirmation) < f.calls.findIndex((call) => call.url));
     assert.match(f.calls.find((call) => call.url).url, /^https:\/\/astral\.sh\/uv\/0\.13\.7\/install\.(sh|ps1)$/);
     assert.ok(!fs.existsSync(f.installerFile()));
     assert.match(f.output(), /Pilcrow 0\.1\.1 is installed/);
   }
+});
+
+test('Pilcrow leaves a missing uv uninstalled when confirmation is declined or unavailable', async () => {
+  const declined = fixture({ available: 'missing' });
+  declined.deps.confirm = async () => false;
+  await installPilcrow({}, declined.deps);
+  assert.match(declined.output(), /cancelled/);
+  assert.ok(!declined.calls.some((call) => call.url || call.args?.includes('install')));
+
+  const unattended = fixture({ available: 'missing' });
+  await assert.rejects(installPilcrow({ nonInteractive: true }, unattended.deps), /uv is not installed/);
+  assert.ok(!unattended.calls.some((call) => call.confirmation || call.url || call.args?.includes('install')));
+
+  const piped = fixture({ available: 'missing' });
+  piped.deps.confirm = confirmUvInstall;
+  piped.deps.stdin = { isTTY: false };
+  await assert.rejects(installPilcrow({}, piped.deps), /uv is not installed/);
+  assert.ok(!piped.calls.some((call) => call.url || call.args?.includes('install')));
+
+  const installed = fixture();
+  await installPilcrow({ nonInteractive: true }, installed.deps);
+  assert.match(installed.output(), /is installed/);
+  assert.ok(!installed.calls.some((call) => call.confirmation));
+});
+
+test('uv confirmation requires explicit yes, handles EOF and invalid answers, and cleans up', async () => {
+  for (const [answer, expected] of [['y\n', true], [' YES \n', true], ['n\n', false], ['no\n', false], ['\n', false], [null, false], ['maybe\ny\n', true]]) {
+    const input = new PassThrough();
+    const output = new PassThrough();
+    input.isTTY = true;
+    output.isTTY = true;
+    let text = '';
+    output.on('data', (chunk) => { text += chunk; });
+    const listeners = process.listenerCount('SIGINT');
+    const pending = confirmUvInstall({ input, output });
+    assert.match(text, /Install uv\? \[y\/N\]/);
+    assert.match(text, /download and run Astral's official uv installer/);
+    if (answer === null) input.end();
+    else input.write(answer);
+    assert.strictEqual(await pending, expected);
+    if (answer?.startsWith('maybe')) assert.match(text, /Please answer y or n/);
+    assert.strictEqual(process.listenerCount('SIGINT'), listeners);
+    input.destroy();
+    output.destroy();
+  }
+});
+
+test('uv confirmation treats interruption as cancellation and does not accept piped yes', async () => {
+  await assert.rejects(confirmUvInstall({ input: { isTTY: false }, output: { isTTY: true } }), /uv is not installed/);
+  await assert.rejects(confirmUvInstall({ input: { isTTY: true }, output: { isTTY: false } }), /uv is not installed/);
+  const input = new PassThrough();
+  const output = new PassThrough();
+  input.isTTY = true;
+  output.isTTY = true;
+  const listeners = process.listenerCount('SIGINT');
+  const pending = confirmUvInstall({ input, output });
+  process.emit('SIGINT');
+  await assert.rejects(pending, (error) => error.exitCode === 130);
+  assert.strictEqual(process.listenerCount('SIGINT'), listeners);
+  input.destroy();
+  output.destroy();
 });
 
 test('Pilcrow stops on download, bootstrap, install, executable, or permission failures', async () => {

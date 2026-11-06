@@ -44,8 +44,13 @@ pilcrow --help
 ```
 
 This installs `pilcrow-docx` from PyPI in a persistent, isolated user environment,
-outside npx's cache. It reuses `uv` from PATH or downloads Astral's official uv
-0.13.7 installer into otekin's user data directory if needed. uv downloads Python
+outside npx's cache. It reuses `uv` from PATH or a previous otekin installation.
+If uv is missing, it asks **Install uv? [y/N]** before downloading or running
+Astral's official uv 0.13.7 installer. Type `y` to install it into otekin's user
+data directory; Enter, `n`, or end-of-input cancels without installing anything.
+Without an interactive terminal, or with `--non-interactive`, uv must already be
+installed; otherwise the command exits with manual installation instructions.
+uv downloads Python
 3.12 when unavailable. Linux, macOS, and Windows are supported; no administrator
 permissions or preinstalled Python are needed. Internet access is required for
 downloads. On Linux/macOS, the uv installer also needs `sh` and `curl` or `wget`;
