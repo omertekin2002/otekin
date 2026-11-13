@@ -1278,17 +1278,20 @@ test('/save writes the conversation to a new Markdown file without terminal esca
   }
 });
 
-test('/retry, /save and /sources appear in /help and the command picker', async () => {
-  const ui = await terminalApp();
+test('/retry, /save, /copy and /sources appear in /help and the command picker', async () => {
+  const ui = await terminalApp({rows: 40});
   try {
     await ui.type('/help\r');
     assert.match(ui.screen(), /\/retry\s+Send your last message again/);
     assert.match(ui.screen(), /\/save\s+Save the conversation as Markdown/);
+    assert.match(ui.screen(), /\/copy\s+Copy the latest reply and its sources/);
     assert.match(ui.screen(), /\/sources\s+Show the full titles and links of cited sources/);
     await ui.type('/re');
     assert.match(ui.screen(), /› \/retry\s+Send your last message again/);
     await ui.type('\u0015/sa');
     assert.match(ui.screen(), /› \/save\s+Save the conversation as Markdown/);
+    await ui.type('\u0015/co');
+    assert.match(ui.screen(), /› \/copy\s+Copy the latest reply and its sources/);
   } finally {
     await ui.close();
   }
@@ -1623,6 +1626,211 @@ test('/sources inspects replies restored from saved history, and NO_COLOR still 
         await ui.close();
       }
     });
+  } finally {
+    fs.rmSync(directory, {recursive: true, force: true});
+  }
+});
+
+// A clipboard stand-in that records what it is given; `works` decides whether the copy succeeds.
+function fakeClipboard(works = true) {
+  const copied = [];
+  return {copied, clipboard: {async copy(text) {
+    copied.push(text);
+    if (works instanceof Error) throw works;
+    return works;
+  }}};
+}
+
+const ESCAPES = /[\u0000-\u0009\u000B-\u001F\u007F-\u009F]/;
+// Whether the screen shows text, which may be wrapped across lines.
+const shows = (ui, text) => ui.screen().replace(/\s+/g, ' ').includes(text);
+
+test('/copy gives the clipboard the latest reply and its source links, without escapes, header or tool lines', async () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'otekin-fullscreen-copy-'));
+  const {copied, clipboard} = fakeClipboard();
+  const services = {
+    ...client, ensureChatServiceAwake: async () => {},
+    async requestChat(_messages, options) {
+      options.onActivity({id: 'search', tool: 'search_web', query: 'copy research', status: 'running'});
+      options.onActivity({id: 'search', tool: 'search_web', query: 'copy research', status: 'completed'});
+      return citedReply('A **sourced** answer with `code` [1][2].', [
+        {number: 1, title: 'First [draft] source', url: 'https://example.com/one'},
+        {number: 2, title: 'Second', url: 'https://example.com/two'}
+      ], 'copy-model');
+    }
+  };
+  try {
+    await withInkColor(async () => {
+      const ui = await terminalApp({services, clipboard, saveDirectory: directory});
+      try {
+        await ui.type('/copy\r');
+        await waitFor(() => ui.screen().includes('Nothing to copy yet. Wait for a reply to finish.'));
+        assert.deepStrictEqual(copied, []);
+        await ui.type('Find sources\r');
+        await waitFor(() => ui.screen().includes('A sourced answer'));
+        assert.match(ui.screen(), /copy research/);
+        assert.match(ui.raw(), SGR, 'the reply on screen is styled');
+        await ui.type('/website\r');
+        await ui.type('/copy\r');
+        await waitFor(() => shows(ui, 'Copied the latest reply (with 2 sources) to the clipboard'));
+        assert.deepStrictEqual(copied, [
+          'A **sourced** answer with `code` [1][2].\n\n' +
+          'Sources: [\\[1\\] First \\[draft\\] source](https://example.com/one) · [\\[2\\] Second](https://example.com/two)\n'
+        ]);
+        assert.doesNotMatch(copied[0], ESCAPES);
+        assert.doesNotMatch(copied[0], /copy-model|copy research|website|Nothing to copy/);
+        assert.deepStrictEqual(fs.readdirSync(directory), [], 'a working clipboard writes no file');
+        assert.match(ui.screen(), /\/ Chat/);
+      } finally {
+        await ui.close();
+      }
+    });
+  } finally {
+    fs.rmSync(directory, {recursive: true, force: true});
+  }
+});
+
+test('/copy during a reply copies the previous completed one and never provisional text', async () => {
+  const {state, services} = streamingServices();
+  const {copied, clipboard} = fakeClipboard();
+  const ui = await terminalApp({services, clipboard});
+  try {
+    await ui.type('First\r');
+    await waitFor(() => Boolean(state.resolve));
+    state.onDelta('Early provisional words');
+    await waitFor(() => ui.screen().includes('Early provisional words'));
+    await ui.type('/copy\r');
+    await waitFor(() => ui.screen().includes('Nothing to copy yet. Wait for a reply to finish.'));
+    assert.deepStrictEqual(copied, []);
+    state.resolve({message: 'First complete answer.'});
+    await waitFor(() => ui.screen().includes('First complete answer.'));
+
+    state.resolve = null;
+    await ui.type('Second\r');
+    await waitFor(() => Boolean(state.resolve));
+    state.onDelta('Second provisional words');
+    await waitFor(() => ui.screen().includes('Second provisional words'));
+    await ui.type('/copy\r');
+    await waitFor(() => shows(ui, 'Copied the previous reply to the clipboard. The reply being written is not finished yet'));
+    assert.deepStrictEqual(copied, ['First complete answer.\n']);
+    assert.match(ui.screen(), /Second provisional words/, 'the reply keeps streaming');
+    state.resolve({message: 'Second complete answer.'});
+    await waitFor(() => ui.screen().includes('Second complete answer.'));
+    await ui.type('/copy\r');
+    await waitFor(() => copied.length === 2);
+    assert.strictEqual(copied[1], 'Second complete answer.\n');
+    await waitFor(() => shows(ui, 'Copied the latest reply to the clipboard'));
+  } finally {
+    await ui.close();
+  }
+});
+
+test('/copy saves a new private Markdown file when no clipboard works, and says so', async () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'otekin-fullscreen-copy-file-'));
+  const services = {
+    ...client, ensureChatServiceAwake: async () => {},
+    requestChat: async () => citedReply('Ömer’s answer [1].', [{number: 1, title: 'Source', url: 'https://example.com/source'}], 'file-model')
+  };
+  const replies = () => fs.readdirSync(directory).filter(name => /^otekin-reply-\d{8}-\d{6}(?:-\d+)?\.md$/.test(name)).sort();
+  const expected = 'Ömer’s answer [1].\n\nSources: [\\[1\\] Source](https://example.com/source)\n';
+  try {
+    const failing = fakeClipboard(false);
+    // Narrow enough to leave out the sidebar, so wrapped notices read as one text.
+    const ui = await terminalApp({columns: 80, services, clipboard: failing.clipboard, saveDirectory: directory});
+    try {
+      await ui.type('/copy\r');
+      await waitFor(() => ui.screen().includes('Nothing to copy yet'));
+      assert.deepStrictEqual(fs.readdirSync(directory), [], 'nothing is written without a reply');
+      await ui.type('Question\r');
+      await waitFor(() => ui.screen().includes('answer [1]'));
+      await ui.type('/copy\r');
+      await waitFor(() => shows(ui, 'No clipboard available; saved the latest reply (with 1 source) to'));
+      assert.strictEqual(replies().length, 1);
+      const file = path.join(directory, replies()[0]);
+      assert(ui.screen().replace(/\s+/g, '').includes(file.replace(/\s+/g, '')));
+      assert.strictEqual(fs.readFileSync(file, 'utf8'), expected);
+      if (process.platform !== 'win32') assert.strictEqual(fs.statSync(file).mode & 0o777, 0o600);
+      assert.deepStrictEqual(failing.copied, [expected], 'the clipboard was tried first');
+      await ui.type('/copy\r');
+      await waitFor(() => replies().length === 2);
+      assert.strictEqual(fs.readFileSync(file, 'utf8'), expected, 'an existing file is never replaced');
+    } finally {
+      await ui.close();
+    }
+
+    const throwing = fakeClipboard(new Error('clipboard exploded'));
+    const missing = await terminalApp({columns: 80, services, clipboard: throwing.clipboard, saveDirectory: path.join(directory, 'missing')});
+    try {
+      await missing.type('Question\r');
+      await waitFor(() => missing.screen().includes('answer [1]'));
+      await missing.type('/copy\r');
+      await waitFor(() => shows(missing, 'No clipboard available, and the reply could not be saved (ENOENT). The chat still works.'));
+      assert.doesNotMatch(missing.screen(), /exploded/);
+      assert.strictEqual(replies().length, 2);
+    } finally {
+      await missing.close();
+    }
+  } finally {
+    fs.rmSync(directory, {recursive: true, force: true});
+  }
+});
+
+test('/copy keeps the draft and the chat scroll position', async () => {
+  const {copied, clipboard} = fakeClipboard();
+  const answer = Array.from({length: 50}, (_,index) => `Answer line ${index + 1}`).join('\n');
+  const ui = await terminalApp({columns: 80, clipboard, services: {
+    ...client, ensureChatServiceAwake: async () => {}, requestChat: async () => ({message: answer})
+  }});
+  const viewport = () => ui.screen().split('\n').slice(2, 25).join('\n');
+  const linesBelow = () => Number((ui.screen().match(/↑ (\d+) lines/) || [])[1] || 0);
+  const composer = () => ui.screen().split('\n').find(line => line.includes('│ ›'));
+  try {
+    await ui.type('Long question\r');
+    await waitFor(() => ui.screen().includes('Answer line 50'));
+    await ui.type('\u001b[5~');
+    const before = viewport();
+    const below = linesBelow();
+    assert(below > 0);
+    assert.doesNotMatch(before, /Answer line 50/);
+    await ui.type('/co\r');
+    await waitFor(() => copied.length === 1 && linesBelow() > below);
+    assert.strictEqual(copied[0], `${answer}\n`);
+    assert.strictEqual(viewport(), before, 'the reading position stays put');
+    // The notice lands below the reading position, so the status line repeats it.
+    assert.match(ui.screen(), /Copied the latest reply to the clipboard/);
+    assert.match(composer(), /│ › Ask anything/);
+    await ui.type('abc\u001b[D');
+    assert.match(composer(), /│ › abc/);
+    const row = ui.screen().split('\n').indexOf(composer());
+    assert.strictEqual(ui.emulator.buffer.active.cursorY, row);
+    assert.strictEqual(ui.emulator.buffer.active.cursorX, composer().indexOf('abc') + 2);
+    await ui.type('\u001b[1;5F');
+    assert.match(ui.screen(), /•\s*\n\s*Copied the latest reply to the clipboard/);
+  } finally {
+    await ui.close();
+  }
+});
+
+test('/copy copies replies restored from saved history with their source links', async () => {
+  const {directory, file} = historyDirectory();
+  const {copied, clipboard} = fakeClipboard();
+  try {
+    fs.mkdirSync(path.dirname(file), {recursive: true});
+    fs.writeFileSync(file, JSON.stringify({version: 1, history: [], prompts: [], messages: [
+      {role: 'user', content: 'Saved question'},
+      {role: 'assistant', model: 'saved-model', content: 'Saved answer [1].', answer: 'Saved answer [1].', sources: [
+        {number: 1, title: 'Saved source', url: 'https://example.com/saved'}
+      ]},
+      {role: 'notice', content: 'website: https://example.com'}
+    ]}));
+    const ui = await terminalApp({historyFile: file, clipboard});
+    try {
+      await ui.type('/copy\r');
+      await waitFor(() => shows(ui, 'Copied the latest reply (with 1 source) to the clipboard'));
+      assert.deepStrictEqual(copied, ['Saved answer [1].\n\nSources: [\\[1\\] Saved source](https://example.com/saved)\n']);
+    } finally {
+      await ui.close();
+    }
   } finally {
     fs.rmSync(directory, {recursive: true, force: true});
   }
