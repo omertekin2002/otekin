@@ -5,7 +5,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const { formatChatResponse } = require('../lib/chat-format');
-const { answerDate, answerTimeLabel, transcriptMarkdown, saveTranscript } = require('../lib/chat-export');
+const { answerDate, answerTimeLabel, transcriptMarkdown, saveTranscript, replyMarkdown, saveReply } = require('../lib/chat-export');
 
 const DATE = new Date(2026, 9, 27, 14, 5, 9);
 const CONTROLS = /[\u0000-\u0009\u000B-\u001F\u007F-\u009F]/;
@@ -150,6 +150,50 @@ test('saveTranscript writes a new file each time and never replaces one', () => 
     assert.strictEqual(saveTranscript(directory, [], { date: DATE }), null);
     assert.strictEqual(fs.readdirSync(directory).length, 3);
     assert.throws(() => saveTranscript(path.join(directory, 'missing'), messages), { code: 'ENOENT' });
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('replyMarkdown is one reply with its numbered source links and nothing around it', () => {
+  const markdown = formatChatResponse({
+    message: 'A **bold** answer [1][2].\n\nSources:\n1. [one](https://example.com/one)\n2. [two](https://example.com/two)',
+    webSources: [
+      { title: 'First [draft] source', url: 'https://example.com/one' },
+      { title: 'Second', url: 'https://example.com/a (b)' }
+    ]
+  }, { hyperlinks: true });
+  const reply = { role: 'assistant', model: 'fixture-model', answeredAt: '2026-10-27T11:05:09.000Z', content: '\u001b[1mstyled\u001b[0m', markdown };
+  assert.strictEqual(replyMarkdown(reply), [
+    'A **bold** answer [1][2].',
+    '',
+    'Sources: [\\[1\\] First \\[draft\\] source](https://example.com/one) · [\\[2\\] Second](https://example.com/a%20%28b%29)',
+    ''
+  ].join('\n'));
+  assert.strictEqual(replyMarkdown({ role: 'assistant', model: 'OTEKIN', content: '\u001b[31mRestored\u001b[0m\tanswer\u001b]0;pwned\u0007  \n' }),
+    'Restored  answer\n');
+  for (const message of [null, undefined, { role: 'user', content: 'Hi' }, { role: 'notice', content: 'website' },
+    { role: 'tools', content: '✓ Search' }, { role: 'error', content: 'failed' }, { role: 'assistant', content: ' \u001b[0m ' }]) {
+    assert.strictEqual(replyMarkdown(message), null);
+  }
+});
+
+test('saveReply writes a new private file each time and never replaces one', () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'otekin-export-reply-'));
+  const reply = { role: 'assistant', model: 'm', content: 'Ömer answered [1].' };
+  try {
+    const existing = path.join(directory, 'otekin-reply-20261027-140509.md');
+    fs.writeFileSync(existing, 'keep me');
+    const first = saveReply(directory, reply, { date: DATE });
+    const second = saveReply(directory, reply, { date: DATE });
+    assert.strictEqual(first, path.join(directory, 'otekin-reply-20261027-140509-2.md'));
+    assert.strictEqual(second, path.join(directory, 'otekin-reply-20261027-140509-3.md'));
+    assert.strictEqual(fs.readFileSync(existing, 'utf8'), 'keep me');
+    assert.strictEqual(fs.readFileSync(first, 'utf8'), 'Ömer answered [1].\n');
+    if (process.platform !== 'win32') assert.strictEqual(fs.statSync(first).mode & 0o777, 0o600);
+    assert.strictEqual(saveReply(directory, { role: 'user', content: 'Hi' }, { date: DATE }), null);
+    assert.strictEqual(fs.readdirSync(directory).length, 3);
+    assert.throws(() => saveReply(path.join(directory, 'missing'), reply), { code: 'ENOENT' });
   } finally {
     fs.rmSync(directory, { recursive: true, force: true });
   }
