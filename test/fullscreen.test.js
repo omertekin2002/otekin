@@ -70,12 +70,11 @@ async function terminalApp(options = {}) {
   const emulator = new Terminal({cols: columns, rows, convertEol: true, allowProposedApi: true});
   let raw = '';
   let lastOutput = Date.now();
-  const stdout = new Writable({write(chunk, _encoding, done) {
+  const stdout = Object.assign(new Writable({write(chunk, _encoding, done) {
     raw += chunk.toString();
     lastOutput = Date.now();
     emulator.write(chunk.toString(), done);
-  }});
-  Object.assign(stdout, {isTTY: true, columns, rows});
+  }}), {isTTY: true, columns, rows});
   const stdin = new PassThrough();
   const rawModes = [];
   Object.assign(stdin, {isTTY: true, setRawMode(value) {rawModes.push(value);}, ref() {}, unref() {}});
@@ -263,6 +262,7 @@ test('command palette, navigation, and profile links work without leaving the ap
 
 test('chat keeps the composer live, preserves drafts and context, and scrolls long replies', async () => {
   const requests = [];
+  /** @type {(reply: object) => void} */
   let reply;
   const services = {
     ...client,
@@ -314,7 +314,9 @@ test('chat keeps the composer live, preserves drafts and context, and scrolls lo
 });
 
 test('scrolled-up conversations stay in place while research and replies arrive', async () => {
+  /** @type {(reply: object) => void} */
   let reply;
+  /** @type {(event: object) => void} */
   let activity;
   const ui = await terminalApp({services: {
     ...client,
@@ -355,6 +357,7 @@ test('scrolled-up conversations stay in place while research and replies arrive'
 });
 
 test('scrolled-up conversations stay in place when cancelling removes research lines', async () => {
+  /** @type {(event: object) => void} */
   let activity;
   let signal;
   let calls = 0;
@@ -482,6 +485,7 @@ test('bracketed paste is edited as a draft and never submits embedded newlines',
 });
 
 test('Tab on narrow terminals preserves unsent drafts, including while a reply is pending', async () => {
+  /** @type {(reply: object) => void} */
   let reply;
   const ui = await terminalApp({columns: 80, rows: 24, services: {
     ...client, ensureChatServiceAwake: async () => {},
@@ -546,6 +550,7 @@ test('Down preserves a new draft unless it is leaving an active prompt recall se
 
 test('cancelling a request keeps the app usable and cannot commit a stale reply', async () => {
   let signal;
+  /** @type {(error: Error) => void} */
   let rejectRequest;
   const requests = [];
   const ui = await terminalApp({services: {
@@ -1223,6 +1228,7 @@ test('/retry after a reply replaces that turn in the request, transcript and sav
   const {directory, file} = historyDirectory();
   const requests = [];
   const firstSource = {title: 'First', url: 'https://example.com/first'};
+  /** @type {(value?: unknown) => void} */
   let release;
   const services = {
     ...client, ensureChatServiceAwake: async () => {},
@@ -1730,6 +1736,7 @@ test('/sources inspects replies restored from saved history, and NO_COLOR still 
 });
 
 // A clipboard stand-in that records what it is given; `works` decides whether the copy succeeds.
+/** @param {boolean | Error} [works] whether the copy succeeds, or the error it throws */
 function fakeClipboard(works = true) {
   const copied = [];
   return {copied, clipboard: {async copy(text) {
