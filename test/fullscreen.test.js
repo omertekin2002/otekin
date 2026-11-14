@@ -10,6 +10,7 @@ const path = require('path');
 const {createRequire} = require('module');
 const {pathToFileURL} = require('url');
 const client = require('../lib/chat-client');
+const chatExport = require('../lib/chat-export');
 const chatHistory = require('../lib/chat-history');
 
 const LINKS = {
@@ -18,11 +19,27 @@ const LINKS = {
   cv: 'https://example.com/resume'
 };
 
+// How long a test waits for the terminal to show what it expects.
+const WAIT_MS = 3000;
+// Pauses that pace typing and resizing like a person would. Assertions never rely on them:
+// they wait for the render they expect. OTEKIN_TEST_NO_PAUSES=1 sets them to 0 to prove it.
+const NO_PAUSES = Boolean(process.env.OTEKIN_TEST_NO_PAUSES);
+const KEY_PAUSE_MS = NO_PAUSES ? 0 : 15;
+const AFTER_TYPING_MS = NO_PAUSES ? 0 : 40;
+const AFTER_RESIZE_MS = NO_PAUSES ? 0 : 80;
+// Ink holds a lone Esc for 20 ms in case an escape sequence follows it. Typing the next key
+// sooner would turn Esc into Alt+key, so this one wait is part of the input protocol.
+const INK_ESCAPE_MS = 30;
+// Ink draws at most 60 frames a second here; three frames without output means the screen settled.
+const SETTLED_MS = 50;
+
+const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+
 async function waitFor(check, message) {
-  const deadline = Date.now() + 3000;
+  const deadline = Date.now() + WAIT_MS;
   while (!check()) {
     if (Date.now() > deadline) throw new Error(message || 'Terminal did not update in time.');
-    await new Promise(resolve => setTimeout(resolve, 15));
+    await sleep(15);
   }
 }
 
@@ -52,11 +69,12 @@ async function terminalApp(options = {}) {
   // A real PTY converts LF to CRLF. Emulate that output processing here.
   const emulator = new Terminal({cols: columns, rows, convertEol: true, allowProposedApi: true});
   let raw = '';
-  const stdout = new Writable({write(chunk, _encoding, done) {
+  let lastOutput = Date.now();
+  const stdout = Object.assign(new Writable({write(chunk, _encoding, done) {
     raw += chunk.toString();
+    lastOutput = Date.now();
     emulator.write(chunk.toString(), done);
-  }});
-  Object.assign(stdout, {isTTY: true, columns, rows});
+  }}), {isTTY: true, columns, rows});
   const stdin = new PassThrough();
   const rawModes = [];
   Object.assign(stdin, {isTTY: true, setRawMode(value) {rawModes.push(value);}, ref() {}, unref() {}});
@@ -69,29 +87,72 @@ async function terminalApp(options = {}) {
   });
   const screen = () => Array.from({length: stdout.rows}, (_,index) =>
     emulator.buffer.active.getLine(index)?.translateToString(true) || '').join('\n');
+  // The emulator parses output asynchronously; until it is done, the screen can show half a frame.
+  const parsed = () => stdout.writableLength === 0;
   const type = async text => {
     const keys = text.includes('\u001b[200~') ? [text]
       : text.match(/\u001b\[[0-9;:]*[A-Za-z~]|\u001b[^[]|[\u0000-\u001f\u007f]|[^\u0000-\u001f\u007f]+/gu) || [];
     for (const key of keys) {
       stdin.write(key);
-      await new Promise(resolve => setTimeout(resolve, 15));
+      // Wait until Ink has read this key, so each key reaches the app on its own, as typed.
+      const deadline = Date.now() + WAIT_MS;
+      while (stdin.readableLength > 0) {
+        if (Date.now() > deadline) throw new Error(`The app did not read the key ${JSON.stringify(key)}.`);
+        await new Promise(resolve => setImmediate(resolve));
+      }
+      await sleep(key === '\u001b' ? Math.max(INK_ESCAPE_MS, KEY_PAUSE_MS) : KEY_PAUSE_MS);
     }
-    await new Promise(resolve => setTimeout(resolve, 40));
+    await sleep(AFTER_TYPING_MS);
   };
+  // Waits until check() holds on a fully drawn screen. On timeout it fails with the screen.
+  const waitUntil = async (check, message) => {
+    const deadline = Date.now() + WAIT_MS;
+    while (!(parsed() && check())) {
+      if (Date.now() > deadline) {
+        throw new assert.AssertionError({
+          message: `Timed out after ${WAIT_MS} ms: ${message || 'the terminal did not show what was expected'}.\nScreen:\n${screen()}`
+        });
+      }
+      await sleep(15);
+    }
+  };
+  // assert.match on the screen that waits for a render that matches, and returns that screen.
+  // On timeout it fails with assert.match's own error, screen included.
+  const expectScreen = async (pattern, message) => {
+    const deadline = Date.now() + WAIT_MS;
+    for (;;) {
+      const text = screen();
+      if (parsed() && pattern.test(text)) return text;
+      if (Date.now() > deadline) {
+        try {
+          assert.match(text, pattern);
+        } catch (error) {
+          error.message = `Timed out after ${WAIT_MS} ms${message ? `: ${message}` : ''}. ${error.message}`;
+          throw error;
+        }
+        return text;
+      }
+      await sleep(15);
+    }
+  };
+  // For keys that should change nothing on screen: waits until the app has drawn nothing new for
+  // a few frames, so a wrong render would show up before the test checks that nothing changed.
+  const settle = () => waitUntil(() => Date.now() - lastOutput >= SETTLED_MS, 'the screen kept changing');
   await waitFor(() => /Ready when you are|Restored your last conversation/.test(screen()));
+  await waitUntil(() => true, 'the first frame was not drawn');
   return {
-    screen, type, opened, stdout, stdin, emulator, rawModes, raw: () => raw,
+    screen, type, waitUntil, expectScreen, settle, opened, stdout, stdin, emulator, rawModes, raw: () => raw,
     async resize(width, height) {
       emulator.resize(width, height);
       stdout.columns = width;
       stdout.rows = height;
       stdout.emit('resize');
-      await new Promise(resolve => setTimeout(resolve, 80));
+      await sleep(AFTER_RESIZE_MS);
     },
     async close() {
       app.unmount();
       await app.waitUntilExit();
-      await new Promise(resolve => setTimeout(resolve, 30));
+      await sleep(30);
       stdin.destroy();
       stdout.destroy();
       emulator.dispose();
@@ -125,13 +186,15 @@ test('full-screen app fills an alternate buffer, resizes, and restores the termi
     const inputRow = ui.screen().split('\n').findIndex(line => line.includes('│ ›'));
     assert.strictEqual(ui.emulator.buffer.active.cursorY, inputRow);
     await ui.resize(52, 18);
+    // The narrow footer, on the new last row, shows the narrow layout is drawn.
+    await ui.expectScreen(/Enter send · \/ commands[^\n]*$/);
     assert.doesNotMatch(ui.screen(), /WORKSPACE/);
     assert.match(ui.screen(), /›_ otekin/);
     assert.match(ui.screen().split('\n')[17], /Enter send/);
     await ui.resize(20, 6);
-    assert.match(ui.screen(), /Resize to at least/);
+    await ui.expectScreen(/Resize to at least/);
     await ui.resize(110, 30);
-    assert.match(ui.screen(), /WORKSPACE/);
+    await ui.expectScreen(/WORKSPACE/);
     await ui.type('\u0003');
     await waitFor(() => ui.emulator.buffer.active.type === 'normal');
     assert(ui.rawModes.includes(true));
@@ -164,8 +227,8 @@ test('welcome, /profile, and the sidebar show the same name and tagline at every
         assert.doesNotMatch(ui.screen(), /ÖMER TEKIN|WORKSPACE/);
       }
       await ui.type('/profile\r');
-      assert.match(ui.screen(), /About Ömer/);
-      assert(main().includes(name), `/profile name at ${columns}×${rows}`);
+      await ui.expectScreen(/\/ About Ömer/);
+      await ui.waitUntil(() => main().includes(name), `/profile name at ${columns}×${rows}`);
       assert(main().includes(tagline), `/profile tagline at ${columns}×${rows}`);
     } finally {
       await ui.close();
@@ -177,21 +240,21 @@ test('command palette, navigation, and profile links work without leaving the ap
   const ui = await terminalApp();
   try {
     await ui.type('/li');
-    assert.match(ui.screen(), /Find me on LinkedIn/);
+    await ui.expectScreen(/Find me on LinkedIn/);
     await ui.type('\t');
-    assert.match(ui.screen(), /│ › \/linkedin/);
+    await ui.expectScreen(/│ › \/linkedin/);
     await ui.type('\r');
     await waitFor(() => ui.opened.length === 1);
     assert.deepStrictEqual(ui.opened, [LINKS.linkedin]);
     await ui.type('/profile\r');
-    assert.match(ui.screen(), /About Ömer/);
-    assert.match(ui.screen(), /Website {3}https:\/\/example.com/);
+    await ui.expectScreen(/\/ About Ömer/);
+    await ui.expectScreen(/Website {3}https:\/\/example.com/);
     await ui.type('/help\r');
-    assert.match(ui.screen(), /Make yourself at home/);
+    await ui.expectScreen(/Make yourself at home/);
     await ui.type('\t\u001b[B\r');
-    assert.match(ui.screen(), /About Ömer/);
+    await ui.expectScreen(/\/ About Ömer/);
     await ui.type('/nonsense\r');
-    assert.match(ui.screen(), /Unknown command: \/nonsense/);
+    await ui.expectScreen(/Unknown command: \/nonsense/);
   } finally {
     await ui.close();
   }
@@ -199,6 +262,7 @@ test('command palette, navigation, and profile links work without leaving the ap
 
 test('chat keeps the composer live, preserves drafts and context, and scrolls long replies', async () => {
   const requests = [];
+  /** @type {(reply: object) => void} */
   let reply;
   const services = {
     ...client,
@@ -218,8 +282,10 @@ test('chat keeps the composer live, preserves drafts and context, and scrolls lo
     await ui.type('Next question');
     reply({message: Array.from({length: 50}, (_,index) => `Answer line ${index + 1}`).join('\n')});
     await waitFor(() => ui.screen().includes('Answer line 50'));
-    assert.match(ui.screen(), /│ › Next question/);
+    await ui.expectScreen(/│ › Next question/);
     await ui.type('\u001b[5~');
+    // The scroll indicator shows the scrolled render is drawn.
+    await ui.expectScreen(/↑ \d+ lines/);
     assert.doesNotMatch(ui.screen(), /Answer line 50/);
     assert.match(ui.screen(), /│ › Next question/);
     await ui.type('\u001b[1;5F');
@@ -232,9 +298,9 @@ test('chat keeps the composer live, preserves drafts and context, and scrolls lo
     reply({message: 'Follow-up answer.'});
     await waitFor(() => ui.screen().includes('Follow-up answer.'));
     await ui.type('\u001b[A');
-    assert.match(ui.screen(), /│ › Next question/);
+    await ui.expectScreen(/│ › Next question/);
     await ui.type('\u001b[B');
-    assert.match(ui.screen(), /│ › Ask anything/);
+    await ui.expectScreen(/│ › Ask anything/);
     await ui.type('/clear\r');
     await waitFor(() => ui.screen().includes("Hi, I'm Ömer"));
     await ui.type('Fresh question\r');
@@ -248,7 +314,9 @@ test('chat keeps the composer live, preserves drafts and context, and scrolls lo
 });
 
 test('scrolled-up conversations stay in place while research and replies arrive', async () => {
+  /** @type {(reply: object) => void} */
   let reply;
+  /** @type {(event: object) => void} */
   let activity;
   const ui = await terminalApp({services: {
     ...client,
@@ -269,18 +337,19 @@ test('scrolled-up conversations stay in place while research and replies arrive'
     await ui.type('Second question\r');
     await waitFor(() => Boolean(reply));
     await ui.type('\u001b[5~');
+    await ui.expectScreen(/↑ \d+ lines/);
     const before = viewport();
     const below = linesBelow();
     assert.match(before, /Answer line/);
     assert(below > 0);
     activity({id: 'search', tool: 'search_web', query: 'current news', status: 'running'});
-    await waitFor(() => linesBelow() > below);
+    await ui.waitUntil(() => linesBelow() > below, 'the research line did not arrive below');
     assert.strictEqual(viewport(), before);
     reply({message: Array.from({length: 10}, (_,index) => `Second answer ${index + 1}`).join('\n')});
-    await waitFor(() => linesBelow() > below + 10);
+    await ui.waitUntil(() => linesBelow() > below + 10, 'the reply did not arrive below');
     assert.strictEqual(viewport(), before);
     await ui.type('\u001b[1;5F');
-    assert.match(ui.screen(), /Second answer 10/);
+    await ui.expectScreen(/Second answer 10/);
     assert.doesNotMatch(ui.screen(), /↑ \d+ lines/);
   } finally {
     await ui.close();
@@ -288,6 +357,7 @@ test('scrolled-up conversations stay in place while research and replies arrive'
 });
 
 test('scrolled-up conversations stay in place when cancelling removes research lines', async () => {
+  /** @type {(event: object) => void} */
   let activity;
   let signal;
   let calls = 0;
@@ -314,10 +384,11 @@ test('scrolled-up conversations stay in place when cancelling removes research l
       activity({id: `read-${index}`, tool: 'read_url', url: `https://example.com/${index}`, status: 'running'});
     }
     await ui.type('\u001b[1;5H');
+    await ui.expectScreen(/First question/);
     const before = viewport();
     assert.match(before, /First question/);
     await ui.type('\u001b');
-    await waitFor(() => signal.aborted && ui.screen().includes('Cancelled.'));
+    await ui.waitUntil(() => signal.aborted && ui.screen().includes('Cancelled.'), 'the request was not cancelled');
     assert.strictEqual(viewport(), before);
   } finally {
     await ui.close();
@@ -344,13 +415,13 @@ test('slash-prefixed text is sent as chat unless it is a single command word', a
     assert.strictEqual(requests[1][2].content, '/etc');
     assert.match(ui.screen(), /OTEKIN · [\w ]*\d{2}:\d{2}\n\s*Reply 2\./);
     await ui.type('\u001b[A');
-    assert.match(ui.screen(), /│ › \/\/etc/);
+    await ui.expectScreen(/│ › \/\/etc/);
     await ui.type('\u0015Third\r');
     await waitFor(() => ui.screen().includes('Reply 3.'));
     assert.match(ui.screen(), /OTEKIN · [\w ]*\d{2}:\d{2}\n\s*Reply 3\./);
     assert.doesNotMatch(ui.screen(), /spoofed/);
     await ui.type('/HELP\r');
-    assert.match(ui.screen(), /Make yourself at home/);
+    await ui.expectScreen(/Make yourself at home/);
     assert.strictEqual(requests.length, 3);
   } finally {
     await ui.close();
@@ -382,8 +453,9 @@ test('the header title uses the default foreground and /clear reports why a requ
     await ui.type('/clear\r');
     await waitFor(() => signal.aborted);
     await waitFor(() => ui.screen().includes("Hi, I'm Ömer"));
-    await new Promise(resolve => setTimeout(resolve, 50));
-    assert.match(ui.screen(), /Conversation cleared/);
+    // Give a late "Cancelled." notice the chance to appear before checking that it doesn't.
+    await sleep(50);
+    await ui.expectScreen(/Conversation cleared/);
     assert.doesNotMatch(ui.screen(), /Cancelled\./);
   } finally {
     await ui.close();
@@ -398,9 +470,8 @@ test('bracketed paste is edited as a draft and never submits embedded newlines',
   }});
   try {
     await ui.type('\u001b[200~Hello\n界 👨‍👩‍👧‍👦\nworld\u001b[201~');
+    await ui.expectScreen(/Hello[\s\S]*world/);
     assert.strictEqual(requests.length, 0);
-    assert.match(ui.screen(), /Hello/);
-    assert.match(ui.screen(), /world/);
     await ui.type('\r');
     await waitFor(() => ui.screen().includes('Received.'));
     assert.strictEqual(requests[0][0].content, 'Hello\n界 👨‍👩‍👧‍👦\nworld');
@@ -414,22 +485,29 @@ test('bracketed paste is edited as a draft and never submits embedded newlines',
 });
 
 test('Tab on narrow terminals preserves unsent drafts, including while a reply is pending', async () => {
+  /** @type {(reply: object) => void} */
   let reply;
   const ui = await terminalApp({columns: 80, rows: 24, services: {
     ...client, ensureChatServiceAwake: async () => {},
     requestChat: () => new Promise(resolve => {reply = resolve;})
   }});
+  const composer = () => ui.screen().split('\n').find(line => line.includes('│ ›')) || '';
   try {
     await ui.type('\t');
-    assert.match(ui.screen(), /Keyboard shortcuts and commands/);
+    await ui.expectScreen(/Keyboard shortcuts and commands/);
     await ui.type('\u0015An unsent draft\u001b[D');
+    // The caret sits on the draft's last character.
+    await ui.waitUntil(() => ui.emulator.buffer.active.cursorX === composer().indexOf('An unsent draft') + 14, 'the caret did not move left');
     const cursor = ui.emulator.buffer.active.cursorX;
     await ui.type('\t');
+    await ui.settle();
     assert.match(ui.screen(), /│ › An unsent draft/);
     assert.strictEqual(ui.emulator.buffer.active.cursorX, cursor);
     await ui.type('\u0015A question\r');
     await waitFor(() => Boolean(reply));
     await ui.type('My follow-up draft\t');
+    await ui.expectScreen(/│ › My follow-up draft/);
+    await ui.settle();
     assert.match(ui.screen(), /│ › My follow-up draft/);
     reply({message: 'The reply arrived.'});
     await waitFor(() => ui.screen().includes('The reply arrived.'));
@@ -444,20 +522,26 @@ test('Down preserves a new draft unless it is leaving an active prompt recall se
     ...client, ensureChatServiceAwake: async () => {},
     requestChat: async () => ({message: 'A remembered answer.'})
   }});
+  const composer = () => ui.screen().split('\n').find(line => line.includes('│ ›')) || '';
   try {
     await ui.type('A remembered question\r');
     await waitFor(() => ui.screen().includes('A remembered answer.'));
     await ui.type('My current draft\u001b[D');
+    // The caret sits on the draft's last character.
+    await ui.waitUntil(() => ui.emulator.buffer.active.cursorX === composer().indexOf('My current draft') + 15, 'the caret did not move left');
     const cursor = ui.emulator.buffer.active.cursorX;
     await ui.type('\u001b[B');
+    await ui.settle();
     assert.match(ui.screen(), /│ › My current draft/);
     assert.strictEqual(ui.emulator.buffer.active.cursorX, cursor);
     await ui.type('\u001b[A');
-    assert.match(ui.screen(), /│ › A remembered question/);
+    await ui.expectScreen(/│ › A remembered question/);
     await ui.type('\u001b[B');
-    assert.match(ui.screen(), /│ › My current draft/);
-    assert.strictEqual(ui.emulator.buffer.active.cursorX, cursor);
+    await ui.expectScreen(/│ › My current draft/);
+    await ui.waitUntil(() => ui.emulator.buffer.active.cursorX === cursor, 'Down did not restore the caret');
     await ui.type('\u0015A newer draft\u001b[B');
+    await ui.expectScreen(/│ › A newer draft/);
+    await ui.settle();
     assert.match(ui.screen(), /│ › A newer draft/);
   } finally {
     await ui.close();
@@ -466,6 +550,7 @@ test('Down preserves a new draft unless it is leaving an active prompt recall se
 
 test('cancelling a request keeps the app usable and cannot commit a stale reply', async () => {
   let signal;
+  /** @type {(error: Error) => void} */
   let rejectRequest;
   const requests = [];
   const ui = await terminalApp({services: {
@@ -651,17 +736,18 @@ test('scrolled-up conversations stay in place while provisional text grows', asy
     await ui.type('Second question\r');
     await waitFor(() => Boolean(state.onDelta));
     await ui.type('\u001b[5~');
+    await ui.expectScreen(/↑ \d+ lines/);
     const before = viewport();
     const below = linesBelow();
     assert.match(before, /Answer line/);
     assert(below > 0);
     for (let index = 1; index <= 3; index += 1) {
       state.onDelta(`Streamed line ${index}\n`);
-      await waitFor(() => linesBelow() > below + index);
+      await ui.waitUntil(() => linesBelow() > below + index, `streamed line ${index} did not arrive below`);
       assert.strictEqual(viewport(), before);
     }
     await ui.type('\u001b[1;5F');
-    assert.match(ui.screen(), /Streamed line 3/);
+    await ui.expectScreen(/Streamed line 3/);
   } finally {
     await ui.close();
   }
@@ -704,7 +790,7 @@ test('saved history restores the conversation, prompt recall and sources, and /c
       assert.match(second.screen(), /YOU\n\s*Remember this question/);
       assert.match(second.screen(), /fixture-model · [\w ]*\d{2}:\d{2}\n\s*Saved answer \[1\]\./);
       await second.type('\u001b[A');
-      assert.match(second.screen(), /│ › Remember this question/);
+      await second.expectScreen(/│ › Remember this question/);
       await second.type('\u0015Follow up\r');
       await waitFor(() => second.screen().includes('Answer 2.'));
       assert.deepStrictEqual(requests[1].map(message => message.content),
@@ -715,6 +801,7 @@ test('saved history restores the conversation, prompt recall and sources, and /c
       await waitFor(() => second.screen().includes("Hi, I'm Ömer"));
       assert.strictEqual(fs.existsSync(file), false);
       await second.type('\u001b[A');
+      await second.settle();
       assert.match(second.screen(), /│ › Ask anything/, '/clear forgets saved prompts too');
     } finally {
       await second.close();
@@ -991,6 +1078,7 @@ test('--no-history and OTEKIN_NO_HISTORY neither read nor write the history file
         assert.match(ui.screen(), /Ready when you are/);
         assert.doesNotMatch(ui.screen(), /Old question/);
         await ui.type('\u001b[A');
+        await ui.settle();
         assert.match(ui.screen(), /│ › Ask anything/);
         await ui.type('New question\r');
         await waitFor(() => ui.screen().includes('Unsaved answer'));
@@ -1058,7 +1146,7 @@ test('restored history never renders terminal escapes from disk', async () => {
       assert.match(ui.screen(), /Title question/);
       assert.match(ui.screen(), /OTEKIN\n\s*Wiped answer link/);
       await ui.type('\u001b[A');
-      assert.match(ui.screen(), /│ › Recalled/);
+      await ui.expectScreen(/│ › Recalled/);
       assert.doesNotMatch(ui.raw(), /pwned-title|evil\.example|spoofed/);
       assert.doesNotMatch(ui.raw(), /\u001b\[2J/);
       assert.strictEqual(ui.emulator.buffer.active.type, 'alternate');
@@ -1140,6 +1228,7 @@ test('/retry after a reply replaces that turn in the request, transcript and sav
   const {directory, file} = historyDirectory();
   const requests = [];
   const firstSource = {title: 'First', url: 'https://example.com/first'};
+  /** @type {(value?: unknown) => void} */
   let release;
   const services = {
     ...client, ensureChatServiceAwake: async () => {},
@@ -1235,8 +1324,13 @@ test('/save writes the conversation to a new Markdown file without terminal esca
     })
   };
   const saved = () => fs.readdirSync(directory).filter(name => /^otekin-chat-\d{8}-\d{6}(?:-\d+)?\.md$/.test(name)).sort();
+  // A pinned clock for the reply time and the file's heading, so the two saves below match byte
+  // for byte even when the real clock crosses into a new minute between them.
+  const clock = new Date(2026, 9, 30, 14, 15, 59).getTime();
+  const transcriptStore = {...chatExport, saveTranscript: (target, messages, options) =>
+    chatExport.saveTranscript(target, messages, {...options, date: new Date(clock)})};
   try {
-    const ui = await terminalApp({services, saveDirectory: directory});
+    const ui = await terminalApp({services, saveDirectory: directory, now: () => clock, transcriptStore});
     try {
       await ui.type('/save\r');
       await waitFor(() => ui.screen().includes('Nothing to save yet. Send a message first.'));
@@ -1250,12 +1344,12 @@ test('/save writes the conversation to a new Markdown file without terminal esca
       assert(ui.screen().replace(/\s+/g, '').includes(path.join(directory, saved()[0]).replace(/\s+/g, '')));
       const text = fs.readFileSync(path.join(directory, saved()[0]), 'utf8');
       assert.doesNotMatch(text, /[\u0000-\u0009\u000B-\u001F\u007F-\u009F]/);
-      assert.match(text, /^# otekin chat · \d{4}-\d{2}-\d{2} \d{2}:\d{2}\n\n## You\n\nFind a source\n\n## save-model · \d{4}-\d{2}-\d{2} \d{2}:\d{2}\n\n/);
+      assert.match(text, /^# otekin chat · 2026-10-30 14:15\n\n## You\n\nFind a source\n\n## save-model · 2026-10-30 14:15\n\n/);
       assert.match(text, /A \*\*sourced\*\* answer \[1\]\.\n\nSources: \[\\\[1\\\] Example source\]\(https:\/\/example\.com\/source\)\n$/);
       assert.doesNotMatch(text, /website:/, 'notices are left out');
       await ui.type('/save\r');
       await waitFor(() => saved().length === 2);
-      assert.strictEqual(fs.readFileSync(path.join(directory, saved()[1]), 'utf8'), text);
+      assert.deepStrictEqual(saved().map(name => fs.readFileSync(path.join(directory, name), 'utf8')), [text, text]);
     } finally {
       await ui.close();
     }
@@ -1278,17 +1372,21 @@ test('/save writes the conversation to a new Markdown file without terminal esca
   }
 });
 
-test('/retry, /save and /sources appear in /help and the command picker', async () => {
-  const ui = await terminalApp();
+test('/retry, /save, /copy and /sources appear in /help and the command picker', async () => {
+  const ui = await terminalApp({rows: 40});
   try {
     await ui.type('/help\r');
-    assert.match(ui.screen(), /\/retry\s+Send your last message again/);
-    assert.match(ui.screen(), /\/save\s+Save the conversation as Markdown/);
-    assert.match(ui.screen(), /\/sources\s+Show the full titles and links of cited sources/);
+    await ui.expectScreen(/Make yourself at home/);
+    await ui.expectScreen(/\/retry\s+Send your last message again/);
+    await ui.expectScreen(/\/save\s+Save the conversation as Markdown/);
+    await ui.expectScreen(/\/copy\s+Copy the latest reply and its sources/);
+    await ui.expectScreen(/\/sources\s+Show the full titles and links of cited sources/);
     await ui.type('/re');
-    assert.match(ui.screen(), /› \/retry\s+Send your last message again/);
+    await ui.expectScreen(/› \/retry\s+Send your last message again/);
     await ui.type('\u0015/sa');
-    assert.match(ui.screen(), /› \/save\s+Save the conversation as Markdown/);
+    await ui.expectScreen(/› \/save\s+Save the conversation as Markdown/);
+    await ui.type('\u0015/co');
+    await ui.expectScreen(/› \/copy\s+Copy the latest reply and its sources/);
   } finally {
     await ui.close();
   }
@@ -1307,23 +1405,25 @@ test('NO_COLOR keeps the full-screen workspace free of SGR codes and focus still
       assert.doesNotMatch(ui.raw(), SGR, 'welcome screen');
 
       await ui.type('/');
-      assert.match(ui.screen(), /› \/help\s+Keyboard shortcuts/);
+      await ui.expectScreen(/› \/help\s+Keyboard shortcuts/);
       assert.match(ui.screen(), / {2}\/profile\s+Meet Ömer/);
       await ui.type('\u001b[B');
-      assert.match(ui.screen(), /› \/profile\s+Meet Ömer/);
+      await ui.expectScreen(/› \/profile\s+Meet Ömer/);
       assert.match(ui.screen(), / {2}\/help\s+Keyboard shortcuts/);
       assert.doesNotMatch(ui.raw(), SGR, 'command palette');
       await ui.type('\u0015\u001b');
+      await ui.waitUntil(() => !/\/help\s+Keyboard shortcuts/.test(ui.screen()) && lines().some(line => line.includes('│ › Ask anything')),
+        'the command palette did not close');
 
       await ui.type('\t\u001b[B');
-      assert.match(ui.screen(), /› About Ömer/);
+      await ui.expectScreen(/› About Ömer/);
       assert.doesNotMatch(ui.screen(), /› Chat/);
       assert(!lines().some(line => line.includes('│ ›')), 'unfocused composer hides its › marker');
       assert.match(ui.screen(), /┌/);
       assert.doesNotMatch(ui.screen(), /╭/);
       assert.doesNotMatch(ui.raw(), SGR, 'navigation focus');
       await ui.type('\t');
-      assert(lines().some(line => line.includes('│ › Ask anything')), 'composer focus returns');
+      await ui.waitUntil(() => lines().some(line => line.includes('│ › Ask anything')), 'composer focus returns');
 
       await ui.type('Stream please\r');
       await waitFor(() => Boolean(state.onDelta));
@@ -1337,7 +1437,7 @@ test('NO_COLOR keeps the full-screen workspace free of SGR codes and focus still
       assert.doesNotMatch(ui.raw(), SGR, 'finished reply');
 
       await ui.resize(20, 6);
-      assert.match(ui.screen(), /Resize to at least/);
+      await ui.expectScreen(/Resize to at least/);
       assert.doesNotMatch(ui.raw(), SGR, 'small terminal');
     } finally {
       await ui.close();
@@ -1357,8 +1457,9 @@ test('without NO_COLOR the full-screen workspace keeps its colors', async () => 
       assert(ui.screen().split('\n').some(line => line.includes('│ › Ask anything')));
       await ui.type('\t');
       // The focused navigation item is drawn inverse; the composer keeps its round border and marker.
-      const row = ui.screen().split('\n').findIndex(line => line.includes('› Chat'));
-      assert(ui.emulator.buffer.active.getLine(row).getCell(1).isInverse());
+      const row = () => ui.screen().split('\n').findIndex(line => line.includes('› Chat'));
+      await ui.waitUntil(() => row() >= 0 && ui.emulator.buffer.active.getLine(row()).getCell(1).isInverse(),
+        'the focused navigation item is not drawn inverse');
       assert.match(ui.screen(), /╭/);
       assert(ui.screen().split('\n').some(line => line.includes('│ › Ask anything')));
     } finally {
@@ -1393,7 +1494,7 @@ test('/sources lists cited replies in full and Esc restores the draft and chat s
   }});
   const viewport = () => ui.screen().split('\n').slice(2, 25).join('\n');
   const flat = () => ui.screen().replace(/\s+/g, '');
-  const composer = () => ui.screen().split('\n').find(line => line.includes('│ ›'));
+  const composer = () => ui.screen().split('\n').find(line => line.includes('│ ›')) || '';
   try {
     await ui.type('First question\r');
     await waitFor(() => ui.screen().includes('First cited'));
@@ -1401,12 +1502,12 @@ test('/sources lists cited replies in full and Esc restores the draft and chat s
     await ui.type('Second question\r');
     await waitFor(() => ui.screen().includes('Answer line 50'));
     await ui.type('\u001b[5~');
+    const scrolled = (await ui.expectScreen(/↑ \d+ lines/)).match(/↑ \d+ lines/)[0];
     const before = viewport();
-    const scrolled = ui.screen().match(/↑ \d+ lines/)[0];
     assert.doesNotMatch(before, /Answer line 50/);
 
     await ui.type('/so');
-    assert.match(ui.screen(), /› \/sources\s+Show the full titles and links of cited sources/);
+    await ui.expectScreen(/› \/sources\s+Show the full titles and links of cited sources/);
     await ui.type('\r');
     await waitFor(() => ui.screen().includes('Sources · reply 2 of 2'));
     assert.match(ui.screen(), /\/ Sources/);
@@ -1416,37 +1517,42 @@ test('/sources lists cited replies in full and Esc restores the draft and chat s
     assert.match(ui.screen(), /Esc back to chat/);
 
     await ui.type('\u001b[D');
-    assert.match(ui.screen(), /Sources · reply 1 of 2 · fixture-model/);
+    await ui.expectScreen(/Sources · reply 1 of 2 · fixture-model/);
     // The whole title and link, wrapped to the terminal and never shortened.
     assert(flat().includes(`[1]${LONG_TITLE.replace(/\s+/g, '')}${LONG_URL}`), ui.screen());
     assert.doesNotMatch(viewport(), /…/);
     assert.match(ui.screen(), /› \[1\] A remarkably/);
     assert.match(ui.screen(), / {2}\[2\] Second source\n\s*https:\/\/example\.com\/second/);
     await ui.type('\u001b[B');
-    assert.match(ui.screen(), /› \[2\] Second source/);
+    await ui.expectScreen(/› \[2\] Second source/);
     assert.match(ui.screen(), / {2}\[1\] A remarkably/);
     await ui.type('\u001b[B\u001b[D');
+    await ui.settle();
     assert.match(ui.screen(), /Sources · reply 1 of 2/, 'the first reply stays put');
     assert.match(ui.screen(), /› \[2\] Second source/, 'the selection stays put at either end');
     await ui.type('\u001b[C');
-    assert.match(ui.screen(), /Sources · reply 2 of 2/);
+    await ui.expectScreen(/Sources · reply 2 of 2/);
     await ui.type('\u001b[C');
+    await ui.settle();
     assert.match(ui.screen(), /Sources · reply 2 of 2/);
 
     // Typing, editing keys and paste never reach the draft while the inspector is open.
     await ui.type('typed text\u0015\u007f\u0017');
     await ui.type('\u001b[200~pasted\u001b[201~');
+    await ui.settle();
     assert.doesNotMatch(ui.screen(), /typed text|pasted/);
     await ui.type('\u001b');
-    await waitFor(() => !ui.screen().includes('Sources · reply'));
+    await ui.waitUntil(() => !ui.screen().includes('Sources · reply'), 'Esc did not close the sources');
     assert.match(ui.screen(), /\/ Chat/);
     assert.strictEqual(viewport(), before);
     assert.match(ui.screen(), new RegExp(scrolled));
     assert.match(composer(), /│ › Ask anything/);
+    assert.doesNotMatch(ui.screen(), /typed text|pasted/);
     assert.strictEqual(requests.length, 2);
 
     await ui.type('abc\u001b[D');
-    assert.match(composer(), /│ › abc/);
+    await ui.waitUntil(() => /│ › abc/.test(composer()) && ui.emulator.buffer.active.cursorX === composer().indexOf('abc') + 2,
+      'the caret did not move left in the draft');
     const row = ui.screen().split('\n').indexOf(composer());
     assert.strictEqual(ui.emulator.buffer.active.cursorY, row);
     assert.strictEqual(ui.emulator.buffer.active.cursorX, composer().indexOf('abc') + 2);
@@ -1470,6 +1576,7 @@ test('/sources keeps the chat in place when a reply arrives while it is open', a
     await ui.type('Second question\r');
     await waitFor(() => Boolean(state.resolve));
     await ui.type('\u001b[5~');
+    await ui.expectScreen(/↑ \d+ lines/);
     const before = viewport();
     await ui.type('/sources\r');
     await waitFor(() => ui.screen().includes('Sources · reply 1 of 1'));
@@ -1479,16 +1586,16 @@ test('/sources keeps the chat in place when a reply arrives while it is open', a
     await waitFor(() => ui.screen().includes('Sources · reply 1 of 2'));
     assert.match(ui.screen(), /› \[1\] First source/);
     await ui.type('\u001b');
-    await waitFor(() => !ui.screen().includes('Sources · reply'));
+    await ui.waitUntil(() => !ui.screen().includes('Sources · reply'), 'Esc did not close the sources');
     assert.strictEqual(viewport(), before);
     await ui.type('\u001b[1;5F');
-    assert.match(ui.screen(), /Second answer 10/);
+    await ui.expectScreen(/Second answer 10/);
 
     // At the bottom of the chat, it returns to the bottom.
     await ui.type('/sources\r');
     await waitFor(() => ui.screen().includes('Sources · reply 2 of 2'));
     await ui.type('\u001b');
-    await waitFor(() => !ui.screen().includes('Sources · reply'));
+    await ui.waitUntil(() => !ui.screen().includes('Sources · reply'), 'Esc did not close the sources');
     assert.match(ui.screen(), /Second answer 10/);
     assert.doesNotMatch(ui.screen(), /↑ \d+ lines/);
   } finally {
@@ -1530,13 +1637,13 @@ test('/sources opens the selected link, or shows it with --no-open, and never sh
 
     // ↓ keeps the selection in view; Page Up and Down scroll the list.
     for (let index = 0; index < 10; index += 1) await ui.type('\u001b[B');
-    assert.match(ui.screen(), /› \[12\] Source 12/);
+    await ui.expectScreen(/› \[12\] Source 12/);
     assert.doesNotMatch(ui.screen(), /Sources · reply/);
     await ui.type('\u001b[5~');
-    assert.match(ui.screen(), /Sources · reply 1 of 1/);
+    await ui.expectScreen(/Sources · reply 1 of 1/);
     assert.doesNotMatch(ui.screen(), /\[12\]/);
     await ui.type('\u001b[6~');
-    assert.match(ui.screen(), /\[12\] Source 12/);
+    await ui.expectScreen(/\[12\] Source 12/);
 
     fail = true;
     await ui.type('\r');
@@ -1577,7 +1684,7 @@ test('/sources without a cited reply adds a notice and stays in chat', async () 
     await waitFor(() => ui.screen().match(/No sources yet/g)?.length === 2);
     assert.match(ui.screen(), /\/ Chat/);
     await ui.type('hello');
-    assert.match(ui.screen(), /│ › hello/);
+    await ui.expectScreen(/│ › hello/);
   } finally {
     await ui.close();
   }
@@ -1604,7 +1711,7 @@ test('/sources inspects replies restored from saved history, and NO_COLOR still 
         assert.match(ui.screen(), /› \[1\] A remarkably/);
         assert.match(ui.screen(), / {2}\[2\] Saved without a link\n\s*\(no link\)/);
         await ui.type('\u001b[B');
-        assert.match(ui.screen(), /› \[2\] Saved without a link/);
+        await ui.expectScreen(/› \[2\] Saved without a link/);
         assert.match(ui.screen(), / {2}\[1\] A remarkably/);
         assert.doesNotMatch(ui.raw(), SGR);
       } finally {
@@ -1623,6 +1730,214 @@ test('/sources inspects replies restored from saved history, and NO_COLOR still 
         await ui.close();
       }
     });
+  } finally {
+    fs.rmSync(directory, {recursive: true, force: true});
+  }
+});
+
+// A clipboard stand-in that records what it is given; `works` decides whether the copy succeeds.
+/** @param {boolean | Error} [works] whether the copy succeeds, or the error it throws */
+function fakeClipboard(works = true) {
+  const copied = [];
+  return {copied, clipboard: {async copy(text) {
+    copied.push(text);
+    if (works instanceof Error) throw works;
+    return works;
+  }}};
+}
+
+const ESCAPES = /[\u0000-\u0009\u000B-\u001F\u007F-\u009F]/;
+// Whether the screen shows text, which may be wrapped across lines.
+const shows = (ui, text) => ui.screen().replace(/\s+/g, ' ').includes(text);
+
+test('/copy gives the clipboard the latest reply and its source links, without escapes, header or tool lines', async () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'otekin-fullscreen-copy-'));
+  const {copied, clipboard} = fakeClipboard();
+  const services = {
+    ...client, ensureChatServiceAwake: async () => {},
+    async requestChat(_messages, options) {
+      options.onActivity({id: 'search', tool: 'search_web', query: 'copy research', status: 'running'});
+      options.onActivity({id: 'search', tool: 'search_web', query: 'copy research', status: 'completed'});
+      return citedReply('A **sourced** answer with `code` [1][2].', [
+        {number: 1, title: 'First [draft] source', url: 'https://example.com/one'},
+        {number: 2, title: 'Second', url: 'https://example.com/two'}
+      ], 'copy-model');
+    }
+  };
+  try {
+    await withInkColor(async () => {
+      const ui = await terminalApp({services, clipboard, saveDirectory: directory});
+      try {
+        await ui.type('/copy\r');
+        await waitFor(() => ui.screen().includes('Nothing to copy yet. Wait for a reply to finish.'));
+        assert.deepStrictEqual(copied, []);
+        await ui.type('Find sources\r');
+        await waitFor(() => ui.screen().includes('A sourced answer'));
+        assert.match(ui.screen(), /copy research/);
+        assert.match(ui.raw(), SGR, 'the reply on screen is styled');
+        await ui.type('/website\r');
+        await ui.type('/copy\r');
+        await waitFor(() => shows(ui, 'Copied the latest reply (with 2 sources) to the clipboard'));
+        assert.deepStrictEqual(copied, [
+          'A **sourced** answer with `code` [1][2].\n\n' +
+          'Sources: [\\[1\\] First \\[draft\\] source](https://example.com/one) · [\\[2\\] Second](https://example.com/two)\n'
+        ]);
+        assert.doesNotMatch(copied[0], ESCAPES);
+        assert.doesNotMatch(copied[0], /copy-model|copy research|website|Nothing to copy/);
+        assert.deepStrictEqual(fs.readdirSync(directory), [], 'a working clipboard writes no file');
+        assert.match(ui.screen(), /\/ Chat/);
+      } finally {
+        await ui.close();
+      }
+    });
+  } finally {
+    fs.rmSync(directory, {recursive: true, force: true});
+  }
+});
+
+test('/copy during a reply copies the previous completed one and never provisional text', async () => {
+  const {state, services} = streamingServices();
+  const {copied, clipboard} = fakeClipboard();
+  const ui = await terminalApp({services, clipboard});
+  try {
+    await ui.type('First\r');
+    await waitFor(() => Boolean(state.resolve));
+    state.onDelta('Early provisional words');
+    await waitFor(() => ui.screen().includes('Early provisional words'));
+    await ui.type('/copy\r');
+    await waitFor(() => ui.screen().includes('Nothing to copy yet. Wait for a reply to finish.'));
+    assert.deepStrictEqual(copied, []);
+    state.resolve({message: 'First complete answer.'});
+    await waitFor(() => ui.screen().includes('First complete answer.'));
+
+    state.resolve = null;
+    await ui.type('Second\r');
+    await waitFor(() => Boolean(state.resolve));
+    state.onDelta('Second provisional words');
+    await waitFor(() => ui.screen().includes('Second provisional words'));
+    await ui.type('/copy\r');
+    await waitFor(() => shows(ui, 'Copied the previous reply to the clipboard. The reply being written is not finished yet'));
+    assert.deepStrictEqual(copied, ['First complete answer.\n']);
+    assert.match(ui.screen(), /Second provisional words/, 'the reply keeps streaming');
+    state.resolve({message: 'Second complete answer.'});
+    await waitFor(() => ui.screen().includes('Second complete answer.'));
+    await ui.type('/copy\r');
+    await waitFor(() => copied.length === 2);
+    assert.strictEqual(copied[1], 'Second complete answer.\n');
+    await waitFor(() => shows(ui, 'Copied the latest reply to the clipboard'));
+  } finally {
+    await ui.close();
+  }
+});
+
+test('/copy saves a new private Markdown file when no clipboard works, and says so', async () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'otekin-fullscreen-copy-file-'));
+  const services = {
+    ...client, ensureChatServiceAwake: async () => {},
+    requestChat: async () => citedReply('Ömer’s answer [1].', [{number: 1, title: 'Source', url: 'https://example.com/source'}], 'file-model')
+  };
+  const replies = () => fs.readdirSync(directory).filter(name => /^otekin-reply-\d{8}-\d{6}(?:-\d+)?\.md$/.test(name)).sort();
+  const expected = 'Ömer’s answer [1].\n\nSources: [\\[1\\] Source](https://example.com/source)\n';
+  try {
+    const failing = fakeClipboard(false);
+    // Narrow enough to leave out the sidebar, so wrapped notices read as one text.
+    const ui = await terminalApp({columns: 80, services, clipboard: failing.clipboard, saveDirectory: directory});
+    try {
+      await ui.type('/copy\r');
+      await waitFor(() => ui.screen().includes('Nothing to copy yet'));
+      assert.deepStrictEqual(fs.readdirSync(directory), [], 'nothing is written without a reply');
+      await ui.type('Question\r');
+      await waitFor(() => ui.screen().includes('answer [1]'));
+      await ui.type('/copy\r');
+      await waitFor(() => shows(ui, 'No clipboard available; saved the latest reply (with 1 source) to'));
+      assert.strictEqual(replies().length, 1);
+      const file = path.join(directory, replies()[0]);
+      assert(ui.screen().replace(/\s+/g, '').includes(file.replace(/\s+/g, '')));
+      assert.strictEqual(fs.readFileSync(file, 'utf8'), expected);
+      if (process.platform !== 'win32') assert.strictEqual(fs.statSync(file).mode & 0o777, 0o600);
+      assert.deepStrictEqual(failing.copied, [expected], 'the clipboard was tried first');
+      await ui.type('/copy\r');
+      await waitFor(() => replies().length === 2);
+      assert.strictEqual(fs.readFileSync(file, 'utf8'), expected, 'an existing file is never replaced');
+    } finally {
+      await ui.close();
+    }
+
+    const throwing = fakeClipboard(new Error('clipboard exploded'));
+    const missing = await terminalApp({columns: 80, services, clipboard: throwing.clipboard, saveDirectory: path.join(directory, 'missing')});
+    try {
+      await missing.type('Question\r');
+      await waitFor(() => missing.screen().includes('answer [1]'));
+      await missing.type('/copy\r');
+      await waitFor(() => shows(missing, 'No clipboard available, and the reply could not be saved (ENOENT). The chat still works.'));
+      assert.doesNotMatch(missing.screen(), /exploded/);
+      assert.strictEqual(replies().length, 2);
+    } finally {
+      await missing.close();
+    }
+  } finally {
+    fs.rmSync(directory, {recursive: true, force: true});
+  }
+});
+
+test('/copy keeps the draft and the chat scroll position', async () => {
+  const {copied, clipboard} = fakeClipboard();
+  const answer = Array.from({length: 50}, (_,index) => `Answer line ${index + 1}`).join('\n');
+  const ui = await terminalApp({columns: 80, clipboard, services: {
+    ...client, ensureChatServiceAwake: async () => {}, requestChat: async () => ({message: answer})
+  }});
+  const viewport = () => ui.screen().split('\n').slice(2, 25).join('\n');
+  const linesBelow = () => Number((ui.screen().match(/↑ (\d+) lines/) || [])[1] || 0);
+  const composer = () => ui.screen().split('\n').find(line => line.includes('│ ›')) || '';
+  try {
+    await ui.type('Long question\r');
+    await waitFor(() => ui.screen().includes('Answer line 50'));
+    await ui.type('\u001b[5~');
+    await ui.expectScreen(/↑ \d+ lines/);
+    const before = viewport();
+    const below = linesBelow();
+    assert(below > 0);
+    assert.doesNotMatch(before, /Answer line 50/);
+    await ui.type('/co\r');
+    await ui.waitUntil(() => copied.length === 1 && linesBelow() > below, 'the copy notice did not arrive below');
+    assert.strictEqual(copied[0], `${answer}\n`);
+    assert.strictEqual(viewport(), before, 'the reading position stays put');
+    // The notice lands below the reading position, so the status line repeats it.
+    assert.match(ui.screen(), /Copied the latest reply to the clipboard/);
+    assert.match(composer(), /│ › Ask anything/);
+    await ui.type('abc\u001b[D');
+    await ui.waitUntil(() => /│ › abc/.test(composer()) && ui.emulator.buffer.active.cursorX === composer().indexOf('abc') + 2,
+      'the caret did not move left in the draft');
+    const row = ui.screen().split('\n').indexOf(composer());
+    assert.strictEqual(ui.emulator.buffer.active.cursorY, row);
+    assert.strictEqual(ui.emulator.buffer.active.cursorX, composer().indexOf('abc') + 2);
+    await ui.type('\u001b[1;5F');
+    await ui.expectScreen(/•\s*\n\s*Copied the latest reply to the clipboard/);
+  } finally {
+    await ui.close();
+  }
+});
+
+test('/copy copies replies restored from saved history with their source links', async () => {
+  const {directory, file} = historyDirectory();
+  const {copied, clipboard} = fakeClipboard();
+  try {
+    fs.mkdirSync(path.dirname(file), {recursive: true});
+    fs.writeFileSync(file, JSON.stringify({version: 1, history: [], prompts: [], messages: [
+      {role: 'user', content: 'Saved question'},
+      {role: 'assistant', model: 'saved-model', content: 'Saved answer [1].', answer: 'Saved answer [1].', sources: [
+        {number: 1, title: 'Saved source', url: 'https://example.com/saved'}
+      ]},
+      {role: 'notice', content: 'website: https://example.com'}
+    ]}));
+    const ui = await terminalApp({historyFile: file, clipboard});
+    try {
+      await ui.type('/copy\r');
+      await waitFor(() => shows(ui, 'Copied the latest reply (with 1 source) to the clipboard'));
+      assert.deepStrictEqual(copied, ['Saved answer [1].\n\nSources: [\\[1\\] Saved source](https://example.com/saved)\n']);
+    } finally {
+      await ui.close();
+    }
   } finally {
     fs.rmSync(directory, {recursive: true, force: true});
   }
