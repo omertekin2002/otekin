@@ -18,14 +18,13 @@ function fakeTerminal(options = {}) {
   const emulator = new Terminal({ cols: columns, rows, convertEol: true, allowProposedApi: true, scrollback: 0 });
   let raw = '';
   let pending = Promise.resolve();
-  const stream = new Writable({
+  const stream = Object.assign(new Writable({
     write(chunk, _encoding, done) {
       raw += chunk.toString();
       pending = new Promise((resolve) => emulator.write(chunk.toString(), resolve));
       done();
     }
-  });
-  Object.assign(stream, { isTTY: true, columns, rows });
+  }), { isTTY: true, columns, rows });
   // Start like a shell would: the command line, then the cursor on a fresh line.
   stream.write(PROMPT + '\n');
   const lines = async () => {

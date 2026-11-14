@@ -20,7 +20,8 @@ function listen(handler) {
     server.listen(0, '127.0.0.1', () => {
       resolve({
         server,
-        endpoint: `http://127.0.0.1:${server.address().port}/v1/chat`
+        // A TCP server always reports an AddressInfo, never a pipe path.
+        endpoint: `http://127.0.0.1:${/** @type {import('net').AddressInfo} */ (server.address()).port}/v1/chat`
       });
     });
   });
@@ -210,6 +211,7 @@ test('requestChat maps non-success responses and captures safe metadata', async 
 });
 
 test('requestChat maps safe gateway error codes without exposing response messages', async () => {
+  /** @type {Array<[number, string, RegExp]>} */
   const fixtures = [
     [502, 'generation_unavailable', /generation is temporarily unavailable/i],
     [504, 'request_timeout', /timed out/i],
@@ -486,6 +488,7 @@ test('stream errors retain safe categories and request IDs without leaking provi
     response.end(JSON.stringify({ type: 'error', code: 'generation_unavailable', error: 'private upstream detail' }) + '\n');
   }, async (endpoint) => {
     await assert.rejects(requestChat([], { endpoint, onActivity() {} }), error => {
+      assert(error instanceof ChatApiError);
       assert.strictEqual(error.requestId, 'stream-123');
       assert.strictEqual(error.statusCode, 200);
       assert.strictEqual(error.code, 'generation_unavailable');
@@ -497,6 +500,7 @@ test('stream errors retain safe categories and request IDs without leaking provi
 });
 
 test('streams reject malformed records, incomplete answers, and oversized events', async () => {
+  /** @type {Array<[string, RegExp]>} */
   const cases = [
     ['{bad json}\n', /invalid stream data/i],
     [JSON.stringify({ type: 'delta', text: 'Partial answer' }) + '\n', /before completion/i],

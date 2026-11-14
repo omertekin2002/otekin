@@ -88,7 +88,8 @@ function listen(handler, healthHandler) {
     server.listen(0, '127.0.0.1', () => {
       resolve({
         server,
-        endpoint: `http://127.0.0.1:${server.address().port}/v1/chat`,
+        // A TCP server always reports an AddressInfo, never a pipe path.
+        endpoint: `http://127.0.0.1:${/** @type {import('net').AddressInfo} */ (server.address()).port}/v1/chat`,
         getHandlerError: () => handlerError,
         getRequests: () => requests.slice()
       });
@@ -265,7 +266,7 @@ test('CLI rejects unknown options without sending anything', async () => {
     response.writeHead(200, { 'Content-Type': 'application/json' });
     response.end(JSON.stringify({ message: 'Should not be reached.' }));
   }, async (endpoint, fixture) => {
-    for (const [args, name] of [
+    for (const [args, name] of /** @type {Array<[string[], string]>} */ ([
       [['--reserch'], '--reserch'],
       [['chat', 'Find', 'sources', '--research', 'always'], '--research'],
       [['chat', 'Find', '--research=never'], '--research'],
@@ -274,7 +275,7 @@ test('CLI rejects unknown options without sending anything', async () => {
       [['--research=secret', 'chat', 'hi'], '--research'],
       [['--help', '--unknown-flag'], '--unknown-flag'],
       [['--json', 'chat', 'hi', '--unknown-flag', '--select'], '--unknown-flag']
-    ]) {
+    ])) {
       const result = await runCli(args, { OTEKIN_CHAT_API_URL: endpoint });
       assert.strictEqual(result.code, 1, args.join(' '));
       assert.strictEqual(result.stdout, '', args.join(' '));
@@ -553,7 +554,7 @@ test('CLI one-shot, --json and piped runs never create the history file', async 
 async function runTtyChat(args, env) {
   const result = await runCli(args, Object.assign({ TERM: 'xterm-256color', NO_COLOR: undefined }, env), TTY_STDOUT);
   const emulator = new Terminal({ cols: 60, rows: 15, convertEol: true, allowProposedApi: true, scrollback: 0 });
-  await new Promise((resolve) => emulator.write(result.stdout, resolve));
+  await new Promise((resolve) => emulator.write(result.stdout, () => resolve(undefined)));
   const buffer = emulator.buffer.active;
   result.screen = Array.from({ length: 15 }, (_, index) =>
     buffer.getLine(buffer.viewportY + index).translateToString(true)).join('\n').replace(/\s+$/, '');
@@ -596,7 +597,7 @@ test('CLI one-shot chat on a terminal streams a preview, then prints only the ca
 
 test('CLI one-shot preview is erased when the stream fails or ends early', async () => {
   for (const ending of [[], [{ type: 'error', error: 'raw provider failure' }]]) {
-    await withServer(streamReply([{ type: 'delta', text: 'Half an answer' }, 250].concat(ending)), async (endpoint) => {
+    await withServer(streamReply([{ type: 'delta', text: 'Half an answer' }, 250, ...ending]), async (endpoint) => {
       const result = await runTtyChat(['chat', 'hi'], { OTEKIN_CHAT_API_URL: endpoint });
       assert.strictEqual(result.code, 1);
       assert.match(result.stdout, /Half an answer/);

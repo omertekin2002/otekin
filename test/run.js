@@ -21,6 +21,7 @@ require('./chat-export.test');
 require('./terminal.test');
 require('./stream-preview.test');
 require('./browser.test');
+require('./clipboard.test');
 require('./profile.test');
 require('./fullscreen.test');
 require('./cli.test');

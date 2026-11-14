@@ -3,9 +3,23 @@
 const assert = require('assert');
 const fs = require('fs');
 const path = require('path');
-const { PassThrough } = require('stream');
+const { PassThrough, Writable } = require('stream');
 const { installPilcrow, runCommand, confirmUvInstall } = require('../lib/install-pilcrow');
 
+// A stream that reports itself as a terminal, or as a pipe when `isTTY` is false.
+const terminalStream = (isTTY = true) => Object.assign(new PassThrough(), { isTTY });
+
+// The exit code installPilcrow and runCommand attach to their errors.
+const exitCodeOf = (error) => (error instanceof Error && 'exitCode' in error ? error.exitCode : undefined);
+
+/**
+ * @param {object} [options]
+ * @param {string} [options.platform]
+ * @param {'path' | 'managed' | 'missing'} [options.available] where uv is found, if anywhere
+ * @param {string} [options.failure] the step that fails, if any
+ * @param {(command: string, args: string[], options: { env?: NodeJS.ProcessEnv }) => void} [options.onBootstrap]
+ *   called with the uv installer's command line
+ */
 function fixture({ platform = 'linux', available = 'path', failure = '', onBootstrap } = {}) {
   const windows = platform === 'win32';
   const paths = windows ? path.win32 : path.posix;
@@ -18,7 +32,7 @@ function fixture({ platform = 'linux', available = 'path', failure = '', onBoots
   const deps = {
     platform, home,
     env: { PATH: bin },
-    stdout: { write: (text) => { output += text; } },
+    stdout: new Writable({ write(chunk, _encoding, done) { output += chunk; done(); } }),
     confirm: async () => { calls.push({ confirmation: true }); return true; },
     fetchImpl: async (url) => {
       calls.push({ url });
@@ -110,7 +124,7 @@ test('Pilcrow leaves a missing uv uninstalled when confirmation is declined or u
 
   const piped = fixture({ available: 'missing' });
   piped.deps.confirm = confirmUvInstall;
-  piped.deps.stdin = { isTTY: false };
+  piped.deps.stdin = terminalStream(false);
   await assert.rejects(installPilcrow({}, piped.deps), /uv is not installed/);
   assert.ok(!piped.calls.some((call) => call.url || call.args?.includes('install')));
 
@@ -121,11 +135,9 @@ test('Pilcrow leaves a missing uv uninstalled when confirmation is declined or u
 });
 
 test('uv confirmation requires explicit yes, handles EOF and invalid answers, and cleans up', async () => {
-  for (const [answer, expected] of [['y\n', true], [' YES \n', true], ['n\n', false], ['no\n', false], ['\n', false], [null, false], ['maybe\ny\n', true]]) {
-    const input = new PassThrough();
-    const output = new PassThrough();
-    input.isTTY = true;
-    output.isTTY = true;
+  for (const [answer, expected] of /** @type {Array<[string | null, boolean]>} */ ([['y\n', true], [' YES \n', true], ['n\n', false], ['no\n', false], ['\n', false], [null, false], ['maybe\ny\n', true]])) {
+    const input = terminalStream();
+    const output = terminalStream();
     let text = '';
     output.on('data', (chunk) => { text += chunk; });
     const listeners = process.listenerCount('SIGINT');
@@ -143,16 +155,14 @@ test('uv confirmation requires explicit yes, handles EOF and invalid answers, an
 });
 
 test('uv confirmation treats interruption as cancellation and does not accept piped yes', async () => {
-  await assert.rejects(confirmUvInstall({ input: { isTTY: false }, output: { isTTY: true } }), /uv is not installed/);
-  await assert.rejects(confirmUvInstall({ input: { isTTY: true }, output: { isTTY: false } }), /uv is not installed/);
-  const input = new PassThrough();
-  const output = new PassThrough();
-  input.isTTY = true;
-  output.isTTY = true;
+  await assert.rejects(confirmUvInstall({ input: terminalStream(false), output: terminalStream() }), /uv is not installed/);
+  await assert.rejects(confirmUvInstall({ input: terminalStream(), output: terminalStream(false) }), /uv is not installed/);
+  const input = terminalStream();
+  const output = terminalStream();
   const listeners = process.listenerCount('SIGINT');
   const pending = confirmUvInstall({ input, output });
   process.emit('SIGINT');
-  await assert.rejects(pending, (error) => error.exitCode === 130);
+  await assert.rejects(pending, (error) => exitCodeOf(error) === 130);
   assert.strictEqual(process.listenerCount('SIGINT'), listeners);
   input.destroy();
   output.destroy();
@@ -182,8 +192,8 @@ test('installer process runner captures output, propagates failures, and cleans 
   const result = await runCommand(process.execPath, ['-e', 'process.stdout.write("ok")'], { capture: true });
   assert.strictEqual(result.stdout, 'ok');
   await assert.rejects(runCommand(process.execPath, ['-e', 'process.stderr.write("bad"); process.exit(7)'], { capture: true }),
-    (error) => error.exitCode === 7 && /bad/.test(error.message));
+    (error) => exitCodeOf(error) === 7 && error instanceof Error && /bad/.test(error.message));
   await assert.rejects(runCommand(path.join(__dirname, 'nonexistent-installer'), [], { capture: true }),
-    (error) => error.code === 'ENOENT');
+    (error) => error instanceof Error && 'code' in error && error.code === 'ENOENT');
   assert.strictEqual(process.listenerCount('SIGINT'), before);
 });
