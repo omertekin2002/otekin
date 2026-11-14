@@ -11,6 +11,7 @@ function tempFile() {
   return { directory, file: path.join(directory, 'nested', 'history.json') };
 }
 
+/** @returns {{ history: object[], messages: object[], prompts: string[] }} */
 function conversation() {
   return {
     history: [

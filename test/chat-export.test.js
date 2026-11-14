@@ -107,7 +107,8 @@ test('transcriptMarkdown heads timed replies with their local answer time and le
 
 test('answerTimeLabel shows the local time today, the day on earlier days and the year in other years', () => {
   const now = new Date(2026, 9, 31, 14, 15, 0);
-  const at = (...parts) => new Date(...parts).toISOString();
+  const at = (year, month, day, hours = 0, minutes = 0, seconds = 0) =>
+    new Date(year, month, day, hours, minutes, seconds).toISOString();
   assert.strictEqual(answerTimeLabel(at(2026, 9, 31, 14, 15, 59), now), '14:15');
   assert.strictEqual(answerTimeLabel(at(2026, 9, 31, 0, 0), now.getTime()), '00:00');
   assert.strictEqual(answerTimeLabel(at(2026, 9, 30, 23, 59), now), '30 Oct 23:59');

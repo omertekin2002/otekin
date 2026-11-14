@@ -39,11 +39,12 @@ function fakeSpawn(outcomes) {
   const calls = [];
   const spawn = (command, args, options) => {
     const outcome = outcomes[calls.length];
-    const child = new EventEmitter();
     const call = { command, args, options, input: null, killed: false };
     calls.push(call);
-    child.kill = () => { call.killed = true; };
-    child.stdin = { on() {}, end(input) { call.input = input; } };
+    const child = Object.assign(new EventEmitter(), {
+      kill: () => { call.killed = true; },
+      stdin: { on() {}, end(input) { call.input = input; } }
+    });
     setImmediate(() => {
       if (outcome === 'ENOENT') child.emit('error', Object.assign(new Error('spawn ENOENT'), { code: 'ENOENT' }));
       else if (typeof outcome === 'number') child.emit('exit', outcome, null);
