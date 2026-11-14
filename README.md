@@ -4,6 +4,8 @@ A full-screen terminal workspace with AI chat and Ömer Tekin's profile. Built w
 
 Requires **Node.js 22 or newer**.
 
+> **npm releases are paused.** `npx otekin` installs 0.1.21 from npm, the last published version. Features added after it, such as `otekin pilcrow` and `/copy`, are only in this repository until publishing resumes. To use them, run a local checkout; see [Releases](#releases).
+
 ## Run
 
 ```bash
@@ -194,4 +196,18 @@ npm run typecheck
 npm test
 ```
 
-`npm start` opens the local version in your terminal. `npm run lint` runs ESLint, which CI also runs on every pull request and before publishing. `npm run typecheck` checks the JavaScript in `bin/` and `lib/` with TypeScript's `checkJs` against the Node 22 API, and CI runs it alongside the linter. The terminal tests use a headless xterm emulator to check the actual rendered screen, keyboard input, resizing, scrolling, and cleanup.
+`npm start` opens the local version in your terminal. `npm run lint` runs ESLint, which CI also runs on every pull request and on every push to `main`. `npm run typecheck` checks the JavaScript in `bin/` and `lib/` with TypeScript's `checkJs` against the Node 22 API, and CI runs it alongside the linter. The terminal tests use a headless xterm emulator to check the actual rendered screen, keyboard input, resizing, scrolling, and cleanup.
+
+## Releases
+
+Publishing to npm is paused until further notice, so `npx otekin` stays on 0.1.21. Merges to `main` still run the linter, type check, tests and a dry-run pack, but they don't bump the version or publish. To run the newest version, including commands such as `otekin pilcrow` and `/copy`, use a checkout:
+
+```bash
+git clone https://github.com/omertekin2002/otekin.git
+cd otekin
+npm ci
+npm start              # same as `npx otekin`
+npm start -- pilcrow   # same as `npx otekin pilcrow`
+```
+
+Publishing is controlled by the `NPM_PUBLISH_ENABLED` value at the top of `.github/workflows/publish.yml`. Setting it to `"true"` resumes publishing a patch release on every merge to `main`.
