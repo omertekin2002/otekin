@@ -253,6 +253,18 @@ test('linear chat sanitizes replies, sources and model labels', async () => {
   assert.doesNotMatch(out, /javascript:/);
 });
 
+test('linear chat echoes questions without terminal controls but sends them as typed', async () => {
+  const typed = 'clear\u001b[2J this \u001b]52;c;ZXZpbA==\u0007now';
+  const s = session(async () => ({ message: 'Answer.' }), { start: { firstPrompt: 'first\u001b[1A' } });
+  s.send(typed + '\n');
+  s.input.end();
+  await s.chat.finished;
+  assert.doesNotMatch(s.out(), /\u001b|\u0007/);
+  assert.match(s.out(), /You: first\n/);
+  assert.match(s.out(), /You: clear this now\n/);
+  assert.deepStrictEqual(s.requests.map((request) => request.messages.at(-1).content), ['first\u001b[1A', typed]);
+});
+
 test('linear chat colors only its labels, and only when asked to', async () => {
   const s = session(async () => ({ message: 'Plain.', model: 'm1' }), { start: { color: true } });
   s.send('Q\n');
