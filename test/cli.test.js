@@ -14,10 +14,14 @@ const CLI = path.join(ROOT, 'bin', 'otekin.js');
 const GREETING = "Hi, I'm Ömer Tekin.";
 const TAGLINE = 'Law & business student at Koç University.';
 const TTY_STDOUT = ['-r', path.join(__dirname, 'tty-stdout.js')];
+const TTY_STDIN = ['-r', path.join(__dirname, 'tty-stdin.js')];
 const SGR = /\u001b\[[0-9;]*m/;
+// Cursor movement, erase and alternate-screen sequences, plus any carriage return.
+const REDRAW = /\u001b\[[0-9;?]*[A-HJK]|\u001b\[\?1049|\r/;
 
 // `nodeArgs` such as `-r <preload>` go before the CLI; an `undefined` env value unsets it.
-function runCli(args, env, nodeArgs) {
+// `input` is written to the CLI's stdin before it is closed.
+function runCli(args, env, nodeArgs, input) {
   return new Promise((resolve, reject) => {
     const childEnv = Object.assign({}, process.env, {
       OTEKIN_CHAT_API_URL: 'http://127.0.0.1:1/v1/chat',
@@ -53,7 +57,7 @@ function runCli(args, env, nodeArgs) {
         stderr: Buffer.concat(stderr).toString('utf8')
       });
     });
-    child.stdin.end();
+    child.stdin.end(input || '');
   });
 }
 
@@ -636,4 +640,166 @@ test('CLI one-shot on a dumb terminal or with --json keeps the non-streaming out
     assert.strictEqual(dumb.stderr + json.stderr, '');
   });
   assert.deepStrictEqual(bodies.map((body) => body.stream), [false, false]);
+});
+
+function linearGateway(bodies, reply) {
+  return async (request, response) => {
+    const body = JSON.parse(await readBody(request));
+    bodies.push(body);
+    const result = reply(body, bodies.length);
+    if (result.status) {
+      response.writeHead(result.status, { 'Content-Type': 'application/json', 'X-Request-ID': 'linear-req-7' });
+      response.end(JSON.stringify(result.body));
+      return;
+    }
+    response.writeHead(200, { 'Content-Type': 'application/x-ndjson' });
+    for (const event of result.events) response.write(JSON.stringify(event) + '\n');
+    response.end();
+  };
+}
+
+function sourcedReply(number) {
+  return {
+    events: [
+      { type: 'tool', activity: { id: `s${number}`, tool: 'search_web', query: `query ${number}`, status: 'running' } },
+      { type: 'delta', text: `Provisional ${number}` },
+      { type: 'tool', activity: { id: `s${number}`, tool: 'search_web', query: `query ${number}`, status: 'complete' } },
+      {
+        type: 'done',
+        message: `Answer ${number} [1].\n\nSources:\n1. [Example ${number}](https://example.com/${number})`,
+        model: 'fixture-model',
+        webSources: [{ title: `Example ${number}`, url: `https://example.com/${number}` }]
+      }
+    ]
+  };
+}
+
+test('CLI linear chat reads piped questions, keeps context and prints each final answer once', async () => {
+  const bodies = [];
+  await withServer(linearGateway(bodies, (_body, number) => sourcedReply(number)), async (endpoint) => {
+    for (const env of [{}, { NO_COLOR: '1' }]) {
+      bodies.length = 0;
+      const result = await runCli(['chat', '--linear'], { OTEKIN_CHAT_API_URL: endpoint, ...env }, [], 'Q1\nQ2\n');
+      assert.strictEqual(result.code, 0);
+      assert.strictEqual(result.stderr, '');
+      assert.strictEqual(bodies.length, 2);
+      assert.deepStrictEqual(bodies[1].messages.map((message) => [message.role, message.content.split('\n')[0]]), [
+        ['user', 'Q1'], ['assistant', 'Answer 1 [1].'], ['user', 'Q2']
+      ]);
+      for (const number of [1, 2]) {
+        assert.strictEqual(result.stdout.split(`Answer ${number} [1].`).length - 1, 1);
+        assert.strictEqual(result.stdout.split(`Searching: query ${number}`).length - 1, 1);
+        assert.match(result.stdout, new RegExp(`fixture-model:\\nAnswer ${number} \\[1\\]\\.\\n\\nSources:\\n1\\. Example ${number} https://example\\.com/${number}\\n`));
+      }
+      assert.doesNotMatch(result.stdout, /Provisional/);
+      assert.doesNotMatch(result.stdout, REDRAW);
+      assert.doesNotMatch(result.stdout, SGR);
+    }
+  });
+});
+
+test('CLI linear chat on a NO_COLOR or dumb terminal never redraws or colors', async () => {
+  const bodies = [];
+  await withServer(linearGateway(bodies, (_body, number) => sourcedReply(number)), async (endpoint) => {
+    for (const env of [{ TERM: 'xterm-256color', NO_COLOR: '1' }, { TERM: 'dumb', NO_COLOR: undefined }]) {
+      const result = await runCli(['chat', '--linear', 'hello'], { OTEKIN_CHAT_API_URL: endpoint, ...env }, TTY_STDOUT, '');
+      assert.strictEqual(result.code, 0);
+      assert.match(result.stdout, /You: hello\nResearching…\nSearching: query \d\nfixture-model:\n/);
+      assert.doesNotMatch(result.stdout, REDRAW);
+      assert.doesNotMatch(result.stdout, SGR);
+    }
+  });
+});
+
+test('CLI linear chat sends a prompt argument as the first turn, then continues', async () => {
+  const bodies = [];
+  await withServer(linearGateway(bodies, (_body, number) => sourcedReply(number)), async (endpoint) => {
+    const result = await runCli(['chat', '--linear', 'first'], { OTEKIN_CHAT_API_URL: endpoint }, [], 'second\n');
+    assert.strictEqual(result.code, 0);
+    assert.deepStrictEqual(bodies.map((body) => body.messages.at(-1).content), ['first', 'second']);
+    assert.strictEqual(bodies[1].messages[0].content, 'first');
+  });
+});
+
+test('CLI linear chat reports a gateway error and keeps going with the previous history', async () => {
+  const bodies = [];
+  await withServer(linearGateway(bodies, (_body, number) => number === 2
+    ? { status: 502, body: { error: 'secret provider detail', code: 'generation_unavailable' } }
+    : sourcedReply(number)), async (endpoint) => {
+    const result = await runCli(['chat', '--linear'], { OTEKIN_CHAT_API_URL: endpoint }, [], 'Q1\nQ2\nQ3\n');
+    assert.strictEqual(result.code, 0);
+    assert.strictEqual(result.stderr,
+      'Chat error: Chat generation is temporarily unavailable. Try again later. (Request ID: linear-req-7)\n');
+    assert.doesNotMatch(result.stdout + result.stderr, /secret provider detail/);
+    assert.deepStrictEqual(bodies[2].messages.map((message) => message.content.split('\n')[0]), ['Q1', 'Answer 1 [1].', 'Q3']);
+    assert.match(result.stdout, /Answer 3 \[1\]\./);
+  });
+});
+
+test('CLI opens linear chat for a promptless chat on a TERM=dumb terminal', async () => {
+  const bodies = [];
+  await withServer(linearGateway(bodies, (_body, number) => sourcedReply(number)), async (endpoint) => {
+    const dumb = await runCli(['chat'], { OTEKIN_CHAT_API_URL: endpoint, TERM: 'dumb' },
+      TTY_STDIN.concat(TTY_STDOUT), 'Q1\n/exit\n');
+    assert.strictEqual(dumb.code, 0);
+    assert.match(dumb.stdout, /^otekin linear chat/);
+    assert.match(dumb.stdout, /Answer 1 \[1\]\./);
+    assert.doesNotMatch(dumb.stdout, REDRAW);
+    assert.strictEqual(bodies.length, 1);
+
+    // Piped stdin still needs a prompt, even on a dumb terminal, and so does --non-interactive.
+    for (const [nodeArgs, args] of [[TTY_STDOUT, ['chat']], [TTY_STDIN.concat(TTY_STDOUT), ['chat', '--non-interactive']]]) {
+      const result = await runCli(args, { OTEKIN_CHAT_API_URL: endpoint, TERM: 'dumb' }, nodeArgs, 'Q\n');
+      assert.strictEqual(result.code, 1, args.join(' '));
+      assert.match(result.stderr, /requires a prompt/i);
+    }
+    assert.strictEqual(bodies.length, 1);
+  });
+});
+
+test('CLI rejects --linear with --json or without chat, sending nothing', async () => {
+  await withServer((request, response) => {
+    request.resume();
+    response.writeHead(200, { 'Content-Type': 'application/json' });
+    response.end(JSON.stringify({ message: 'Should not be reached.' }));
+  }, async (endpoint, fixture) => {
+    for (const args of [['chat', '--linear', '--json'], ['--json', 'chat', '--linear', 'hi']]) {
+      const result = await runCli(args, { OTEKIN_CHAT_API_URL: endpoint }, [], 'Q\n');
+      assert.strictEqual(result.code, 1, args.join(' '));
+      assert.strictEqual(result.stdout, '');
+      assert.match(result.stderr, /Linear chat does not support --json/);
+    }
+    for (const args of [['--linear'], ['cv', '--linear', '--no-open'], ['pilcrow', '--linear']]) {
+      const result = await runCli(args, { OTEKIN_CHAT_API_URL: endpoint }, [], 'Q\n');
+      assert.strictEqual(result.code, 1, args.join(' '));
+      assert.strictEqual(result.stdout, '');
+    }
+    assert.deepStrictEqual(fixture.getRequests(), []);
+  });
+});
+
+test('CLI linear chat never creates or changes the history file', async () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'otekin-linear-history-'));
+  const file = path.join(directory, 'history.json');
+  const absent = path.join(directory, 'state', 'history.json');
+  fs.writeFileSync(file, '{"saved":true}');
+  try {
+    await withServer(linearGateway([], (_body, number) => sourcedReply(number)), async (endpoint) => {
+      for (const target of [file, absent]) {
+        const result = await runCli(['chat', '--linear'], { OTEKIN_CHAT_API_URL: endpoint, OTEKIN_HISTORY_FILE: target }, [], 'Q1\nQ2\n');
+        assert.strictEqual(result.code, 0);
+      }
+    });
+    assert.strictEqual(fs.readFileSync(file, 'utf8'), '{"saved":true}');
+    assert.strictEqual(fs.existsSync(path.dirname(absent)), false);
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('CLI help documents linear chat and its TERM=dumb behavior', async () => {
+  const help = await runCli(['--help']);
+  assert.match(help.stdout, /npx otekin chat --linear/);
+  assert.match(help.stdout, /--linear\s+Chat line by line/);
+  assert.match(help.stdout, /TERM=dumb terminal opens it automatically/);
 });

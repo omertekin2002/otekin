@@ -20,6 +20,7 @@ require('./chat-format.test');
 require('./chat-export.test');
 require('./terminal.test');
 require('./stream-preview.test');
+require('./linear-chat.test');
 require('./browser.test');
 require('./clipboard.test');
 require('./profile.test');
