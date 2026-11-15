@@ -33,7 +33,7 @@ Type `/` to open the command picker. Use ↑/↓ to choose a command, Tab to com
 
 You can write your next draft while a reply is in progress. Pasted multiline text stays in the composer until you press Enter. The conversation and your previous prompts are saved, so the next full-screen session picks up where you left off; ↑ recalls earlier prompts. Use `/clear` to forget them, or `--no-history` to keep a session off the record. See [Saved chat history](#saved-chat-history).
 
-Pipes, `TERM=dumb`, and `--non-interactive` use plain profile output. Direct link commands, one-shot chat, and JSON output remain available without entering full-screen mode.
+Pipes, `TERM=dumb`, and `--non-interactive` use plain profile output; on a `TERM=dumb` terminal, `npx otekin chat` opens [linear chat](#linear-chat). Direct link commands, one-shot chat, and JSON output remain available without entering full-screen mode.
 
 ## Install Pilcrow
 
@@ -81,6 +81,7 @@ No API key is required. Ask a one-shot question or open the full-screen chat dir
 ```bash
 npx otekin chat "What happened today?"
 npx otekin chat
+npx otekin chat --linear
 npx otekin chat "Explain this" --json
 npx otekin --select chat
 npx otekin chat -- "-5°C in °F?"
@@ -116,6 +117,26 @@ Research citations are shown as a compact source row instead of raw redirect URL
 
 Interactive history retains the gateway's bounded tool results and source catalog so follow-up questions can use the same evidence and source numbers, including after a restart. Older complete turns are trimmed to stay within the service's character and request-byte limits.
 
+### Linear chat
+
+Linear chat is a quiet, line-based conversation for screen readers and simple terminals. It only ever adds lines: it never moves the cursor, redraws the screen, animates a spinner or shows provisional text. Start it with:
+
+```bash
+npx otekin chat --linear
+npx otekin chat --linear "What happened today?"
+printf 'First question\nA follow-up\n' | npx otekin chat --linear
+```
+
+Type a question after `You: ` and press Enter. A prompt given on the command line is sent as the first question, and the conversation continues after it. With piped input, each line is one question, and the session ends at the end of the input. Follow-up questions keep the earlier turns as context, like the full-screen chat.
+
+For each question, linear chat prints one `Researching…` line, at most one `Waking chat service…` line when the service is slow to wake, and one line per tool as it starts, such as `Searching: EU AI Act changes`. When the reply is complete it is printed once: the name of the model that answered, the answer, and its sources as a numbered list with their full URLs. Errors print `Chat error: …`, with the request ID when there is one, and the conversation carries on.
+
+- Ctrl+C cancels a reply in progress and prints `Cancelled.`; a reply that arrives afterwards is never shown. Ctrl+C or Ctrl+D while waiting for a question ends the session.
+- `/help` lists the commands, and `/exit` or `/quit` ends the session. Other single slash words print `Unknown command`; start a message with `//` to send it with one leading `/`. Blank lines are ignored.
+- On a terminal with `TERM=dumb`, `npx otekin chat` without a prompt opens linear chat automatically instead of the full-screen workspace.
+- Color is used only for the header and model name, and only on a color terminal without `NO_COLOR`.
+- Linear chat does not read or write saved chat history yet, and `--json` is not supported with it.
+
 When the service has optional image generation enabled, ask for an image in the same chat. Normal output saves generated images as PNG files in a temporary `otekin-images-*` directory and prints their paths. These files remain until you or the operating system removes them. `--json` preserves the inline image data without writing files. Image bytes are replaced with text placeholders in conversation history.
 
 ## Options
@@ -123,6 +144,7 @@ When the service has optional image generation enabled, ask for an image in the 
 - `--non-interactive`: print the profile message and links without a prompt.
 - `--no-open`: print a selected URL instead of opening it in a browser.
 - `--no-history`: don't load or save the full-screen chat history for this run. An existing history file is left untouched.
+- `--linear`: with `chat`, hold a line-based conversation that never redraws or animates and prints each reply once. See [Linear chat](#linear-chat).
 - `--cv`, `--resume`: open the CV link directly.
 - `--select <website|linkedin|cv|chat|exit>`: choose an option directly.
 - `--json`: output profile JSON, or preserve the complete response object for a one-shot chat.
