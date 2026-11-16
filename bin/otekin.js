@@ -6,7 +6,8 @@ const pkg = require('../package.json');
 const {
   requestChat,
   prepareRequestMessages,
-  ensureChatServiceAwake
+  ensureChatServiceAwake,
+  assistantMessageFromResponse
 } = require('../lib/chat-client');
 const { formatChatResponse } = require('../lib/chat-format');
 const { saveGeneratedImages } = require('../lib/chat-images');
@@ -16,6 +17,8 @@ const { cleanText, createTheme, startProgress, createActivityDisplay } = require
 const { createStreamPreview } = require('../lib/stream-preview');
 const profile = require('../lib/profile');
 const { installPilcrow } = require('../lib/install-pilcrow');
+const { startLinearChat, prefersLinearChat } = require('../lib/linear-chat');
+const { copyToClipboard } = require('../lib/clipboard');
 
 const outputTheme = createTheme(process.stdout);
 
@@ -33,6 +36,7 @@ Usage:
   npx otekin pilcrow
   npx otekin chat "What happened today?"
   npx otekin chat
+  npx otekin chat --linear
   npx otekin chat -- "-5°C in °F?"
 
 Options:
@@ -42,6 +46,7 @@ Options:
   --json                  Output profile or one-shot chat JSON and exit
   --no-open               Don't open links in a browser (print them instead)
   --no-history            Don't load or save full-screen chat history this run
+  --linear                Chat line by line: no animation, each reply printed once
   --cv, --resume          Open the CV download link directly
   -s, --select <choice>   Select directly: website | linkedin | cv | chat | exit
   --                      End options; later arguments are prompt text or a choice
@@ -90,6 +95,14 @@ In a terminal, one-shot chat shows the reply as it streams in, then replaces it
 with the final answer. Ctrl+C cancels it and exits with code 130. Piped, --json
 and TERM=dumb output print only the final answer.
 
+Linear chat (otekin chat --linear) reads one question per line, from the keyboard
+or piped input, and prints each finished reply once, with numbered sources and
+their URLs. It never redraws or animates. /retry sends the last message again,
+/save writes the conversation to a Markdown file, and /copy copies the latest
+reply (or saves it to a file when no clipboard works). Ctrl+C cancels a reply;
+Ctrl+C or Ctrl+D when idle, /exit or /quit ends it. A promptless "otekin chat"
+on a TERM=dumb terminal opens it automatically. It does not use saved history yet.
+
 The full-screen chat saves its conversation and recent prompts so they come back
 next time. One-shot, --json and piped chat never read or write it.
 `.trim();
@@ -132,6 +145,7 @@ function parseArgs(argv) {
     json: false,
     noOpen: false,
     noHistory: false,
+    linear: false,
     upgrade: false,
     select: null,
     command: null,
@@ -154,6 +168,7 @@ function parseArgs(argv) {
     else if (a === '--json') opts.json = true;
     else if (a === '--no-open') opts.noOpen = true;
     else if (a === '--no-history') opts.noHistory = true;
+    else if (a === '--linear') opts.linear = true;
     else if (a === '--upgrade' && opts.command === 'pilcrow') opts.upgrade = true;
     else if (a === '--cv' || a === '--resume') opts.select = 'cv';
     else if (a === '-s' || a === '--select' || a.startsWith('--select=')) {
@@ -343,6 +358,27 @@ async function runOneShotChat(prompt, opts) {
   }
 }
 
+// Never reads or writes saved history. Resolves when the session ends; it always exits 0.
+// /save and the /copy fallback write to the current directory.
+async function runLinearChat(firstPrompt) {
+  const session = startLinearChat({
+    input: process.stdin,
+    output: process.stdout,
+    error: process.stderr,
+    services: { prepareRequestMessages, ensureChatServiceAwake, requestChat, assistantMessageFromResponse },
+    firstPrompt,
+    saveDirectory: process.cwd(),
+    copy: (text) => copyToClipboard(text)
+  });
+  const onInterrupt = () => session.interrupt();
+  process.on('SIGINT', onInterrupt);
+  try {
+    await session.finished;
+  } finally {
+    process.removeListener('SIGINT', onInterrupt);
+  }
+}
+
 async function runInteractiveChat(opts) {
   const { runTerminalApp } = await import('../lib/fullscreen.mjs');
   await runTerminalApp({
@@ -376,7 +412,7 @@ async function main() {
   }
 
   if (opts.command === 'pilcrow') {
-    if (opts.commandArgs.length || opts.select || opts.json || opts.noOpen || opts.noHistory) {
+    if (opts.commandArgs.length || opts.select || opts.json || opts.noOpen || opts.noHistory || opts.linear) {
       process.stderr.write('Pilcrow installation accepts only --upgrade, --help, --version, and --non-interactive. Run "otekin pilcrow --help".\n');
       process.exitCode = 1;
       return;
@@ -390,8 +426,24 @@ async function main() {
     return;
   }
 
+  if (opts.linear && opts.command !== 'chat') {
+    process.stderr.write('--linear works only with chat. Run "otekin chat --linear".\n');
+    process.exitCode = 1;
+    return;
+  }
+
   if (opts.command === 'chat') {
     const prompt = opts.commandArgs.join(' ').trim();
+    if (opts.linear) {
+      if (opts.json) {
+        process.stderr.write('Linear chat does not support --json. Provide a prompt without --linear for one-shot JSON output.\n');
+        process.exitCode = 1;
+        return;
+      }
+      await runLinearChat(prompt);
+      return;
+    }
+
     if (prompt) {
       await runOneShotChat(prompt, opts);
       return;
@@ -400,6 +452,16 @@ async function main() {
     if (opts.json) {
       process.stderr.write('Interactive chat does not support --json. Provide a prompt for one-shot JSON output.\n');
       process.exitCode = 1;
+      return;
+    }
+
+    if (prefersLinearChat({
+      stdinIsTTY: process.stdin.isTTY,
+      stdoutIsTTY: process.stdout.isTTY,
+      term: process.env.TERM,
+      nonInteractive: opts.nonInteractive
+    })) {
+      await runLinearChat('');
       return;
     }
 
