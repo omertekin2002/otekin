@@ -295,18 +295,24 @@ test('linear chat colors only its labels, and only when asked to', async () => {
   assert.match(s.out(), /\u001b\[1mm1\u001b\[0m:/);
   assert.doesNotMatch(s.out(), REDRAW);
 
+  const plainInput = Object.assign(new PassThrough(), { isTTY: true });
+  const plainOutput = new PassThrough();
+  let plainText = '';
+  plainOutput.on('data', (chunk) => { plainText += chunk.toString(); });
   const plain = startLinearChat({
-    input: Object.assign(new PassThrough(), { isTTY: true }),
-    output: new PassThrough(),
+    input: plainInput,
+    output: plainOutput,
     services: {
       prepareRequestMessages,
       assistantMessageFromResponse,
       ensureChatServiceAwake: async () => ({ ok: true }),
-      requestChat: async () => ({ message: 'Unused.' })
+      requestChat: async () => ({ message: 'Plain reply.' })
     }
   });
-  plain.interrupt();
+  plainInput.end('Q\n');
   await plain.finished;
+  assert.match(plainText, /Plain reply\./);
+  assert.doesNotMatch(plainText, SGR);
 });
 
 test('linear chat helpers pick the mode, commands, labels and source list', () => {
@@ -366,6 +372,28 @@ test('linear chat /retry after a cancelled reply sends the same question', async
   assert.deepStrictEqual(s.requests[1].messages, [{ role: 'user', content: 'Q1' }]);
   assert.match(s.out(), /Cancelled\.\nYou: \/retry\nResearching…\nOTEKIN:\nSecond try\.\n/);
   assert.doesNotMatch(s.out(), /Late\./);
+});
+
+test('linear chat retries an unanswered question without duplicating it in saved transcripts', async () => {
+  const directory = tempDirectory();
+  try {
+    const s = session(async (_messages, _opts, number) => {
+      if (number < 3) throw new Error('Try again.');
+      return cited(number);
+    }, { start: { saveDirectory: directory, now: () => FIXED_NOW } });
+    s.send('Q1\n/retry\n/retry\n/save\n/retry\n/save\n');
+    s.input.end();
+    await s.chat.finished;
+    assert.strictEqual(s.requests.length, 4);
+    for (const file of filesIn(directory)) {
+      const markdown = fs.readFileSync(path.join(directory, file), 'utf8');
+      assert.strictEqual(markdown.split('## You\n\nQ1\n').length - 1, 1);
+      assert.match(markdown, /Answer [34] \[1\]\./);
+    }
+    assert.strictEqual(filesIn(directory).length, 2);
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
 });
 
 test('linear chat /retry after a completed reply replaces that turn in history and in /save', async () => {
