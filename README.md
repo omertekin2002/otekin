@@ -127,7 +127,7 @@ npx otekin chat --linear "What happened today?"
 printf 'First question\nA follow-up\n' | npx otekin chat --linear
 ```
 
-Type a question after `You: ` and press Enter. A prompt given on the command line is sent as the first question, and the conversation continues after it. With piped input, each line is one question, and the session ends at the end of the input. Follow-up questions keep the earlier turns as context, like the full-screen chat.
+Type a question after `You: ` and press Enter. A prompt given on the command line is sent as the first question, and the conversation continues after it. It is sent as written and never runs a command: `npx otekin chat --linear -- /exit` asks about `/exit`, and `//etc` is sent as `//etc`. With piped input, each line is one question, and the session ends at the end of the input. Follow-up questions keep the earlier turns as context, like the full-screen chat.
 
 For each question, linear chat prints one `Researching…` line, at most one `Waking chat service…` line when the service is slow to wake, and one line per tool as it starts, such as `Searching: EU AI Act changes`. When the reply is complete it is printed once: the name of the model that answered, the answer, and its sources as a numbered list with their full URLs. Errors print `Chat error: …`, with the request ID when there is one, and the conversation carries on.
 

@@ -721,6 +721,22 @@ test('CLI linear chat sends a prompt argument as the first turn, then continues'
   });
 });
 
+test('CLI linear chat sends a prompt argument that looks like a command as a question', async () => {
+  const bodies = [];
+  await withServer(linearGateway(bodies, (_body, number) => sourcedReply(number)), async (endpoint) => {
+    for (const args of [['chat', '--linear', '--', '/exit'], ['chat', '--linear', '/exit']]) {
+      bodies.length = 0;
+      // The piped /exit still ends the session, so the line after it is never sent.
+      const result = await runCli(args, { OTEKIN_CHAT_API_URL: endpoint }, [], 'second\n/exit\nthird\n');
+      assert.strictEqual(result.code, 0);
+      assert.strictEqual(result.stderr, '');
+      assert.deepStrictEqual(bodies.map((body) => body.messages.at(-1).content), ['/exit', 'second']);
+      assert.strictEqual(bodies[1].messages[0].content, '/exit');
+      assert.match(result.stdout, /You: \/exit\nResearching…\n/);
+    }
+  });
+});
+
 test('CLI linear chat reports a gateway error and keeps going with the previous history', async () => {
   const bodies = [];
   await withServer(linearGateway(bodies, (_body, number) => number === 2

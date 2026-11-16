@@ -258,6 +258,74 @@ test('linear chat sends a first prompt before reading input', async () => {
   assert.match(s.out(), /You: first\nResearching…\nOTEKIN:\nFirst answer\.\n/);
 });
 
+test('linear chat sends a first prompt that looks like a command as a question, then reads input', async () => {
+  const s = session(async (_messages, _opts, number) => ({ message: `Answer ${number}.` }), { start: { firstPrompt: '/exit' } });
+  s.send('Q2\n/exit\nnever sent\n');
+  await s.chat.finished;
+  // The command-line /exit is a question and the piped one after it still ends the session.
+  assert.deepStrictEqual(s.requests.map((request) => request.messages.at(-1).content), ['/exit', 'Q2']);
+  assert.deepStrictEqual(s.requests[1].messages.map((message) => message.content), ['/exit', 'Answer 1.', 'Q2']);
+  assert.match(s.out(), /You: \/exit\nResearching…\nOTEKIN:\nAnswer 1\.\n\nYou: Q2\nResearching…\nOTEKIN:\nAnswer 2\.\n\nYou: \/exit\n$/);
+  assert.doesNotMatch(s.out(), /never sent/);
+
+  const directory = tempDirectory();
+  try {
+    // No command runs from the command line, and a leading // is sent as it was written.
+    for (const firstPrompt of ['/help', '/retry', '/save', '/copy', '/quit', '/Nope', '//etc']) {
+      const copied = [];
+      const other = session(async () => ({ message: 'Answered.' }), {
+        start: { firstPrompt, saveDirectory: directory, copy: async (text) => copied.push(text) }
+      });
+      other.input.end();
+      await other.chat.finished;
+      assert.deepStrictEqual(other.requests.map((request) => request.messages), [[{ role: 'user', content: firstPrompt }]]);
+      assert.match(other.out(), /Researching…\nOTEKIN:\nAnswered\.\n/);
+      assert.doesNotMatch(other.out(), /Linear chat commands:|Unknown command|Nothing to|Saved the conversation|clipboard/i);
+      assert.deepStrictEqual(copied, []);
+    }
+    assert.deepStrictEqual(filesIn(directory), []);
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('linear chat retries a failed first prompt that looks like a command and saves it once', async () => {
+  const directory = tempDirectory();
+  try {
+    const s = session(async (_messages, _opts, number) => {
+      if (number === 1) throw new Error('Try again.');
+      return cited(number);
+    }, { start: { firstPrompt: '/exit', saveDirectory: directory, now: () => FIXED_NOW } });
+    s.send('/retry\n/save\n/retry\n/save\n');
+    s.input.end();
+    await s.chat.finished;
+    assert.strictEqual(s.err(), 'Chat error: Try again.\n');
+    assert.deepStrictEqual(s.requests.map((request) => request.messages), Array(3).fill([{ role: 'user', content: '/exit' }]));
+    // One save after each reply; file names do not sort in the order they were written.
+    const answers = filesIn(directory).map((file) => {
+      const markdown = fs.readFileSync(path.join(directory, file), 'utf8');
+      assert.strictEqual(markdown.split('## You\n\n/exit\n').length - 1, 1);
+      assert.strictEqual(markdown.split('## You\n').length - 1, 1);
+      return markdown.match(/Answer \d \[1\]\./g);
+    });
+    assert.deepStrictEqual(answers.sort(), [['Answer 2 [1].'], ['Answer 3 [1].']]);
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('linear chat ignores an empty or blank first prompt', async () => {
+  for (const firstPrompt of ['', ' \t ']) {
+    const s = session(async () => ({ message: 'Unused.' }), { start: { firstPrompt } });
+    await s.idle(1);
+    s.input.end();
+    await s.chat.finished;
+    assert.strictEqual(s.requests.length, 0);
+    assert.strictEqual(s.out().split('You: ').length - 1, 1);
+    assert.doesNotMatch(s.out(), /Researching/);
+  }
+});
+
 test('linear chat sanitizes replies, sources and model labels', async () => {
   const s = session(async () => ({
     message: 'Safe\u001b[2J text\r\u001b]8;;https://evil.test\u0007link\u001b]8;;\u0007 [1].',
