@@ -609,20 +609,27 @@ test('linear chat runs a /retry typed during a reply in turn once that reply has
   const pending = deferred();
   const clipboard = deferred();
   const s = session(async (_messages, _opts, number) => (number === 2 ? pending.promise : cited(number)), {
-    start: { interactive: true, saveDirectory: tempDirectory(), copy: () => clipboard.promise }
+    start: { interactive: true, saveDirectory: tempDirectory(), now: () => FIXED_NOW, copy: () => clipboard.promise }
   });
   s.send('Q1\n');
   await s.idle(2);
   s.send('Q2\n');
   await tick(5);
-  // /retry waits behind a slow /copy; by the time it runs, Q2 has its answer.
-  s.send('/copy\n/retry\n');
+  // /retry and /save wait behind a slow /copy; by the time they run, Q2 has its answer.
+  s.send('/copy\n/retry\n/save\n');
   await tick(5);
   pending.resolve(cited(2));
   await tick(5);
-  clipboard.resolve('pbcopy');
+  // The input ends before the clipboard settles: the waiting commands still run.
+  let finished = false;
+  s.chat.finished.then(() => { finished = true; });
   s.input.end();
+  await tick(5);
+  assert.strictEqual(finished, false);
+  clipboard.resolve('pbcopy');
   await s.chat.finished;
+  assert.match(s.out(), /Saved the conversation to /);
+  assert(s.out().endsWith('\n'));
   const contents = (request) => request.messages.map((message) => message.content.split('\n')[0]);
   // One request at a time: the retry replaced Q2's answer after it arrived.
   assert.strictEqual(s.requests.length, 3);
