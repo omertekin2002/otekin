@@ -20,8 +20,8 @@ const SGR = /\u001b\[[0-9;]*m/;
 const REDRAW = /\u001b\[[0-9;?]*[A-HJK]|\u001b\[\?1049|\r/;
 
 // `nodeArgs` such as `-r <preload>` go before the CLI; an `undefined` env value unsets it.
-// `input` is written to the CLI's stdin before it is closed.
-function runCli(args, env, nodeArgs, input) {
+// `input` is written to the CLI's stdin before it is closed. `cwd` defaults to the repository.
+function runCli(args, env, nodeArgs, input, cwd = ROOT) {
   return new Promise((resolve, reject) => {
     const childEnv = Object.assign({}, process.env, {
       OTEKIN_CHAT_API_URL: 'http://127.0.0.1:1/v1/chat',
@@ -31,7 +31,7 @@ function runCli(args, env, nodeArgs, input) {
       if (childEnv[key] === undefined) delete childEnv[key];
     });
     const child = spawn(process.execPath, (nodeArgs || []).concat(CLI, args), {
-      cwd: ROOT,
+      cwd,
       env: childEnv,
       stdio: ['pipe', 'pipe', 'pipe']
     });
@@ -734,6 +734,37 @@ test('CLI linear chat reports a gateway error and keeps going with the previous 
     assert.deepStrictEqual(bodies[2].messages.map((message) => message.content.split('\n')[0]), ['Q1', 'Answer 1 [1].', 'Q3']);
     assert.match(result.stdout, /Answer 3 \[1\]\./);
   });
+});
+
+test('CLI linear chat /save writes to the current directory and /retry replaces the saved answer', async () => {
+  const bodies = [];
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'otekin-cli-linear-'));
+  try {
+    await withServer(linearGateway(bodies, (_body, number) => sourcedReply(number)), async (endpoint) => {
+      const result = await runCli(['chat', '--linear'], { OTEKIN_CHAT_API_URL: endpoint }, [], 'Q1\n/save\n/retry\n/save\n', directory);
+      assert.strictEqual(result.code, 0);
+      assert.strictEqual(result.stderr, '');
+      assert.deepStrictEqual(bodies.map((body) => body.messages.map((message) => message.content)), [['Q1'], ['Q1']]);
+      assert.strictEqual(fs.readdirSync(directory).length, 2);
+      // In the order they were saved, which the printed paths give.
+      const saved = [...result.stdout.matchAll(/^Saved the conversation to (.+)$/gm)].map((match) => match[1]);
+      assert.strictEqual(saved.length, 2);
+      saved.forEach((file) => {
+        // Only the folder name: process.cwd() may spell the temp path differently, as macOS does.
+        assert.strictEqual(path.basename(path.dirname(file)), path.basename(directory));
+        assert.match(path.basename(file), /^otekin-chat-\d{8}-\d{6}(-2)?\.md$/);
+      });
+      const [first, second] = saved.map((file) => fs.readFileSync(file, 'utf8'));
+      assert.match(first, /## You\n\nQ1\n\n## fixture-model · [^\n]+\n\nAnswer 1 \[1\]\./);
+      // The retry's answer replaced the first one: the second save holds one answer, not two.
+      assert.match(second, /Answer 2 \[1\]\./);
+      assert.doesNotMatch(second, /Answer 1/);
+      assert.strictEqual(second.split('## You').length - 1, 1);
+      assert.doesNotMatch(first + second, /Searching|Provisional/);
+    });
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
 });
 
 test('CLI opens linear chat for a promptless chat on a TERM=dumb terminal', async () => {

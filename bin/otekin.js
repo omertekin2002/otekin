@@ -18,6 +18,7 @@ const { createStreamPreview } = require('../lib/stream-preview');
 const profile = require('../lib/profile');
 const { installPilcrow } = require('../lib/install-pilcrow');
 const { startLinearChat, prefersLinearChat } = require('../lib/linear-chat');
+const { copyToClipboard } = require('../lib/clipboard');
 
 const outputTheme = createTheme(process.stdout);
 
@@ -96,9 +97,11 @@ and TERM=dumb output print only the final answer.
 
 Linear chat (otekin chat --linear) reads one question per line, from the keyboard
 or piped input, and prints each finished reply once, with numbered sources and
-their URLs. It never redraws or animates. Ctrl+C cancels a reply; Ctrl+C or
-Ctrl+D when idle, /exit or /quit ends it. A promptless "otekin chat" on a
-TERM=dumb terminal opens it automatically. It does not use saved history yet.
+their URLs. It never redraws or animates. /retry sends the last message again,
+/save writes the conversation to a Markdown file, and /copy copies the latest
+reply (or saves it to a file when no clipboard works). Ctrl+C cancels a reply;
+Ctrl+C or Ctrl+D when idle, /exit or /quit ends it. A promptless "otekin chat"
+on a TERM=dumb terminal opens it automatically. It does not use saved history yet.
 
 The full-screen chat saves its conversation and recent prompts so they come back
 next time. One-shot, --json and piped chat never read or write it.
@@ -356,13 +359,16 @@ async function runOneShotChat(prompt, opts) {
 }
 
 // Never reads or writes saved history. Resolves when the session ends; it always exits 0.
+// /save and the /copy fallback write to the current directory.
 async function runLinearChat(firstPrompt) {
   const session = startLinearChat({
     input: process.stdin,
     output: process.stdout,
     error: process.stderr,
     services: { prepareRequestMessages, ensureChatServiceAwake, requestChat, assistantMessageFromResponse },
-    firstPrompt
+    firstPrompt,
+    saveDirectory: process.cwd(),
+    copy: (text) => copyToClipboard(text)
   });
   const onInterrupt = () => session.interrupt();
   process.on('SIGINT', onInterrupt);

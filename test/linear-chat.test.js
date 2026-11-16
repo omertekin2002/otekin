@@ -1,6 +1,9 @@
 'use strict';
 
 const assert = require('assert');
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
 const { PassThrough } = require('stream');
 const {
   startLinearChat,
@@ -15,6 +18,25 @@ const { prepareRequestMessages, assistantMessageFromResponse } = require('../lib
 const REDRAW = /\u001b\[[0-9;?]*[A-HJK]|\u001b\[\?1049|\r/;
 const SGR = /\u001b\[[0-9;]*m/;
 const tick = (ms = 0) => new Promise((resolve) => setTimeout(resolve, ms));
+// 2026-11-16 12:34:56 UTC, so saved file names and answer times are predictable.
+const FIXED_NOW = Date.UTC(2026, 10, 16, 12, 34, 56);
+
+function tempDirectory() {
+  return fs.mkdtempSync(path.join(os.tmpdir(), 'otekin-linear-'));
+}
+
+function filesIn(directory) {
+  return fs.readdirSync(directory).sort();
+}
+
+// A cited reply numbered after the request, with a source link of its own.
+function cited(number) {
+  return {
+    message: `Answer ${number} [1].\n\nSources:\n1. [Example ${number}](https://example.com/${number})`,
+    model: 'fixture-model',
+    webSources: [{ title: `Example ${number}`, url: `https://example.com/${number}` }]
+  };
+}
 
 function deferred() {
   /** @type {(value?: unknown) => void} */
@@ -218,7 +240,7 @@ test('linear chat handles commands, // messages and blank lines', async () => {
   assert.match(out, /Linear chat commands:\n {2}\/help/);
   assert.match(out, /\/exit, \/quit {2}End the chat/);
   assert.match(out, /Unknown command: \/nope\. Type \/help to see the commands\./);
-  assert.match(out, /Unknown command: \/retry\. Type \/help to see the commands\./);
+  assert.match(out, /You: \/retry\nNothing to retry yet\. Send a message first\.\n/);
   assert.deepStrictEqual(s.requests.map((request) => request.messages.at(-1).content), ['/text here']);
   assert.doesNotMatch(out, /never sent/);
 
@@ -299,4 +321,312 @@ test('linear chat helpers pick the mode, commands, labels and source list', () =
   assert.strictEqual(modelLabel({ model: ' gpt-x ' }), 'gpt-x');
   assert.strictEqual(modelLabel({ model: 'a b' }), 'OTEKIN');
   assert.strictEqual(formatLinearReply({ message: 'No sources.' }), 'No sources.');
+});
+
+test('linear chat /help lists /retry, /save and /copy', async () => {
+  const s = session(async () => ({ message: 'Unused.' }));
+  s.send('/help\n');
+  s.input.end();
+  await s.chat.finished;
+  assert.match(s.out(), /\/retry +Send your last message again\n/);
+  assert.match(s.out(), /\/save +Save the conversation as Markdown\n/);
+  assert.match(s.out(), /\/copy +Copy the latest reply and its sources\n/);
+  assert.strictEqual(s.requests.length, 0);
+});
+
+test('linear chat /retry after a failed reply sends the same question and prints the reply once', async () => {
+  const s = session(async (_messages, _opts, number) => {
+    if (number === 1) throw new Error('Chat service is busy.');
+    return { message: 'Retried answer.' };
+  });
+  s.send('Q1\n/retry\n');
+  s.input.end();
+  await s.chat.finished;
+  assert.strictEqual(s.requests.length, 2);
+  assert.deepStrictEqual(s.requests[0].messages, [{ role: 'user', content: 'Q1' }]);
+  assert.deepStrictEqual(s.requests[1].messages, s.requests[0].messages);
+  assert.strictEqual(s.err(), 'Chat error: Chat service is busy.\n');
+  assert.strictEqual(s.out().split('Retried answer.').length - 1, 1);
+  assert.match(s.out(), /You: \/retry\nResearching…\nOTEKIN:\nRetried answer\.\n/);
+  assert.doesNotMatch(s.out(), REDRAW);
+});
+
+test('linear chat /retry after a cancelled reply sends the same question', async () => {
+  const late = deferred();
+  const s = session(async (_messages, _opts, number) => (number === 1 ? late.promise : { message: 'Second try.' }));
+  s.send('Q1\n');
+  await tick(5);
+  s.chat.interrupt();
+  await s.idle(2);
+  s.send('/retry\n');
+  s.input.end();
+  await s.chat.finished;
+  late.resolve({ message: 'Late.' });
+  assert.strictEqual(s.requests.length, 2);
+  assert.deepStrictEqual(s.requests[1].messages, [{ role: 'user', content: 'Q1' }]);
+  assert.match(s.out(), /Cancelled\.\nYou: \/retry\nResearching…\nOTEKIN:\nSecond try\.\n/);
+  assert.doesNotMatch(s.out(), /Late\./);
+});
+
+test('linear chat /retry after a completed reply replaces that turn in history and in /save', async () => {
+  const directory = tempDirectory();
+  const s = session(async (_messages, _opts, number) => cited(number), {
+    start: { saveDirectory: directory, now: () => FIXED_NOW }
+  });
+  s.send('Q1\nQ2\n/retry\n/save\nQ3\n');
+  s.input.end();
+  await s.chat.finished;
+  const contents = (request) => request.messages.map((message) => message.content.split('\n')[0]);
+  assert.strictEqual(s.requests.length, 4);
+  // The retry resends Q2 with the earlier turns as context, minus the replaced turn.
+  assert.deepStrictEqual(contents(s.requests[2]), ['Q1', 'Answer 1 [1].', 'Q2']);
+  // The next follow-up carries only the new answer.
+  assert.deepStrictEqual(contents(s.requests[3]), ['Q1', 'Answer 1 [1].', 'Q2', 'Answer 3 [1].', 'Q3']);
+  const saved = filesIn(directory);
+  assert.strictEqual(saved.length, 1);
+  const markdown = fs.readFileSync(path.join(directory, saved[0]), 'utf8');
+  assert.match(markdown, /## You\n\nQ2\n\n## fixture-model · [^\n]+\n\nAnswer 3 \[1\]\./);
+  assert.doesNotMatch(markdown, /Answer 2/);
+  assert.strictEqual(markdown.split('## You\n\nQ2\n').length - 1, 1);
+});
+
+test('linear chat keeps the previous answer when a replacing /retry fails or is cancelled', async () => {
+  const directory = tempDirectory();
+  const hanging = deferred();
+  const s = session(async (_messages, _opts, number) => {
+    if (number === 2) throw new Error('Retry failed.');
+    if (number === 3) return hanging.promise;
+    return cited(number);
+  }, { start: { saveDirectory: directory, now: () => FIXED_NOW } });
+  s.send('Q1\n/retry\n');
+  await s.idle(3);
+  s.send('/retry\n');
+  await tick(5);
+  assert.strictEqual(s.requests.length, 3);
+  s.chat.interrupt();
+  await s.idle(4);
+  s.send('/save\nQ2\n');
+  s.input.end();
+  await s.chat.finished;
+  hanging.resolve(cited(99));
+  const contents = (request) => request.messages.map((message) => message.content.split('\n')[0]);
+  // Both retries resent Q1 without its answer.
+  assert.deepStrictEqual(contents(s.requests[1]), ['Q1']);
+  assert.deepStrictEqual(contents(s.requests[2]), ['Q1']);
+  // The follow-up still has the first answer as context.
+  assert.deepStrictEqual(contents(s.requests[3]), ['Q1', 'Answer 1 [1].', 'Q2']);
+  const markdown = fs.readFileSync(path.join(directory, filesIn(directory)[0]), 'utf8');
+  assert.match(markdown, /## You\n\nQ1\n\n## fixture-model · [^\n]+\n\nAnswer 1 \[1\]\./);
+  assert.doesNotMatch(markdown, /Retry failed|Cancelled|Answer 99/);
+});
+
+test('linear chat /retry while a reply is on the way sends nothing and says so', async () => {
+  const pending = deferred();
+  const s = session(async () => pending.promise, { start: { interactive: true } });
+  s.send('Q1\n');
+  await tick(5);
+  s.send('/retry\n');
+  await tick(5);
+  assert.strictEqual(s.requests.length, 1);
+  assert.match(s.out(), /Researching…\nYou: \/retry\nA reply is on the way\. Ctrl\+C cancels it, then \/retry sends it again\.\n$/);
+  pending.resolve({ message: 'Only answer.' });
+  await s.idle(1);
+  s.input.end();
+  await s.chat.finished;
+  assert.strictEqual(s.requests.length, 1);
+  assert.strictEqual(s.out().split('Only answer.').length - 1, 1);
+  assert.match(s.out(), /OTEKIN:\nOnly answer\.\n\nYou: \n$/);
+});
+
+test('linear chat /save writes the questions and replies only, and nothing when there is nothing to save', async () => {
+  const directory = tempDirectory();
+  const s = session(async (_messages, opts, number) => {
+    if (number === 2) throw new Error('Broken.');
+    opts.onActivity({ id: 't1', tool: 'search_web', query: 'secret tool query', status: 'running' });
+    return {
+      ...cited(number),
+      toolActivity: [{ id: 't2', tool: 'read_url', query: 'https://tool.example', status: 'complete' }]
+    };
+  }, { start: { saveDirectory: directory, now: () => FIXED_NOW } });
+  s.send('/save\n');
+  await s.idle(2);
+  assert.match(s.out(), /You: \/save\nNothing to save yet\. Send a message first\.\n/);
+  assert.deepStrictEqual(filesIn(directory), []);
+  s.send('Q1\nQ2\n/save\n');
+  s.input.end();
+  await s.chat.finished;
+  const saved = filesIn(directory);
+  assert.strictEqual(saved.length, 1);
+  assert.match(saved[0], /^otekin-chat-\d{8}-\d{6}\.md$/);
+  const file = path.join(directory, saved[0]);
+  assert(s.out().includes(`Saved the conversation to ${file}\n`));
+  const markdown = fs.readFileSync(file, 'utf8');
+  assert.match(markdown, /^# otekin chat · /);
+  assert.match(markdown, /## You\n\nQ1\n\n## fixture-model · \d{4}-\d{2}-\d{2} \d{2}:\d{2}\n\nAnswer 1 \[1\]\.\n\nSources: \[\\\[1\\\] Example 1\]\(https:\/\/example\.com\/1\)\n/);
+  assert.match(markdown, /## You\n\nQ2\n$/);
+  assert.doesNotMatch(markdown, /secret tool query|tool\.example|Broken|Chat error|Researching/);
+  if (process.platform !== 'win32') assert.strictEqual(fs.statSync(file).mode & 0o777, 0o600);
+  assert.doesNotMatch(s.out(), REDRAW);
+});
+
+test('linear chat /save prints its path without terminal controls and reports write failures by code', async () => {
+  if (process.platform !== 'win32') {
+    const parent = tempDirectory();
+    const directory = path.join(parent, 'evil\u001b[2Jdir');
+    fs.mkdirSync(directory);
+    const s = session(async () => ({ message: 'Answer.' }), { start: { saveDirectory: directory, now: () => FIXED_NOW } });
+    s.send('Q\n/save\n');
+    s.input.end();
+    await s.chat.finished;
+    assert.strictEqual(filesIn(directory).length, 1);
+    assert.doesNotMatch(s.out(), /\u001b/);
+    assert.match(s.out(), /Saved the conversation to \S*evildir\/otekin-chat-\d{8}-\d{6}\.md\n/);
+  }
+
+  const missing = path.join(tempDirectory(), 'missing', 'nested');
+  const s = session(async () => ({ message: 'Answer.' }), { start: { saveDirectory: missing } });
+  s.send('Q\n/save\n');
+  s.input.end();
+  await s.chat.finished;
+  assert.match(s.out(), /Could not save the conversation \(ENOENT\)\. The chat still works\.\n/);
+  assert(!s.out().includes(missing));
+});
+
+test('linear chat /copy copies the latest reply, falls back to a file and says when there is nothing', async () => {
+  const directory = tempDirectory();
+  /** @type {string[]} */
+  const copied = [];
+  /** @type {unknown} */
+  let result = 'xclip';
+  const s = session(async (_messages, _opts, number) => cited(number), {
+    start: {
+      saveDirectory: directory,
+      now: () => FIXED_NOW,
+      copy: async (text) => {
+        copied.push(text);
+        if (result instanceof Error) throw result;
+        return result;
+      }
+    }
+  });
+  s.send('/copy\n');
+  await s.idle(2);
+  assert.match(s.out(), /You: \/copy\nNothing to copy yet\. Wait for a reply to finish\.\n/);
+  assert.deepStrictEqual(copied, []);
+
+  s.send('Q1\nQ2\n/copy\n');
+  await s.idle(5);
+  assert.deepStrictEqual(copied, ['Answer 2 [1].\n\nSources: [\\[1\\] Example 2](https://example.com/2)\n']);
+  assert.match(s.out(), /You: \/copy\nCopied the latest reply \(with 1 source\) to the clipboard\n/);
+  assert.deepStrictEqual(filesIn(directory), []);
+
+  result = null;
+  s.send('/copy\n');
+  await s.idle(6);
+  result = new Error('spawn failed');
+  s.send('/copy\n');
+  s.input.end();
+  await s.chat.finished;
+  const saved = filesIn(directory);
+  assert.strictEqual(saved.length, 2);
+  saved.forEach((name) => assert.match(name, /^otekin-reply-\d{8}-\d{6}(-2)?\.md$/));
+  for (const name of saved) {
+    assert.strictEqual(fs.readFileSync(path.join(directory, name), 'utf8'), copied[1]);
+    assert(s.out().includes(`No clipboard available; saved the latest reply (with 1 source) to ${path.join(directory, name)}\n`));
+  }
+  assert.doesNotMatch(s.out(), REDRAW);
+});
+
+test('linear chat commands typed during a reply answer at once without breaking the reply', async () => {
+  const directory = tempDirectory();
+  const pending = deferred();
+  /** @type {string[]} */
+  const copied = [];
+  const s = session(async (_messages, _opts, number) => (number === 2 ? pending.promise : cited(number)), {
+    start: {
+      interactive: true,
+      saveDirectory: directory,
+      now: () => FIXED_NOW,
+      copy: async (text) => {
+        copied.push(text);
+        return 'pbcopy';
+      }
+    }
+  });
+  s.send('Q1\n');
+  await s.idle(2);
+  s.send('Q2\n');
+  await tick(5);
+  s.send('/copy\n/save\n/help\n');
+  await tick(5);
+  // The reply on its way is never copied; the latest completed one is, and the message says so.
+  assert.deepStrictEqual(copied, ['Answer 1 [1].\n\nSources: [\\[1\\] Example 1](https://example.com/1)\n']);
+  assert.match(s.out(), /Copied the previous reply \(with 1 source\) to the clipboard\. The reply being written is not finished yet\n/);
+  assert.match(s.out(), /Saved the conversation to /);
+  assert.match(s.out(), /Linear chat commands:/);
+  assert.strictEqual(s.requests.length, 2);
+  pending.resolve(cited(2));
+  await s.idle(3);
+  s.input.end();
+  await s.chat.finished;
+  const out = s.out();
+  // The reply arrives whole after the commands' lines.
+  assert.match(out, /Ctrl\+D +End the chat when idle\nfixture-model:\nAnswer 2 \[1\]\.\n\nSources:\n1\. Example 2 https:\/\/example\.com\/2\n\nYou: \n$/);
+  assert.strictEqual(out.split('Answer 2 [1].').length - 1, 1);
+  assert.doesNotMatch(out, REDRAW);
+  // Piped lines wait their turn instead.
+  const piped = session(async (_messages, _opts, number) => cited(number), {
+    start: { saveDirectory: tempDirectory(), copy: async () => 'pbcopy' }
+  });
+  piped.send('Q1\n/copy\n');
+  piped.input.end();
+  await piped.chat.finished;
+  assert.match(piped.out(), /Copied the latest reply \(with 1 source\) to the clipboard\n/);
+});
+
+test('linear chat prints a late clipboard result on its own line after the prompt returns', async () => {
+  const pending = deferred();
+  const clipboard = deferred();
+  const s = session(async (_messages, _opts, number) => (number === 2 ? pending.promise : cited(number)), {
+    start: { interactive: true, saveDirectory: tempDirectory(), copy: () => clipboard.promise }
+  });
+  s.send('Q1\n');
+  await s.idle(2);
+  s.send('Q2\n');
+  await tick(5);
+  s.send('/copy\n');
+  await tick(5);
+  pending.resolve(cited(2));
+  await s.idle(3);
+  clipboard.resolve('xsel');
+  await tick(5);
+  assert.match(s.out(), /\n\nYou: \nCopied the previous reply \(with 1 source\) to the clipboard\. The reply being written is not finished yet\nYou: $/);
+  s.input.end();
+  await s.chat.finished;
+});
+
+test('linear chat runs a /retry typed during a reply in turn once that reply has finished', async () => {
+  const pending = deferred();
+  const clipboard = deferred();
+  const s = session(async (_messages, _opts, number) => (number === 2 ? pending.promise : cited(number)), {
+    start: { interactive: true, saveDirectory: tempDirectory(), copy: () => clipboard.promise }
+  });
+  s.send('Q1\n');
+  await s.idle(2);
+  s.send('Q2\n');
+  await tick(5);
+  // /retry waits behind a slow /copy; by the time it runs, Q2 has its answer.
+  s.send('/copy\n/retry\n');
+  await tick(5);
+  pending.resolve(cited(2));
+  await tick(5);
+  clipboard.resolve('pbcopy');
+  s.input.end();
+  await s.chat.finished;
+  const contents = (request) => request.messages.map((message) => message.content.split('\n')[0]);
+  // One request at a time: the retry replaced Q2's answer after it arrived.
+  assert.strictEqual(s.requests.length, 3);
+  assert.deepStrictEqual(contents(s.requests[2]), ['Q1', 'Answer 1 [1].', 'Q2']);
+  assert.strictEqual(s.out().split('Answer 3 [1].').length - 1, 1);
+  assert.doesNotMatch(s.out(), /A reply is on the way/);
 });
