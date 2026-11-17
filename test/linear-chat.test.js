@@ -13,6 +13,7 @@ const {
   modelLabel
 } = require('../lib/linear-chat');
 const { prepareRequestMessages, assistantMessageFromResponse } = require('../lib/chat-client');
+const chatHistory = require('../lib/chat-history');
 
 // Cursor movement, erase and alternate-screen sequences, plus any carriage return.
 const REDRAW = /\u001b\[[0-9;?]*[A-HJK]|\u001b\[\?1049|\r/;
@@ -397,7 +398,7 @@ test('linear chat helpers pick the mode, commands, labels and source list', () =
   assert.strictEqual(formatLinearReply({ message: 'No sources.' }), 'No sources.');
 });
 
-test('linear chat /help lists /retry, /save and /copy', async () => {
+test('linear chat /help lists /retry, /save, /copy and /clear', async () => {
   const s = session(async () => ({ message: 'Unused.' }));
   s.send('/help\n');
   s.input.end();
@@ -405,6 +406,7 @@ test('linear chat /help lists /retry, /save and /copy', async () => {
   assert.match(s.out(), /\/retry +Send your last message again\n/);
   assert.match(s.out(), /\/save +Save the conversation as Markdown\n/);
   assert.match(s.out(), /\/copy +Copy the latest reply and its sources\n/);
+  assert.match(s.out(), /\/clear +Forget the conversation and its saved history\n/);
   assert.strictEqual(s.requests.length, 0);
 });
 
@@ -732,4 +734,303 @@ test('linear chat runs a /retry typed during a reply in turn once that reply has
   assert.deepStrictEqual(contents(s.requests[2]), ['Q1', 'Answer 1 [1].', 'Q2']);
   assert.strictEqual(s.out().split('Answer 3 [1].').length - 1, 1);
   assert.doesNotMatch(s.out(), /A reply is on the way/);
+});
+
+// A history file in a fresh directory, removed by the caller.
+function historyFixture() {
+  const directory = tempDirectory();
+  return { directory, file: path.join(directory, 'state', 'history.json') };
+}
+
+// Saves a conversation as the full-screen chat would: one cited, timed reply and a tool line.
+function saveFullScreenConversation(file) {
+  const response = cited(1);
+  const history = prepareRequestMessages([], 'Saved question').concat(assistantMessageFromResponse(response));
+  chatHistory.saveHistory(file, {
+    history,
+    messages: [
+      { role: 'user', content: 'Saved question' },
+      { role: 'tools', content: '✓ Searched  saved query' },
+      {
+        role: 'assistant',
+        model: 'fixture-model',
+        answeredAt: '2026-11-15T09:30:00.000Z',
+        content: 'Answer 1 [1].\n\nSources: [1] Example 1',
+        answer: 'Answer 1 [1].',
+        sources: [{ number: 1, title: 'Example 1', url: 'https://example.com/1' }]
+      }
+    ],
+    prompts: ['Saved question']
+  });
+  return history;
+}
+
+// An interactive session (a person typing) using a saved history file.
+function historySession(requestChat, file, start = {}) {
+  return session(requestChat, { start: { interactive: true, historyFile: file, now: () => FIXED_NOW, ...start } });
+}
+
+test('linear chat continues a saved conversation with one line and its context', async () => {
+  const { directory, file } = historyFixture();
+  const saveDirectory = path.join(directory, 'saved');
+  fs.mkdirSync(saveDirectory);
+  try {
+    saveFullScreenConversation(file);
+    // The same request the full-screen chat would send.
+    const expected = prepareRequestMessages(chatHistory.loadHistory(file).history, 'Follow up');
+    const s = historySession(async (_messages, _opts, number) => cited(number + 1), file, { saveDirectory });
+    s.send('Follow up\n');
+    await s.idle(2);
+    s.send('/save\n');
+    s.input.end();
+    await s.chat.finished;
+    const out = s.out();
+    assert.strictEqual(out.split('Continuing your saved conversation').length - 1, 1);
+    assert.match(out, /^otekin linear chat.*\n.*\nContinuing your saved conversation \(1 question\)\. \/clear forgets it; --no-history skips it\.\nYou: /);
+    // The old reply is not printed again.
+    assert.strictEqual(out.split('Answer 1 [1].').length - 1, 0);
+    assert.deepStrictEqual(s.requests[0].messages, expected);
+    assert.strictEqual(s.requests[0].messages[1].webSources[0].url, 'https://example.com/1');
+    const [saved] = filesIn(saveDirectory);
+    const markdown = fs.readFileSync(path.join(saveDirectory, saved), 'utf8');
+    assert.match(markdown, /## You\n\nSaved question\n\n## fixture-model · 2026-11-15 \d{2}:30\n\nAnswer 1 \[1\]\.\n\nSources: \[\\\[1\\\] Example 1\]\(https:\/\/example\.com\/1\)\n\n## You\n\nFollow up\n\n## fixture-model · /);
+    assert.doesNotMatch(markdown, /saved query/);
+    assert.strictEqual(s.err(), '');
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('linear chat saves each completed reply where the next session finds it', async () => {
+  const { directory, file } = historyFixture();
+  try {
+    const first = historySession(async (_messages, _opts, number) => cited(number), file);
+    first.send('Q1\n//slash question\n');
+    first.input.end();
+    await first.chat.finished;
+    assert.doesNotMatch(first.out(), /Continuing/);
+    const saved = chatHistory.loadHistory(file);
+    assert(saved);
+    assert.deepStrictEqual(saved.history.map((message) => [message.role, message.content.split('\n')[0]]), [
+      ['user', 'Q1'], ['assistant', 'Answer 1 [1].'], ['user', '/slash question'], ['assistant', 'Answer 2 [1].']
+    ]);
+    assert.deepStrictEqual(saved.prompts, ['Q1', '//slash question']);
+    const reply = saved.messages[1];
+    assert.strictEqual(reply.role, 'assistant');
+    assert.strictEqual(reply.model, 'fixture-model');
+    assert.strictEqual(reply.content, 'Answer 1 [1].\n\nSources: [1] Example 1');
+    assert.strictEqual(reply.answer, 'Answer 1 [1].');
+    assert.deepStrictEqual(reply.sources, [{ number: 1, title: 'Example 1', url: 'https://example.com/1' }]);
+    assert.strictEqual(reply.answeredAt, new Date(FIXED_NOW).toISOString());
+
+    const second = historySession(async (_messages, _opts, number) => cited(number + 2), file);
+    second.send('Q3\n');
+    second.input.end();
+    await second.chat.finished;
+    assert.match(second.out(), /Continuing your saved conversation \(2 questions\)\./);
+    assert.deepStrictEqual(second.requests[0].messages.map((message) => message.content.split('\n')[0]),
+      ['Q1', 'Answer 1 [1].', '/slash question', 'Answer 2 [1].', 'Q3']);
+    assert.deepStrictEqual(chatHistory.loadHistory(file).prompts, ['Q1', '//slash question', 'Q3']);
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('linear chat saves a command-line prompt so recalling it asks it again', async () => {
+  const { directory, file } = historyFixture();
+  try {
+    const s = historySession(async () => ({ message: 'About exit.' }), file, { firstPrompt: '/exit' });
+    s.input.end();
+    await s.chat.finished;
+    assert.deepStrictEqual(chatHistory.loadHistory(file).prompts, ['//exit']);
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('linear chat saves a replacing /retry in place, and never a failed or cancelled reply', async () => {
+  const { directory, file } = historyFixture();
+  try {
+    const late = deferred();
+    const s = historySession(async (_messages, _opts, number) => {
+      if (number === 2) throw new Error('Busy.');
+      if (number === 3) return late.promise;
+      return cited(number);
+    }, file);
+    s.send('Q1\n');
+    await s.idle(2);
+    const before = fs.readFileSync(file);
+    s.send('/retry\n');
+    await s.idle(3);
+    assert.deepStrictEqual(fs.readFileSync(file), before, 'a failed retry leaves the file as it was');
+    s.send('/retry\n');
+    await tick(5);
+    s.chat.interrupt();
+    await s.idle(4);
+    late.resolve(cited(3));
+    await tick(5);
+    assert.deepStrictEqual(fs.readFileSync(file), before, 'a cancelled retry leaves the file as it was');
+    s.send('/retry\n');
+    s.input.end();
+    await s.chat.finished;
+    const saved = chatHistory.loadHistory(file);
+    assert.deepStrictEqual(saved.history.map((message) => message.content.split('\n')[0]), ['Q1', 'Answer 4 [1].']);
+    assert.deepStrictEqual(saved.messages.map((message) => [message.role, message.content.split('\n')[0]]),
+      [['user', 'Q1'], ['assistant', 'Answer 4 [1].']]);
+    assert.deepStrictEqual(saved.prompts, ['Q1']);
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('linear chat replaces a restored last turn with /retry', async () => {
+  const { directory, file } = historyFixture();
+  try {
+    saveFullScreenConversation(file);
+    const s = historySession(async () => cited(9), file);
+    s.send('/retry\n');
+    s.input.end();
+    await s.chat.finished;
+    assert.deepStrictEqual(s.requests[0].messages, [{ role: 'user', content: 'Saved question' }]);
+    const saved = chatHistory.loadHistory(file);
+    assert.deepStrictEqual(saved.messages.map((message) => [message.role, message.content.split('\n')[0]]),
+      [['user', 'Saved question'], ['assistant', 'Answer 9 [1].']]);
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('linear chat never reads or writes history when piped or with history off', async () => {
+  const calls = [];
+  const historyStore = {
+    loadHistory: (file) => { calls.push(['load', file]); return null; },
+    saveHistory: (file) => { calls.push(['save', file]); },
+    clearHistory: (file) => { calls.push(['clear', file]); }
+  };
+  // Piped input: a file is given, but the session is not interactive.
+  const piped = session(async () => ({ message: 'Piped.' }), {
+    start: { interactive: false, historyFile: '/unused/history.json', historyStore }
+  });
+  piped.send('Q1\n/clear\nQ2\n');
+  piped.input.end();
+  await piped.chat.finished;
+  // History off: no file.
+  const off = session(async () => ({ message: 'Off.' }), { start: { interactive: true, historyFile: null, historyStore } });
+  off.send('Q1\n/clear\n');
+  off.input.end();
+  await off.chat.finished;
+  assert.deepStrictEqual(calls, []);
+  assert.doesNotMatch(piped.out() + off.out(), /Continuing|Could not save/);
+  assert.match(piped.out(), /You: \/clear\nConversation cleared\n/);
+  assert.deepStrictEqual(piped.requests[1].messages, [{ role: 'user', content: 'Q2' }]);
+});
+
+test('linear chat /clear forgets the conversation, its prompts and the saved file', async () => {
+  const { directory, file } = historyFixture();
+  const saveDirectory = path.join(directory, 'saved');
+  fs.mkdirSync(saveDirectory);
+  try {
+    saveFullScreenConversation(file);
+    const s = historySession(async (_messages, _opts, number) => cited(number), file, { saveDirectory });
+    s.send('/clear\n');
+    await s.idle(2);
+    assert.match(s.out(), /You: \/clear\nConversation cleared\n/);
+    assert.strictEqual(fs.existsSync(file), false);
+    s.send('/save\n/copy\n/retry\n');
+    await s.idle(5);
+    assert.match(s.out(), /Nothing to save yet\. Send a message first\./);
+    assert.match(s.out(), /Nothing to copy yet\./);
+    assert.match(s.out(), /Nothing to retry yet\./);
+    assert.deepStrictEqual(filesIn(saveDirectory), []);
+    s.send('Fresh\n');
+    s.input.end();
+    await s.chat.finished;
+    assert.deepStrictEqual(s.requests[0].messages, [{ role: 'user', content: 'Fresh' }]);
+    const saved = chatHistory.loadHistory(file);
+    assert.deepStrictEqual(saved.prompts, ['Fresh']);
+    assert.deepStrictEqual(saved.messages.map((message) => message.role), ['user', 'assistant']);
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('linear chat /clear cancels a reply on the way and forgets its question', async () => {
+  const { directory, file } = historyFixture();
+  try {
+    const late = deferred();
+    /** @type {AbortSignal | null} */
+    let signal = null;
+    const s = historySession(async (_messages, opts, number) => {
+      if (number === 2) {
+        signal = opts.signal;
+        return late.promise;
+      }
+      return cited(number);
+    }, file);
+    s.send('Q1\n');
+    await s.idle(2);
+    s.send('Q2\n');
+    await tick(5);
+    s.send('/clear\n');
+    await tick(5);
+    assert(signal);
+    assert.strictEqual(signal.aborted, true);
+    assert.strictEqual(fs.existsSync(file), false);
+    late.resolve(cited(2));
+    await tick(5);
+    s.send('/retry\nQ3\n');
+    s.input.end();
+    await s.chat.finished;
+    assert.doesNotMatch(s.out(), /Answer 2/);
+    assert.match(s.out(), /Nothing to retry yet\./);
+    assert.deepStrictEqual(s.requests[2].messages, [{ role: 'user', content: 'Q3' }]);
+    assert.deepStrictEqual(chatHistory.loadHistory(file).prompts, ['Q3']);
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('linear chat reports history save and delete failures in one line and keeps working', async () => {
+  const saves = [];
+  const historyStore = {
+    loadHistory: () => null,
+    saveHistory: (_file, state) => {
+      saves.push(state);
+      throw Object.assign(new Error('EACCES: permission denied, open /secret/path/history.json'), { code: 'EACCES' });
+    },
+    clearHistory: () => {
+      throw Object.assign(new Error('EPERM: /secret/path'), { code: 'EPERM' });
+    }
+  };
+  const s = session(async (_messages, _opts, number) => cited(number), {
+    start: { interactive: true, historyFile: '/secret/path/history.json', historyStore }
+  });
+  s.send('Q1\nQ2\n');
+  await s.idle(3);
+  s.send('/clear\n');
+  s.input.end();
+  await s.chat.finished;
+  const out = s.out();
+  assert.strictEqual(out.split('Could not save chat history (EACCES). The chat still works.\n').length - 1, 2);
+  assert.match(out, /You: \/clear\nConversation cleared, but the saved history could not be deleted\n/);
+  assert.doesNotMatch(out + s.err(), /secret|permission denied/);
+  assert.match(out, /Answer 2 \[1\]\./);
+  assert.strictEqual(saves.length, 2);
+  assert.deepStrictEqual(saves[1].history.map((message) => message.content.split('\n')[0]),
+    ['Q1', 'Answer 1 [1].', 'Q2', 'Answer 2 [1].']);
+  assert.deepStrictEqual(saves[1].prompts, ['Q1', 'Q2']);
+});
+
+test('linear chat ignores a history store that cannot load', async () => {
+  const historyStore = {
+    loadHistory: () => { throw new Error('broken'); },
+    saveHistory: () => {},
+    clearHistory: () => {}
+  };
+  const s = session(async () => ({ message: 'Fine.' }), { start: { interactive: true, historyFile: '/x/history.json', historyStore } });
+  s.send('Q1\n');
+  s.input.end();
+  await s.chat.finished;
+  assert.doesNotMatch(s.out(), /Continuing/);
+  assert.deepStrictEqual(s.requests[0].messages, [{ role: 'user', content: 'Q1' }]);
 });
