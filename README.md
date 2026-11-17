@@ -31,7 +31,7 @@ Type `/` to open the command picker. Use ↑/↓ to choose a command, Tab to com
 | Ctrl+C | Cancel a request; exit when idle |
 | Ctrl+D | Exit with an empty draft |
 
-You can write your next draft while a reply is in progress. Pasted multiline text stays in the composer until you press Enter. The conversation and your previous prompts are saved, so the next full-screen session picks up where you left off; ↑ recalls earlier prompts. Use `/clear` to forget them, or `--no-history` to keep a session off the record. See [Saved chat history](#saved-chat-history).
+You can write your next draft while a reply is in progress. Pasted multiline text stays in the composer until you press Enter. The conversation and your previous prompts are saved, so the next full-screen or linear session picks up where you left off; ↑ recalls earlier prompts. Use `/clear` to forget them, or `--no-history` to keep a session off the record. See [Saved chat history](#saved-chat-history).
 
 Pipes, `TERM=dumb`, and `--non-interactive` use plain profile output; on a `TERM=dumb` terminal, `npx otekin chat` opens [linear chat](#linear-chat). Direct link commands, one-shot chat, and JSON output remain available without entering full-screen mode.
 
@@ -136,10 +136,12 @@ For each question, linear chat prints one `Researching…` line, at most one `Wa
 - `/retry` sends your last message again, like in the full-screen chat. After a failed or cancelled reply, it sends the same question. After a reply arrived, the new reply replaces it, in `/save` and in what is sent on later turns; if the retry fails or is cancelled, the earlier reply stays. While a reply is on the way, it only says so: press Ctrl+C first.
 - `/save` writes the conversation to a new Markdown file in the current directory, such as `otekin-chat-20261116-141500.md`, and prints its path. It holds your messages and the replies, each headed by the model that answered and its answer time, with numbered sources as Markdown links. Notices, errors, tool lines and `Cancelled.` are left out. Like the full-screen chat, it keeps the newest 100 messages and replies.
 - `/copy` copies the latest completed reply to the clipboard as Markdown, the answer followed by its numbered source links, and says how many sources it holds. When no clipboard tool works, it writes the reply to a new `otekin-reply-*.md` file in the current directory and prints its path. Files from `/save` and `/copy` are readable only by you on macOS and Linux and never replace an existing file.
-- At a terminal, `/help`, `/retry`, `/save` and `/copy` answer at once even while a reply is on the way; `/copy` then copies the previous completed reply and says so. The reply is still printed whole when it arrives. Piped lines always run in order, each after the previous reply.
+- At a terminal, linear chat shares [saved chat history](#saved-chat-history) with the full-screen chat: the same file, so either one continues a conversation the other started. When there is one, a single line says so, `Continuing your saved conversation (3 questions). /clear forgets it; --no-history skips it.`, without printing the old replies again. Follow-ups use the earlier turns as context, `/retry` can replace the last saved reply, and `/save` and `/copy` include saved replies with their source links and answer times. The conversation is saved after each completed reply, never after a failed or cancelled one; if saving fails, one line says `Could not save chat history (CODE). The chat still works.` Piped input never reads or writes saved history, so scripts stay reproducible.
+- `/clear` forgets the conversation, including a question still waiting for a reply, and deletes the saved history file; it prints `Conversation cleared`. While a reply is on the way, it cancels it first.
+- At a terminal, `/help`, `/retry`, `/save`, `/copy` and `/clear` answer at once even while a reply is on the way; `/copy` then copies the previous completed reply and says so. The reply is still printed whole when it arrives. Piped lines always run in order, each after the previous reply.
 - On a terminal with `TERM=dumb`, `npx otekin chat` without a prompt opens linear chat automatically instead of the full-screen workspace.
 - Color is used only for the header and model name, and only on a color terminal without `NO_COLOR`.
-- Linear chat does not read or write saved chat history yet, and `--json` is not supported with it.
+- `--json` is not supported with linear chat.
 
 When the service has optional image generation enabled, ask for an image in the same chat. Normal output saves generated images as PNG files in a temporary `otekin-images-*` directory and prints their paths. These files remain until you or the operating system removes them. `--json` preserves the inline image data without writing files. Image bytes are replaced with text placeholders in conversation history.
 
@@ -147,7 +149,7 @@ When the service has optional image generation enabled, ask for an image in the 
 
 - `--non-interactive`: print the profile message and links without a prompt.
 - `--no-open`: print a selected URL instead of opening it in a browser.
-- `--no-history`: don't load or save the full-screen chat history for this run. An existing history file is left untouched.
+- `--no-history`: don't load or save the saved chat history (full-screen or linear) for this run. An existing history file is left untouched.
 - `--linear`: with `chat`, hold a line-based conversation that never redraws or animates and prints each reply once. See [Linear chat](#linear-chat).
 - `--cv`, `--resume`: open the CV link directly.
 - `--select <website|linkedin|cv|chat|exit>`: choose an option directly.
@@ -173,7 +175,7 @@ npx otekin --json chat "What changed recently in EU AI regulation?"
 
 ## Chat service and privacy
 
-Chat uses the public SLgateway endpoint at `https://signloop-chat-api.vercel.app/v1/chat`, hosted on Vercel, and requires no API key. The model chooses its research tools and can continue after a tool failure. Bounded conversation history, including tool replay and source catalogs, is sent again on subsequent turns. The full-screen chat also saves it on your computer, as described below. `/save` writes a separate Markdown copy of the conversation to the current directory, even with saved history off. On macOS and Linux only you can read it, and `/clear` leaves it in place. `/copy` puts a single reply on your system clipboard, where other apps can read it, or, when no clipboard tool works, in a file like `/save`'s. Generated image files are saved separately as described above. The CLI accepts responses up to 24 MiB to accommodate optional images. Streaming transfers are capped at 48 MiB because image data can appear in both a provisional delta and the final reply; each individual event remains limited to 24 MiB.
+Chat uses the public SLgateway endpoint at `https://signloop-chat-api.vercel.app/v1/chat`, hosted on Vercel, and requires no API key. The model chooses its research tools and can continue after a tool failure. Bounded conversation history, including tool replay and source catalogs, is sent again on subsequent turns. The full-screen chat, and linear chat at a terminal, also save it on your computer, as described below. `/save` writes a separate Markdown copy of the conversation to the current directory, even with saved history off. On macOS and Linux only you can read it, and `/clear` leaves it in place. `/copy` puts a single reply on your system clipboard, where other apps can read it, or, when no clipboard tool works, in a file like `/save`'s. Generated image files are saved separately as described above. The CLI accepts responses up to 24 MiB to accommodate optional images. Streaming transfers are capped at 48 MiB because image data can appear in both a provisional delta and the final reply; each individual event remains limited to 24 MiB.
 
 Conversation content is transmitted to SLgateway and its configured model providers. Tool use can send search queries to search providers, URLs to hosted readers, requests to public API targets, and image prompts to the image provider. Calling the public endpoint can consume those providers' resources. Do not send sensitive content you would not want processed by those services.
 
@@ -197,7 +199,7 @@ CORS restrictions do not affect this Node.js CLI. The override must use an HTTP 
 
 ### Saved chat history
 
-The full-screen chat saves the conversation after each completed reply, so it is still there the next time you open it. One-shot `chat "…"`, `--json` and piped runs never read or write it.
+The full-screen chat and [linear chat](#linear-chat) at a terminal save the conversation after each completed reply, so it is still there the next time you open either of them. They share one file: a conversation started in one continues in the other. One-shot `chat "…"`, `--json` and piped runs, including piped linear chat, never read or write it.
 
 - **What is stored:** the bounded history sent back to the gateway (your messages, its replies, tool replay and the source catalog), the last 100 transcript entries as plain text, and your last 50 prompts. Each cited reply is also stored with its answer text and numbered sources (title and `http`/`https` link), so restored replies keep their styling and clickable source labels, and `/save` writes their sources as Markdown links. Each reply also stores when it was answered, as an ISO-8601 UTC time; the chat shows it in local time after the model label (`gpt-5 · 14:15` today, `gpt-5 · 30 Oct 14:15` on an earlier day, with the year when it differs), and a `/retry` replaces it with the new reply's time. Replies saved by older versions have no answer time and show none. Tool activity is restored as plain text. Generated images stay in their own files.
 - **Where:** one JSON file, `history.json`, in:
@@ -207,10 +209,10 @@ The full-screen chat saves the conversation after each completed reply, so it is
 
   Set `OTEKIN_HISTORY_FILE=/path/to/history.json` to use another file.
 - **Permissions:** on macOS and Linux the file is readable only by you (`0600`) and its directory is `0700`. It is written to a temporary file first and then renamed, so an interrupted save never leaves half a file. The file isn't encrypted.
-- **Forgetting it:** `/clear` deletes the file. Deleting it yourself works too.
+- **Forgetting it:** `/clear`, in either chat, deletes the file. Deleting it yourself works too.
 - **Turning it off:** `--no-history` skips loading and saving for one run and leaves any existing file untouched. Set `OTEKIN_NO_HISTORY=1` to turn it off for good. With history off, the conversation lasts only for the current session.
 
-The CLI treats the file as untrusted. A file that is damaged, from another version, or over 2 MiB is ignored and the chat starts empty; terminal control sequences in it are never displayed. A reply whose stored sources are malformed, too many or too long is restored as plain text, without links. An answer time that can't be read, is too long, is before 2020 or is more than a day in the future is dropped, and the reply is restored without it. If a save fails, the status line says so and the chat keeps working.
+The CLI treats the file as untrusted. A file that is damaged, from another version, or over 2 MiB is ignored and the chat starts empty; terminal control sequences in it are never displayed. A reply whose stored sources are malformed, too many or too long is restored as plain text, without links. An answer time that can't be read, is too long, is before 2020 or is more than a day in the future is dropped, and the reply is restored without it. If a save fails, the status line (or, in linear chat, one printed line) says so with only the error code, and the chat keeps working.
 
 ## Develop locally
 

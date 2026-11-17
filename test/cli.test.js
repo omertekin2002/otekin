@@ -8,6 +8,7 @@ const os = require('os');
 const path = require('path');
 const { Terminal } = require('@xterm/headless');
 const pkg = require('../package.json');
+const chatHistory = require('../lib/chat-history');
 
 const ROOT = path.resolve(__dirname, '..');
 const CLI = path.join(ROOT, 'bin', 'otekin.js');
@@ -786,7 +787,7 @@ test('CLI linear chat /save writes to the current directory and /retry replaces 
 test('CLI opens linear chat for a promptless chat on a TERM=dumb terminal', async () => {
   const bodies = [];
   await withServer(linearGateway(bodies, (_body, number) => sourcedReply(number)), async (endpoint) => {
-    const dumb = await runCli(['chat'], { OTEKIN_CHAT_API_URL: endpoint, TERM: 'dumb' },
+    const dumb = await runCli(['chat'], { OTEKIN_CHAT_API_URL: endpoint, TERM: 'dumb', OTEKIN_NO_HISTORY: '1' },
       TTY_STDIN.concat(TTY_STDOUT), 'Q1\n/exit\n');
     assert.strictEqual(dumb.code, 0);
     assert.match(dumb.stdout, /^otekin linear chat/);
@@ -825,7 +826,7 @@ test('CLI rejects --linear with --json or without chat, sending nothing', async 
   });
 });
 
-test('CLI linear chat never creates or changes the history file', async () => {
+test('CLI piped linear chat never creates or changes the history file', async () => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'otekin-linear-history-'));
   const file = path.join(directory, 'history.json');
   const absent = path.join(directory, 'state', 'history.json');
@@ -844,9 +845,59 @@ test('CLI linear chat never creates or changes the history file', async () => {
   }
 });
 
+test('CLI linear chat at a terminal saves history and continues it in the next run', async () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'otekin-linear-tty-history-'));
+  const file = path.join(directory, 'state', 'history.json');
+  const bodies = [];
+  try {
+    await withServer(linearGateway(bodies, (_body, number) => sourcedReply(number)), async (endpoint) => {
+      const env = { OTEKIN_CHAT_API_URL: endpoint, OTEKIN_HISTORY_FILE: file };
+      const first = await runCli(['chat', '--linear'], env, TTY_STDIN, 'Q1\n');
+      assert.strictEqual(first.code, 0);
+      assert.doesNotMatch(first.stdout, /Continuing/);
+      const saved = chatHistory.loadHistory(file);
+      assert(saved, 'the first run saved its conversation');
+      assert.deepStrictEqual(saved.prompts, ['Q1']);
+      assert.deepStrictEqual(saved.messages.map((message) => message.role), ['user', 'assistant']);
+      assert.deepStrictEqual(saved.messages[1].sources, [{ number: 1, title: 'Example 1', url: 'https://example.com/1' }]);
+      if (process.platform !== 'win32') assert.strictEqual(fs.statSync(file).mode & 0o777, 0o600);
+
+      const second = await runCli(['chat', '--linear'], env, TTY_STDIN, 'Q2\n');
+      assert.strictEqual(second.code, 0);
+      assert.strictEqual(second.stdout.split('Continuing your saved conversation (1 question). /clear forgets it; --no-history skips it.\n').length - 1, 1);
+      assert.strictEqual(second.stdout.split('Answer 1 [1].').length - 1, 0);
+      assert.deepStrictEqual(bodies[1].messages.map((message) => message.content.split('\n')[0]), ['Q1', 'Answer 1 [1].', 'Q2']);
+      assert.deepStrictEqual(chatHistory.loadHistory(file).prompts, ['Q1', 'Q2']);
+
+      // History off: the saved file is neither read nor changed.
+      const before = fs.readFileSync(file);
+      for (const [args, extra] of [[['chat', '--linear', '--no-history'], {}], [['chat', '--linear'], { OTEKIN_NO_HISTORY: '1' }]]) {
+        const count = bodies.length;
+        const result = await runCli(args, { ...env, ...extra }, TTY_STDIN, 'Q3\n');
+        assert.strictEqual(result.code, 0);
+        assert.doesNotMatch(result.stdout, /Continuing/);
+        assert.deepStrictEqual(bodies[count].messages, [{ role: 'user', content: 'Q3' }]);
+      }
+      assert.deepStrictEqual(fs.readFileSync(file), before);
+
+      const cleared = await runCli(['chat', '--linear'], env, TTY_STDIN, '/clear\n');
+      assert.strictEqual(cleared.code, 0);
+      assert.match(cleared.stdout, /Conversation cleared\n/);
+      assert.strictEqual(fs.existsSync(file), false);
+    });
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
 test('CLI help documents linear chat and its TERM=dumb behavior', async () => {
   const help = await runCli(['--help']);
   assert.match(help.stdout, /npx otekin chat --linear/);
   assert.match(help.stdout, /--linear\s+Chat line by line/);
   assert.match(help.stdout, /TERM=dumb terminal opens it automatically/);
+  assert.match(help.stdout, /--no-history\s+Don't load or save chat history this run/);
+  assert.match(help.stdout, /full-screen and linear chats save their conversation/);
+  assert.match(help.stdout, /piped linear chat\) never read or\s+write it/);
+  assert.match(help.stdout, /\/clear forgets the\s+conversation/);
+  assert.doesNotMatch(help.stdout, /does not use saved history yet/);
 });

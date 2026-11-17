@@ -904,6 +904,80 @@ test('restored replies keep their clickable sources, /save links and /retry repl
   }
 });
 
+// Runs one interactive linear chat session to the end of its input and returns what it printed.
+async function linearSession(lines, options) {
+  const {startLinearChat} = require('../lib/linear-chat');
+  const input = new PassThrough();
+  const output = new PassThrough();
+  let out = '';
+  output.on('data', chunk => { out += chunk.toString(); });
+  const chat = startLinearChat({input, output, color: false, echo: true, interactive: true, saveImages: response => response, ...options});
+  for (const line of lines) {
+    input.write(line + '\n');
+    // Each line waits for the prompt, so commands run after the reply before them.
+    await waitFor(() => out.endsWith('You: ') && out.split('You: ').length - 1 > lines.indexOf(line) + 1);
+  }
+  input.end();
+  await chat.finished;
+  return out;
+}
+
+test('linear and full-screen chat continue each other’s saved conversation', async () => {
+  const {directory, file} = historyDirectory();
+  const saveDirectory = path.join(directory, 'saved');
+  fs.mkdirSync(saveDirectory);
+  const replies = [
+    {message: 'Linear answer [1].', model: 'linear-model', webSources: [{number: 1, title: 'Linear source', url: 'https://example.com/linear'}]},
+    {message: 'Full-screen answer [2].', model: 'screen-model', webSources: [{number: 2, title: 'Screen source', url: 'https://example.com/screen'}]},
+    {message: 'Last answer.', model: 'linear-model'}
+  ];
+  const requests = [];
+  const services = {
+    ...client, ensureChatServiceAwake: async () => {},
+    requestChat: async messages => {
+      requests.push(messages);
+      return replies[requests.length - 1];
+    }
+  };
+  try {
+    const first = await linearSession(['Asked in linear'], {services, historyFile: file, now: () => Date.UTC(2026, 10, 16, 9, 5)});
+    assert.doesNotMatch(first, /Continuing/);
+    assert(fs.existsSync(file));
+
+    const screen = await terminalApp({columns: 80, services, historyFile: file, saveDirectory});
+    try {
+      assert.match(screen.screen(), /Restored your last conversation/);
+      assert.match(screen.screen(), /YOU\n\s*Asked in linear/);
+      assert.match(screen.screen(), /linear-model · [\w ]*\d{2}:05\n\s*Linear answer \[1\]\.\n\s*\n\s*Sources: \[1\] Linear source/);
+      assert.deepStrictEqual(terminalLinks(screen.raw()), ['https://example.com/linear [1] Linear source']);
+      await screen.type('\u001b[A');
+      await screen.expectScreen(/│ › Asked in linear/);
+      await screen.type('\u0015Asked in full screen\r');
+      await waitFor(() => screen.screen().includes('Full-screen answer [2].'));
+      assert.deepStrictEqual(requests[1].map(message => message.content.split('\n')[0]),
+        ['Asked in linear', 'Linear answer [1].', 'Asked in full screen']);
+      assert.deepStrictEqual(requests[1][1].webSources, replies[0].webSources);
+      await waitFor(() => chatHistory.loadHistory(file)?.messages.filter(message => message.role === 'assistant').length === 2);
+    } finally {
+      await screen.close();
+    }
+
+    const last = await linearSession(['Asked in linear again', '/save'], {services, historyFile: file, saveDirectory});
+    assert.strictEqual(last.split('Continuing your saved conversation (2 questions).').length - 1, 1);
+    assert.doesNotMatch(last, /Linear answer|Full-screen answer/, 'restored replies are not printed again');
+    assert.deepStrictEqual(requests[2].map(message => message.content.split('\n')[0]),
+      ['Asked in linear', 'Linear answer [1].', 'Asked in full screen', 'Full-screen answer [2].', 'Asked in linear again']);
+    const [saved] = fs.readdirSync(saveDirectory);
+    const markdown = fs.readFileSync(path.join(saveDirectory, saved), 'utf8');
+    assert.match(markdown, /## linear-model · 2026-11-16 \d{2}:05\n\nLinear answer \[1\]\.\n\nSources: \[\\\[1\\\] Linear source\]\(https:\/\/example\.com\/linear\)\n/);
+    assert.match(markdown, /## screen-model · \d{4}-\d{2}-\d{2} \d{2}:\d{2}\n\nFull-screen answer \[2\]\.\n\nSources: \[\\\[2\\\] Screen source\]\(https:\/\/example\.com\/screen\)\n/);
+    assert.match(markdown, /## You\n\nAsked in linear again\n\n## linear-model · .*\n\nLast answer\.\n$/);
+    assert.deepStrictEqual(chatHistory.loadHistory(file).prompts, ['Asked in linear', 'Asked in full screen', 'Asked in linear again']);
+  } finally {
+    fs.rmSync(directory, {recursive: true, force: true});
+  }
+});
+
 test('restored replies without color keep their links, and bad saved sources stay plain text', async () => {
   const {directory, file} = historyDirectory();
   const reply = (sources, extra = {}) => ({

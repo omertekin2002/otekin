@@ -12,7 +12,8 @@ const {
 const { formatChatResponse } = require('../lib/chat-format');
 const { saveGeneratedImages } = require('../lib/chat-images');
 const { browserCommand } = require('../lib/browser');
-const { historyFileFor } = require('../lib/chat-history');
+const chatHistory = require('../lib/chat-history');
+const { historyFileFor } = chatHistory;
 const { cleanText, createTheme, startProgress, createActivityDisplay } = require('../lib/terminal');
 const { createStreamPreview } = require('../lib/stream-preview');
 const profile = require('../lib/profile');
@@ -45,7 +46,7 @@ Options:
   --non-interactive       Print text + links and exit (no prompt)
   --json                  Output profile or one-shot chat JSON and exit
   --no-open               Don't open links in a browser (print them instead)
-  --no-history            Don't load or save full-screen chat history this run
+  --no-history            Don't load or save chat history this run
   --linear                Chat line by line: no animation, each reply printed once
   --cv, --resume          Open the CV download link directly
   -s, --select <choice>   Select directly: website | linkedin | cv | chat | exit
@@ -88,8 +89,8 @@ Environment:
   NO_COLOR                Disable terminal colors
   OTEKIN_CHAT_API_URL      Override the HTTP(S) chat endpoint (no API key required)
   OTEKIN_CHAT_HEALTH_URL   Override its HTTP(S) health endpoint (defaults to /healthz)
-  OTEKIN_NO_HISTORY=1      Never load or save full-screen chat history
-  OTEKIN_HISTORY_FILE      Save full-screen chat history to this file instead
+  OTEKIN_NO_HISTORY=1      Never load or save chat history
+  OTEKIN_HISTORY_FILE      Save chat history to this file instead
 
 In a terminal, one-shot chat shows the reply as it streams in, then replaces it
 with the final answer. Ctrl+C cancels it and exits with code 130. Piped, --json
@@ -99,12 +100,14 @@ Linear chat (otekin chat --linear) reads one question per line, from the keyboar
 or piped input, and prints each finished reply once, with numbered sources and
 their URLs. It never redraws or animates. /retry sends the last message again,
 /save writes the conversation to a Markdown file, and /copy copies the latest
-reply (or saves it to a file when no clipboard works). Ctrl+C cancels a reply;
-Ctrl+C or Ctrl+D when idle, /exit or /quit ends it. A promptless "otekin chat"
-on a TERM=dumb terminal opens it automatically. It does not use saved history yet.
+reply (or saves it to a file when no clipboard works). /clear forgets the
+conversation. Ctrl+C cancels a reply; Ctrl+C or Ctrl+D when idle, /exit or /quit
+ends it. A promptless "otekin chat" on a TERM=dumb terminal opens it automatically.
 
-The full-screen chat saves its conversation and recent prompts so they come back
-next time. One-shot, --json and piped chat never read or write it.
+The full-screen and linear chats save their conversation and recent prompts in
+one file, so either picks up where the other left off; /clear deletes it.
+One-shot, --json and piped chat (including piped linear chat) never read or
+write it.
 `.trim();
 
   stream.write(help + '\n');
@@ -358,9 +361,10 @@ async function runOneShotChat(prompt, opts) {
   }
 }
 
-// Never reads or writes saved history. Resolves when the session ends; it always exits 0.
+// Shares saved history with the full-screen chat when stdin is a terminal; piped sessions never
+// touch it. Resolves when the session ends; it always exits 0.
 // /save and the /copy fallback write to the current directory.
-async function runLinearChat(firstPrompt) {
+async function runLinearChat(firstPrompt, opts) {
   const session = startLinearChat({
     input: process.stdin,
     output: process.stdout,
@@ -368,7 +372,9 @@ async function runLinearChat(firstPrompt) {
     services: { prepareRequestMessages, ensureChatServiceAwake, requestChat, assistantMessageFromResponse },
     firstPrompt,
     saveDirectory: process.cwd(),
-    copy: (text) => copyToClipboard(text)
+    copy: (text) => copyToClipboard(text),
+    historyFile: historyFileFor(opts),
+    historyStore: chatHistory
   });
   const onInterrupt = () => session.interrupt();
   process.on('SIGINT', onInterrupt);
@@ -440,7 +446,7 @@ async function main() {
         process.exitCode = 1;
         return;
       }
-      await runLinearChat(prompt);
+      await runLinearChat(prompt, opts);
       return;
     }
 
@@ -461,7 +467,7 @@ async function main() {
       term: process.env.TERM,
       nonInteractive: opts.nonInteractive
     })) {
-      await runLinearChat('');
+      await runLinearChat('', opts);
       return;
     }
 
