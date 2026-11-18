@@ -172,12 +172,18 @@ test('Pilcrow CLI dispatches installation and upgrade without entering chat', as
     const version = await invoke(['pilcrow', '--version']);
     assert.strictEqual(version.stdout, pkg.version + '\n');
     for (const args of [['pilcrow', 'export'], ['pilcrow', '--json'], ['--json', 'pilcrow'],
-      ['pilcrow', '--no-open'], ['pilcrow', '--no-history'], ['pilcrow', '--cv'],
+      ['pilcrow', '--no-open'], ['pilcrow', '--no-history'], ['pilcrow', '--cv'], ['pilcrow', '--reduced-motion'],
       ['pilcrow', '--unknown'], ['pilcrow', '--', '--upgrade'], ['--upgrade']]) {
       const result = await invoke(args);
       assert.strictEqual(result.code, 1, args.join(' '));
       assert.doesNotMatch(result.stdout, /INSTALL:/);
     }
+    const rejected = await invoke(['pilcrow', '--reduced-motion']);
+    assert.match(rejected.stderr, /^Pilcrow installation accepts only --upgrade, --help, --version, and --non-interactive\./);
+    // The environment variable is a preference, not an option, so it never blocks installation.
+    const preference = await invoke(['pilcrow'], { OTEKIN_REDUCED_MOTION: '1' });
+    assert.strictEqual(preference.code, 0);
+    assert.match(preference.stdout, /^INSTALL:/);
     const failure = await invoke(['pilcrow'], { TEST_INSTALL_FAILURE: '1' });
     assert.strictEqual(failure.code, 7);
     assert.match(failure.stderr, /Pilcrow installation failed: fixture failure/);
@@ -335,14 +341,15 @@ test('CLI accepts every known option', async () => {
     assert.strictEqual(result.stdout, `${pkg.version}\n`);
   }
 
-  for (const args of [['--non-interactive'], ['--no-interactive'], ['--no-history', '--non-interactive']]) {
+  for (const args of [['--non-interactive'], ['--no-interactive'], ['--no-history', '--non-interactive'],
+    ['--reduced-motion', '--non-interactive']]) {
     const result = await runCli(args);
     assert.strictEqual(result.code, 0, args.join(' '));
     assert.match(result.stdout, /Links:/);
     assert.strictEqual(result.stderr, '');
   }
 
-  for (const args of [['--cv', '--no-open'], ['--resume', '--no-open'], ['-s', 'cv', '--no-open'], ['--select', 'cv', '--no-open'], ['--select=cv', '--no-open']]) {
+  for (const args of [['--cv', '--no-open'], ['--resume', '--no-open'], ['cv', '--no-open', '--reduced-motion'], ['-s', 'cv', '--no-open'], ['--select', 'cv', '--no-open'], ['--select=cv', '--no-open']]) {
     const result = await runCli(args);
     assert.strictEqual(result.code, 0, args.join(' '));
     assert.match(result.stdout, /Link: https:\/\/omertekin2002\.github\.io\/resume/);
@@ -625,6 +632,52 @@ test('CLI one-shot preview follows NO_COLOR', async () => {
     });
 });
 
+const MOTION = /[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]|\d+s\b/;
+
+test('CLI one-shot --reduced-motion streams a still preview, with the flag or OTEKIN_REDUCED_MOTION', async () => {
+  const events = [
+    { type: 'tool', activity: { id: 's', tool: 'search_web', query: 'still', status: 'running' } },
+    { type: 'delta', text: 'Still provisional' },
+    1300,
+    { type: 'tool', activity: { id: 's', tool: 'search_web', query: 'still', status: 'complete' } },
+    { type: 'done', message: 'Still answer.' }
+  ];
+  for (const [args, env] of [[['chat', 'hi', '--reduced-motion'], {}], [['chat', 'hi'], { OTEKIN_REDUCED_MOTION: '1' }]]) {
+    await withServer(streamReply(events), async (endpoint) => {
+      const result = await runTtyChat(args, { OTEKIN_CHAT_API_URL: endpoint, ...env });
+      assert.strictEqual(result.code, 0, result.stderr);
+      assert.strictEqual(result.stderr, '');
+      const provisional = result.stdout.indexOf('Still provisional');
+      assert(provisional >= 0 && provisional < result.stdout.indexOf('Still answer.'));
+      // Over a second with no new text or label: the status row is written once, never ticked.
+      assert.strictEqual(result.stdout.split('… Writing').length - 1, 1);
+      assert.doesNotMatch(result.stdout, MOTION);
+      assert.strictEqual(result.screen, '\n  AI\n\nStill answer.');
+    });
+  }
+  // Without it, the same reply ticks its spinner and seconds counter.
+  await withServer(streamReply(events), async (endpoint) => {
+    const result = await runTtyChat(['chat', 'hi'], { OTEKIN_CHAT_API_URL: endpoint, OTEKIN_REDUCED_MOTION: '0' });
+    assert.strictEqual(result.code, 0);
+    assert.match(result.stdout, /[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏] Writing · 1s/);
+  });
+});
+
+test('CLI --reduced-motion leaves piped and --json one-shot output unchanged', async () => {
+  await withServer(async (request, response) => {
+    await readBody(request);
+    response.writeHead(200, { 'Content-Type': 'application/json' });
+    response.end(JSON.stringify({ message: 'A concise answer.', provider: 'fixture' }));
+  }, async (endpoint) => {
+    const piped = await runCli(['chat', 'hi', '--reduced-motion'], { OTEKIN_CHAT_API_URL: endpoint });
+    assert.strictEqual(piped.code, 0);
+    assert.strictEqual(piped.stdout, 'A concise answer.\n');
+    const json = await runTtyChat(['chat', 'hi', '--json', '--reduced-motion'], { OTEKIN_CHAT_API_URL: endpoint });
+    assert.deepStrictEqual(JSON.parse(json.stdout), { message: 'A concise answer.', provider: 'fixture' });
+    assert.strictEqual(piped.stderr + json.stderr, '');
+  });
+});
+
 test('CLI one-shot on a dumb terminal or with --json keeps the non-streaming output', async () => {
   const bodies = [];
   await withServer(async (request, response) => {
@@ -720,6 +773,20 @@ test('CLI linear chat sends a prompt argument as the first turn, then continues'
     assert.deepStrictEqual(bodies.map((body) => body.messages.at(-1).content), ['first', 'second']);
     assert.strictEqual(bodies[1].messages[0].content, 'first');
   });
+});
+
+test('CLI linear chat accepts --reduced-motion and prints exactly what it prints without it', async () => {
+  const outputs = [];
+  for (const args of [['chat', '--linear', 'first'], ['chat', '--linear', '--reduced-motion', 'first']]) {
+    await withServer(linearGateway([], () => ({ events: [{ type: 'done', message: 'Still answer.', model: 'fixture-model' }] })),
+      async (endpoint) => {
+        const result = await runCli(args, { OTEKIN_CHAT_API_URL: endpoint }, [], '');
+        assert.strictEqual(result.code, 0, args.join(' '));
+        outputs.push(result.stdout + result.stderr);
+      });
+  }
+  assert.match(outputs[0], /Still answer\./);
+  assert.strictEqual(outputs[1], outputs[0]);
 });
 
 test('CLI linear chat sends a prompt argument that looks like a command as a question', async () => {
@@ -900,4 +967,11 @@ test('CLI help documents linear chat and its TERM=dumb behavior', async () => {
   assert.match(help.stdout, /piped linear chat\) never read or\s+write it/);
   assert.match(help.stdout, /\/clear forgets the\s+conversation/);
   assert.doesNotMatch(help.stdout, /does not use saved history yet/);
+});
+
+test('CLI help documents --reduced-motion and OTEKIN_REDUCED_MOTION', async () => {
+  const help = await runCli(['--help']);
+  assert.match(help.stdout, /Options:[^]*--reduced-motion\s+Show a static status instead of spinners and timers[^]*Environment:/);
+  assert.match(help.stdout, /Environment:[^]*OTEKIN_REDUCED_MOTION=1\s+Same as --reduced-motion \(0 or empty leaves motion on\)/);
+  assert.match(help.stdout, /no spinner or seconds counter/);
 });

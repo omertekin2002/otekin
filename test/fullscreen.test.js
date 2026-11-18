@@ -722,6 +722,77 @@ test('cancel, /clear, and request errors discard provisional text, including lat
   }
 });
 
+// Spinner frames, or an elapsed-seconds counter such as "· 12s".
+const MOTION = /[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]|· \d+s/;
+const statusRow = screen => screen.split('\n').find(line => /^ +… /.test(line));
+
+test('reduced motion keeps the status row still and shows every status change', async () => {
+  const {state, services} = streamingServices();
+  const ui = await terminalApp({services, options: {reducedMotion: true}});
+  try {
+    await ui.type('Question\r');
+    await waitFor(() => Boolean(state.onDelta));
+    await ui.expectScreen(/… Thinking/);
+    await ui.settle();
+    const row = statusRow(ui.screen());
+    assert.match(row, /^ +… Thinking$/);
+    const before = ui.raw();
+    await sleep(1500);
+    // Nothing changed, so nothing was drawn: no spinner frame, no ticking counter.
+    assert.strictEqual(ui.raw(), before);
+    assert.strictEqual(statusRow(ui.screen()), row);
+    state.onActivity({id: 'search', tool: 'search_web', query: 'motion laws', status: 'running'});
+    await ui.expectScreen(/… Searching {2}motion laws/);
+    state.onActivity({id: 'search', tool: 'search_web', query: 'motion laws', status: 'complete'});
+    await ui.expectScreen(/… Thinking/);
+    state.onDelta('Provisional ');
+    state.onDelta('reduced text');
+    await ui.expectScreen(/WRITING · provisional[^]*Provisional reduced text[^]*… Writing/);
+    state.resolve({message: 'Canonical still answer.'});
+    await ui.expectScreen(/Canonical still answer\./);
+    const done = await ui.expectScreen(/Ready when you are/);
+    assert.doesNotMatch(done, /Provisional|WRITING|^ +… /m);
+
+    state.onDelta = null;
+    await ui.type('Cancel me\r');
+    await waitFor(() => Boolean(state.onDelta));
+    await ui.expectScreen(/… Thinking/);
+    await ui.type('\u001b');
+    await ui.expectScreen(/Cancelled\. Ready for your next message\./);
+
+    state.onDelta = null;
+    await ui.type('Fail me\r');
+    await waitFor(() => Boolean(state.onDelta));
+    state.reject(new Error('Service unavailable'));
+    await ui.expectScreen(/Try again when you’re ready/);
+    assert.doesNotMatch(ui.raw(), MOTION);
+  } finally {
+    await ui.close();
+  }
+});
+
+test('OTEKIN_REDUCED_MOTION turns reduced motion on, and 0 or empty leaves the spinner', async () => {
+  for (const [value, reduced] of /** @type {Array<[string, boolean]>} */ ([['1', true], ['0', false], ['', false]])) {
+    const {state, services} = streamingServices();
+    const ui = await terminalApp({services, env: {OTEKIN_REDUCED_MOTION: value}});
+    try {
+      await ui.type('Question\r');
+      await waitFor(() => Boolean(state.onDelta));
+      if (reduced) {
+        await ui.expectScreen(/… Thinking/);
+        await sleep(300);
+        assert.doesNotMatch(ui.raw(), MOTION, value);
+      } else {
+        await ui.expectScreen(/[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏] Thinking · \d+s/);
+      }
+      state.resolve({message: 'Answer.'});
+      await ui.expectScreen(/Ready when you are/);
+    } finally {
+      await ui.close();
+    }
+  }
+});
+
 test('scrolled-up conversations stay in place while provisional text grows', async () => {
   const {state, services} = streamingServices();
   const ui = await terminalApp({services});
