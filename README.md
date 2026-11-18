@@ -143,6 +143,18 @@ For each question, linear chat prints one `Researching…` line, at most one `Wa
 - Color is used only for the header and model name, and only on a color terminal without `NO_COLOR`.
 - `--json` is not supported with linear chat.
 
+### Reduced motion
+
+To keep the full-screen workspace without animation, start it with `--reduced-motion`, or set `OTEKIN_REDUCED_MOTION=1` to make it the default (`0` or an empty value leaves motion on):
+
+```bash
+npx otekin --reduced-motion
+npx otekin chat "What happened today?" --reduced-motion
+OTEKIN_REDUCED_MOTION=1 npx otekin
+```
+
+While a reply is in progress, the status line shows a static marker and what is happening, such as `… Thinking` or `… Searching  EU AI Act changes`, with no spinner and no seconds counter. It changes only when that text does: waking the service, research, each tool, writing, and the final ready, cancelled or failed notice. Provisional reply text still streams in, but it is redrawn at most once a second, and the canonical answer replaces it as usual. One-shot chat in a terminal does the same for its progress line and stream preview. Piped and `--json` output, and linear chat, which never animates, are unchanged. `--reduced-motion` is accepted with the profile commands and `--linear`, where it changes nothing, but not with `otekin pilcrow`.
+
 When the service has optional image generation enabled, ask for an image in the same chat. Normal output saves generated images as PNG files in a temporary `otekin-images-*` directory and prints their paths. These files remain until you or the operating system removes them. `--json` preserves the inline image data without writing files. Image bytes are replaced with text placeholders in conversation history.
 
 ## Options
@@ -151,6 +163,7 @@ When the service has optional image generation enabled, ask for an image in the 
 - `--no-open`: print a selected URL instead of opening it in a browser.
 - `--no-history`: don't load or save the saved chat history (full-screen or linear) for this run. An existing history file is left untouched.
 - `--linear`: with `chat`, hold a line-based conversation that never redraws or animates and prints each reply once. See [Linear chat](#linear-chat).
+- `--reduced-motion`: replace spinners and ticking timers with a static status in the full-screen workspace and one-shot chat. `OTEKIN_REDUCED_MOTION=1` does the same for every run. See [Reduced motion](#reduced-motion).
 - `--cv`, `--resume`: open the CV link directly.
 - `--select <website|linkedin|cv|chat|exit>`: choose an option directly.
 - `--json`: output profile JSON, or preserve the complete response object for a one-shot chat.

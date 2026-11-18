@@ -1,7 +1,9 @@
 'use strict';
 
 const assert = require('assert');
-const { cleanText, createTheme, clipLine, createActivityDisplay, startProgress } = require('../lib/terminal');
+const {
+  PROGRESS_FRAMES, cleanText, createTheme, clipLine, createActivityDisplay, reducedMotionFor, startProgress
+} = require('../lib/terminal');
 
 test('terminal styling respects pipes, NO_COLOR, and dumb terminals', () => {
   assert.strictEqual(createTheme({ isTTY: false }, {}).accent('text'), 'text');
@@ -39,6 +41,81 @@ test('progress stays within narrow terminal widths and cleans up its timer', asy
   if (process.env.TERM !== 'dumb') {
     assert.match(cleanText(output), /Searching/);
     assert.doesNotMatch(output, /\n/);
+  }
+});
+
+test('reduced motion is on for --reduced-motion or a set OTEKIN_REDUCED_MOTION, and off otherwise', () => {
+  assert.strictEqual(reducedMotionFor({ reducedMotion: true }, {}), true);
+  for (const value of ['1', 'yes', 'true', 'on']) {
+    assert.strictEqual(reducedMotionFor({}, { OTEKIN_REDUCED_MOTION: value }), true, value);
+  }
+  for (const value of [undefined, '', ' ', '0', 'false', 'no', 'off']) {
+    assert.strictEqual(reducedMotionFor({}, { OTEKIN_REDUCED_MOTION: value }), false, String(value));
+  }
+  assert.strictEqual(reducedMotionFor(null, {}), false);
+});
+
+// A fake terminal stderr that records each write.
+function recordingStream(columns = 60) {
+  const writes = [];
+  return { writes, stream: { isTTY: true, columns, write: text => { writes.push(text); } } };
+}
+
+test('reduced-motion progress draws a static line once and redraws only when its label changes', async () => {
+  if (process.env.TERM === 'dumb') return;
+  const { writes, stream } = recordingStream();
+  let label = 'Thinking';
+  const stop = startProgress(stream, () => label, { reducedMotion: true });
+  try {
+    await new Promise(resolve => setTimeout(resolve, 50));
+    const first = writes.join('');
+    assert.match(first, /… Thinking/);
+    // Several 100 ms ticks pass with nothing new: nothing is written.
+    await new Promise(resolve => setTimeout(resolve, 1100));
+    assert.strictEqual(writes.join(''), first);
+    label = 'Searching  laws';
+    await new Promise(resolve => setTimeout(resolve, 150));
+    const second = writes.join('').slice(first.length);
+    assert.match(second, /… Searching {2}laws/);
+    await new Promise(resolve => setTimeout(resolve, 300));
+    assert.strictEqual(writes.join(''), first + second);
+    const all = cleanText(writes.join(''));
+    assert.doesNotMatch(all, new RegExp(`[${PROGRESS_FRAMES.join('')}]|\\d+s`));
+  } finally {
+    stop();
+  }
+});
+
+test('progress keeps its spinner and seconds counter without reduced motion', async () => {
+  if (process.env.TERM === 'dumb') return;
+  const { writes, stream } = recordingStream();
+  const stop = startProgress(stream, 'Thinking');
+  await new Promise(resolve => setTimeout(resolve, 350));
+  stop();
+  const lines = writes.filter(text => /Thinking/.test(text)).map(cleanText);
+  assert(lines.length >= 3, `draws: ${lines.length}`);
+  assert.match(lines[0], new RegExp(`^ {2}${PROGRESS_FRAMES[0]} Thinking · 0s$`));
+  assert.match(lines[1], new RegExp(`^ {2}${PROGRESS_FRAMES[1]} Thinking · 0s$`));
+});
+
+test('reduced-motion activity display shows static tool labels and keeps completed lines', async () => {
+  if (process.env.TERM === 'dumb') return;
+  const { writes, stream } = recordingStream();
+  const display = createActivityDisplay(stream, { reducedMotion: true });
+  try {
+    await new Promise(resolve => setTimeout(resolve, 50));
+    display.onActivity({ id: 's', tool: 'search_web', query: 'courts', status: 'running' });
+    await new Promise(resolve => setTimeout(resolve, 250));
+    const count = writes.length;
+    await new Promise(resolve => setTimeout(resolve, 500));
+    assert.strictEqual(writes.length, count);
+    display.onActivity({ id: 's', tool: 'search_web', query: 'courts', status: 'complete' });
+    await new Promise(resolve => setTimeout(resolve, 50));
+    const output = cleanText(writes.join(''));
+    assert.match(output, /… Thinking[^]*… Searching {2}courts[^]*✓ Search {2}courts\n[^]*… Thinking/);
+    assert.doesNotMatch(output, new RegExp(`[${PROGRESS_FRAMES.join('')}]|\\d+s`));
+  } finally {
+    display.stop();
   }
 });
 

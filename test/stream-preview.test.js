@@ -3,8 +3,10 @@
 const assert = require('assert');
 const { Writable } = require('stream');
 const { Terminal } = require('@xterm/headless');
-const { createTheme, createActivityDisplay } = require('../lib/terminal');
-const { createStreamPreview, provisionalText, REDRAW_INTERVAL_MS } = require('../lib/stream-preview');
+const { PROGRESS_FRAMES, createTheme, createActivityDisplay } = require('../lib/terminal');
+const {
+  createStreamPreview, provisionalText, REDRAW_INTERVAL_MS, REDUCED_MOTION_TEXT_INTERVAL_MS
+} = require('../lib/stream-preview');
 
 const SGR = /\u001b\[[0-9;]*m/;
 const PROMPT = '$ otekin chat "hi"';
@@ -258,6 +260,66 @@ test('stream preview never erases output above it after an emoji reply reflows',
     assert.doesNotMatch(await term.screen(), /界/);
   } finally {
     preview.clear();
+    term.dispose();
+  }
+});
+
+const MOTION = new RegExp(`[${PROGRESS_FRAMES.join('')}]|\\d+s\\b`);
+
+test('reduced-motion preview shows a static status row and stays still between changes', async () => {
+  const term = fakeTerminal({ columns: 50 });
+  let label = null;
+  const preview = await createStreamPreview(term.stream, {
+    theme: createTheme(term.stream, {}), reducedMotion: true, statusLabel: () => label
+  });
+  try {
+    preview.update('First words');
+    await tick();
+    assert.strictEqual(await term.screen(), `${PROMPT}\n\n  AI\n\n  First words\n  … Writing`);
+    // With no new text or label, many redraw intervals pass without a single write.
+    const still = term.raw();
+    await tick(1200);
+    assert.strictEqual(term.raw(), still);
+    // A new label rewrites only the status row, once.
+    label = 'Reading page  example.com';
+    await tick();
+    assert.match(await term.screen(), /First words\n {2}… Reading page {2}example\.com$/);
+    const relabelled = term.raw();
+    assert.strictEqual(relabelled.slice(still.length).split('… Reading page').length - 1, 1);
+    await tick(300);
+    assert.strictEqual(term.raw(), relabelled);
+    assert.doesNotMatch(term.raw(), MOTION);
+    preview.clear();
+    assert.strictEqual(await term.screen(), PROMPT);
+  } finally {
+    preview.clear();
+    term.dispose();
+  }
+});
+
+test('reduced-motion preview redraws new text at most once a second and still shows all of it', async () => {
+  const term = fakeTerminal();
+  const reduced = await createStreamPreview(term.stream, { theme: createTheme(term.stream, {}), reducedMotion: true });
+  try {
+    const started = Date.now();
+    reduced.update('d0 ');
+    const deadline = started + REDUCED_MOTION_TEXT_INTERVAL_MS + 400;
+    let index = 1;
+    while (Date.now() < deadline) {
+      reduced.update(`d${index++} `);
+      await tick(REDRAW_INTERVAL_MS);
+    }
+    const last = index - 1;
+    // The first delta draws at once; the rest arrive in at most one redraw a second.
+    const erases = term.raw().split('\u001b[J').length - 1;
+    assert(erases >= 1 && erases <= 2, `redraws: ${erases}`);
+    await tick(REDUCED_MOTION_TEXT_INTERVAL_MS + REDRAW_INTERVAL_MS * 2);
+    assert.match(await term.screen(), new RegExp(`d${last}\\n {2}… Writing$`));
+    assert.doesNotMatch(term.raw(), MOTION);
+    reduced.clear();
+    assert.strictEqual(await term.screen(), PROMPT);
+  } finally {
+    reduced.clear();
     term.dispose();
   }
 });
