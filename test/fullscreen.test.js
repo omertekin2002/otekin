@@ -1433,6 +1433,173 @@ test('/retry after a reply replaces that turn in the request, transcript and sav
   }
 });
 
+const requestContents = request => request.map(message => message.content);
+
+test('a failed replacing /retry keeps the previous answer, its saved history and its context', async () => {
+  const {directory, file} = historyDirectory();
+  const requests = [];
+  // Each request's outcome in order: two answers, a failed /retry, a second /retry, then a follow-up.
+  const outcomes = [
+    {message: 'First answer.'},
+    {message: 'Second answer.'},
+    new client.ChatApiError('Chat service request timed out.', {code: 'request_timeout', requestId: 'retry-failure'}),
+    {message: 'Second answer, retried.'},
+    {message: 'Follow-up answer.'}
+  ];
+  const services = {
+    ...client, ensureChatServiceAwake: async () => {},
+    async requestChat(messages) {
+      const outcome = outcomes[requests.push(messages) - 1];
+      if (outcome instanceof Error) throw outcome;
+      return outcome;
+    }
+  };
+  try {
+    const ui = await terminalApp({services, historyFile: file});
+    try {
+      await ui.type('First question\r');
+      await waitFor(() => ui.screen().includes('First answer.'));
+      await ui.type('Second question\r');
+      await waitFor(() => ui.screen().includes('Second answer.'));
+      await waitFor(() => chatHistory.loadHistory(file)?.history[3]?.content === 'Second answer.');
+      const before = checksum(file);
+
+      await ui.type('/retry\r');
+      await ui.expectScreen(/Chat service request timed out\. \(Request ID: retry-failure\)/);
+      assert.deepStrictEqual(requests[2], requests[1], 'the retry resends the second turn');
+      assert.match(ui.screen(), /CHAT ERROR/);
+      assert.match(ui.screen(), /Second answer\./, 'the answered turn stays after a failed retry');
+      assert.strictEqual(ui.screen().match(/Second question/g).length, 1);
+      await ui.settle();
+      assert.strictEqual(checksum(file), before, 'a failed retry leaves the saved history byte for byte');
+
+      // The answered turn is still the one /retry replaces.
+      await ui.type('/retry\r');
+      await waitFor(() => ui.screen().includes('Second answer, retried.'));
+      assert.deepStrictEqual(requests[3], requests[1], 'a retry after the failure resends the original second turn');
+      assert.doesNotMatch(ui.screen(), /Second answer\./);
+      assert.strictEqual(ui.screen().match(/Second question/g).length, 1);
+      await waitFor(() => chatHistory.loadHistory(file)?.history[3]?.content === 'Second answer, retried.');
+      assert.deepStrictEqual(requestContents(chatHistory.loadHistory(file).history),
+        ['First question', 'First answer.', 'Second question', 'Second answer, retried.']);
+
+      await ui.type('Follow-up question\r');
+      await waitFor(() => ui.screen().includes('Follow-up answer.'));
+      assert.deepStrictEqual(requestContents(requests[4]),
+        ['First question', 'First answer.', 'Second question', 'Second answer, retried.', 'Follow-up question']);
+      assert.strictEqual(requests.length, 5);
+    } finally {
+      await ui.close();
+    }
+  } finally {
+    fs.rmSync(directory, {recursive: true, force: true});
+  }
+});
+
+test('a cancelled replacing /retry keeps the previous answer and never commits provisional or late text', async () => {
+  const {directory, file} = historyDirectory();
+  const requests = [];
+  /** @type {{resolve: (reply: object) => void, onDelta: (text: string) => void, signal: AbortSignal}} */
+  let retry;
+  const services = {
+    ...client, ensureChatServiceAwake: async () => {},
+    requestChat(messages, options) {
+      requests.push(messages);
+      if (requests.length !== 3) return Promise.resolve({message: ['First answer.', 'Second answer.', '', 'Follow-up answer.'][requests.length - 1]});
+      // A reply that finishes just after it was cancelled: it ignores the abort and resolves late.
+      return new Promise(resolve => {retry = {resolve, onDelta: options.onDelta, signal: options.signal};});
+    }
+  };
+  try {
+    const ui = await terminalApp({services, historyFile: file});
+    try {
+      await ui.type('First question\r');
+      await waitFor(() => ui.screen().includes('First answer.'));
+      await ui.type('Second question\r');
+      await waitFor(() => ui.screen().includes('Second answer.'));
+      await waitFor(() => chatHistory.loadHistory(file)?.history[3]?.content === 'Second answer.');
+      const before = checksum(file);
+
+      await ui.type('/retry\r');
+      await waitFor(() => Boolean(retry));
+      assert.deepStrictEqual(requests[2], requests[1], 'the retry resends the second turn');
+      retry.onDelta('Provisional retry text');
+      await ui.expectScreen(/Provisional retry text/);
+      assert.match(ui.screen(), /Second answer\./, 'the answered turn stays while its replacement streams');
+      await ui.type('\u001b');
+      await waitFor(() => retry.signal.aborted);
+      retry.onDelta(' late delta');
+      retry.resolve({message: 'Late retry answer.'});
+      await ui.expectScreen(/Cancelled\. Ready for your next message\./);
+      await ui.settle();
+      assert.doesNotMatch(ui.screen(), /Provisional retry text|late delta|Late retry answer/);
+      assert.match(ui.screen(), /Second answer\./);
+      assert.strictEqual(ui.screen().match(/Second question/g).length, 1);
+      assert.strictEqual(checksum(file), before, 'a cancelled retry leaves the saved history byte for byte');
+
+      await ui.type('Follow-up question\r');
+      await waitFor(() => ui.screen().includes('Follow-up answer.'));
+      assert.deepStrictEqual(requestContents(requests[3]),
+        ['First question', 'First answer.', 'Second question', 'Second answer.', 'Follow-up question']);
+      await waitFor(() => chatHistory.loadHistory(file)?.history[5]?.content === 'Follow-up answer.');
+      assert.doesNotMatch(fs.readFileSync(file, 'utf8'), /Provisional retry text|late delta|Late retry answer/);
+    } finally {
+      await ui.close();
+    }
+  } finally {
+    fs.rmSync(directory, {recursive: true, force: true});
+  }
+});
+
+test('a long conversation stays bounded in the transcript, saved history and requests, and scrolls end to end', async () => {
+  const {directory, file} = historyDirectory();
+  const turns = 60;
+  const label = turn => String(turn).padStart(3, '0');
+  const requests = [];
+  const services = {
+    ...client, ensureChatServiceAwake: async () => {},
+    requestChat: async messages => ({message: `Answer ${label(requests.push(messages))}.`})
+  };
+  // Every transcript entry the conversation produced, oldest first.
+  const entries = Array.from({length: turns}, (_,index) => [`Question ${label(index + 1)}`, `Answer ${label(index + 1)}.`]).flat();
+  try {
+    const ui = await terminalApp({services, historyFile: file});
+    try {
+      for (let turn = 1; turn <= turns; turn += 1) {
+        await ui.type(`Question ${label(turn)}\r`);
+        await waitFor(() => ui.screen().includes(`Answer ${label(turn)}.`), `turn ${turn} was not answered in time`);
+      }
+      assert.strictEqual(requests.length, turns);
+
+      await waitFor(() => chatHistory.loadHistory(file)?.messages.at(-1)?.content === entries.at(-1));
+      const saved = chatHistory.loadHistory(file);
+      assert.strictEqual(saved.messages.length, chatHistory.MAX_MESSAGES);
+      assert.deepStrictEqual(requestContents(saved.messages), entries.slice(-chatHistory.MAX_MESSAGES));
+
+      const last = requests.at(-1);
+      assert(last.length > 2 && last.length <= client.MAX_MESSAGES, `the final request sent ${last.length} messages`);
+      assert.deepStrictEqual(requestContents(last), entries.slice(0, -1).slice(-last.length),
+        'the final request sends the newest turns, ending with the newest question');
+
+      // The oldest retained entry is the first question after the 100-entry bound.
+      const oldest = entries.at(-chatHistory.MAX_MESSAGES);
+      assert.strictEqual(oldest, `Question ${label(turns - chatHistory.MAX_MESSAGES / 2 + 1)}`);
+      await ui.type('\u001b[1;5H');
+      await ui.expectScreen(new RegExp(oldest));
+      assert.doesNotMatch(ui.screen(), new RegExp(entries.at(-chatHistory.MAX_MESSAGES - 1).replace('.', '\\.')));
+      assert.doesNotMatch(ui.screen(), /Question 0(?:0\d|10)\b|Answer 060\./);
+      await ui.type('\u001b[1;5F');
+      await ui.expectScreen(/Answer 060\./);
+      assert.match(ui.screen(), /│ › Ask anything/);
+      assert.doesNotMatch(ui.screen(), new RegExp(oldest));
+    } finally {
+      await ui.close();
+    }
+  } finally {
+    fs.rmSync(directory, {recursive: true, force: true});
+  }
+});
+
 test('/retry with nothing to retry, including after /clear, sends nothing', async () => {
   const requests = [];
   const services = {
