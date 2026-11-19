@@ -115,7 +115,7 @@ Before each chat request, the CLI calls the service's lightweight `GET /healthz`
 
 Research citations are shown as a compact source row instead of raw redirect URLs. Source labels preserve the gateway's stable citation numbers, so gaps can remain as older sources retire. In supported terminals, each numbered source label is clickable. Use `--json` when you need the complete source URLs, snippets, and gateway metadata.
 
-Interactive history retains the gateway's bounded tool results and source catalog so follow-up questions can use the same evidence and source numbers, including after a restart. Older complete turns are trimmed to stay within the service's character and request-byte limits.
+Interactive history retains the gateway's bounded tool results and source catalog so follow-up questions can use the same evidence and source numbers, including after a restart. Older complete turns are trimmed to stay within the service's character and request-byte limits. The first time a follow-up leaves out older turns, full-screen and linear chat say so once in that conversation: those turns stay on screen and in `/save`, but the assistant no longer receives them. `/clear` starts the count again, and a restored conversation can show the notice again on its first follow-up.
 
 ### Linear chat
 
