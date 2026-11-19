@@ -9,6 +9,7 @@ const {
   ChatApiError,
   checkChatService,
   ensureChatServiceAwake,
+  omittedTurns,
   prepareRequestMessages,
   requestChat
 } = require('../lib/chat-client');
@@ -375,6 +376,63 @@ test('prepareRequestMessages drops the oldest complete pairs at character limits
   assert.strictEqual(result.length % 2, 1);
   assert.strictEqual(result[0].content[0], '8');
   assert.deepStrictEqual(result[result.length - 1], { role: 'user', content: 'latest' });
+});
+
+function turns(count, size = 0) {
+  const history = [];
+  for (let index = 0; index < count; index += 1) {
+    history.push(
+      { role: 'user', content: size ? String(index).padEnd(size, 'u') : `user-${index}` },
+      { role: 'assistant', content: size ? String(index).padEnd(size, 'a') : `assistant-${index}` }
+    );
+  }
+  return history;
+}
+
+test('omittedTurns is zero while a request carries every earlier turn', () => {
+  assert.strictEqual(omittedTurns([], prepareRequestMessages([], 'first')), 0);
+  const history = turns(14);
+  const messages = prepareRequestMessages(history, 'latest');
+  assert.strictEqual(messages.length, MAX_MESSAGES - 1);
+  assert.strictEqual(omittedTurns(history, messages), 0);
+  // Unanswered questions, notices, errors and tool lines are not turns the request could carry.
+  const transcript = [{ role: 'notice', content: 'Restored' }, { role: 'user', content: 'failed' },
+    { role: 'error', content: 'Chat error' }].concat(history.slice(0, 2), { role: 'tools', content: 'search' },
+    history.slice(2), { role: 'user', content: 'cancelled' });
+  assert.strictEqual(omittedTurns(transcript, messages), 0);
+  assert.strictEqual(omittedTurns(null, null), 0);
+});
+
+test('omittedTurns counts the oldest turns dropped at the message limit', () => {
+  const fifteen = turns(15);
+  assert.strictEqual(omittedTurns(fifteen, prepareRequestMessages(fifteen, 'latest')), 1);
+  const twenty = turns(20);
+  const messages = prepareRequestMessages(twenty, 'latest');
+  assert.strictEqual(messages[0].content, 'user-6');
+  assert.strictEqual(omittedTurns(twenty, messages), 6);
+});
+
+test('omittedTurns counts the oldest turns dropped at the character budget', () => {
+  const history = turns(4, MAX_MESSAGE_CHARACTERS);
+  assert.strictEqual(omittedTurns(history, prepareRequestMessages(history, 'latest')), 0);
+  const long = turns(15, MAX_MESSAGE_CHARACTERS);
+  const messages = prepareRequestMessages(long, 'latest');
+  assert(messages.length < MAX_MESSAGES);
+  assert.strictEqual(messages[0].content[0], '8');
+  assert.strictEqual(omittedTurns(long, messages), 8);
+});
+
+test('omittedTurns compares a restored transcript with its already trimmed request history', () => {
+  // Large replies trimmed the last request to its newest turns; the transcript still shows them all.
+  const transcript = turns(10, MAX_MESSAGE_CHARACTERS);
+  const last = prepareRequestMessages(transcript.slice(0, -2), transcript[transcript.length - 2].content);
+  assert.strictEqual(last[0].content[0], '3');
+  // Saved request history is that request plus its reply: the oldest turns are already gone.
+  const saved = last.concat(transcript[transcript.length - 1]);
+  const messages = prepareRequestMessages(saved, 'Follow up');
+  assert.strictEqual(messages.length, saved.length + 1, 'the follow-up keeps every saved turn');
+  assert.strictEqual(omittedTurns(saved, messages), 0, 'request history alone cannot tell');
+  assert.strictEqual(omittedTurns(transcript, messages), 3);
 });
 
 test('a failed request does not mutate committed conversation history', async () => {

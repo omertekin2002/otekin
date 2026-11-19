@@ -722,6 +722,77 @@ test('cancel, /clear, and request errors discard provisional text, including lat
   }
 });
 
+// Spinner frames, or an elapsed-seconds counter such as "· 12s".
+const MOTION = /[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]|· \d+s/;
+const statusRow = screen => screen.split('\n').find(line => /^ +… /.test(line));
+
+test('reduced motion keeps the status row still and shows every status change', async () => {
+  const {state, services} = streamingServices();
+  const ui = await terminalApp({services, options: {reducedMotion: true}});
+  try {
+    await ui.type('Question\r');
+    await waitFor(() => Boolean(state.onDelta));
+    await ui.expectScreen(/… Thinking/);
+    await ui.settle();
+    const row = statusRow(ui.screen());
+    assert.match(row, /^ +… Thinking$/);
+    const before = ui.raw();
+    await sleep(1500);
+    // Nothing changed, so nothing was drawn: no spinner frame, no ticking counter.
+    assert.strictEqual(ui.raw(), before);
+    assert.strictEqual(statusRow(ui.screen()), row);
+    state.onActivity({id: 'search', tool: 'search_web', query: 'motion laws', status: 'running'});
+    await ui.expectScreen(/… Searching {2}motion laws/);
+    state.onActivity({id: 'search', tool: 'search_web', query: 'motion laws', status: 'complete'});
+    await ui.expectScreen(/… Thinking/);
+    state.onDelta('Provisional ');
+    state.onDelta('reduced text');
+    await ui.expectScreen(/WRITING · provisional[^]*Provisional reduced text[^]*… Writing/);
+    state.resolve({message: 'Canonical still answer.'});
+    await ui.expectScreen(/Canonical still answer\./);
+    const done = await ui.expectScreen(/Ready when you are/);
+    assert.doesNotMatch(done, /Provisional|WRITING|^ +… /m);
+
+    state.onDelta = null;
+    await ui.type('Cancel me\r');
+    await waitFor(() => Boolean(state.onDelta));
+    await ui.expectScreen(/… Thinking/);
+    await ui.type('\u001b');
+    await ui.expectScreen(/Cancelled\. Ready for your next message\./);
+
+    state.onDelta = null;
+    await ui.type('Fail me\r');
+    await waitFor(() => Boolean(state.onDelta));
+    state.reject(new Error('Service unavailable'));
+    await ui.expectScreen(/Try again when you’re ready/);
+    assert.doesNotMatch(ui.raw(), MOTION);
+  } finally {
+    await ui.close();
+  }
+});
+
+test('OTEKIN_REDUCED_MOTION turns reduced motion on, and 0 or empty leaves the spinner', async () => {
+  for (const [value, reduced] of /** @type {Array<[string, boolean]>} */ ([['1', true], ['0', false], ['', false]])) {
+    const {state, services} = streamingServices();
+    const ui = await terminalApp({services, env: {OTEKIN_REDUCED_MOTION: value}});
+    try {
+      await ui.type('Question\r');
+      await waitFor(() => Boolean(state.onDelta));
+      if (reduced) {
+        await ui.expectScreen(/… Thinking/);
+        await sleep(300);
+        assert.doesNotMatch(ui.raw(), MOTION, value);
+      } else {
+        await ui.expectScreen(/[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏] Thinking · \d+s/);
+      }
+      state.resolve({message: 'Answer.'});
+      await ui.expectScreen(/Ready when you are/);
+    } finally {
+      await ui.close();
+    }
+  }
+});
+
 test('scrolled-up conversations stay in place while provisional text grows', async () => {
   const {state, services} = streamingServices();
   const ui = await terminalApp({services});
@@ -899,6 +970,80 @@ test('restored replies keep their clickable sources, /save links and /retry repl
     } finally {
       await third.close();
     }
+  } finally {
+    fs.rmSync(directory, {recursive: true, force: true});
+  }
+});
+
+// Runs one interactive linear chat session to the end of its input and returns what it printed.
+async function linearSession(lines, options) {
+  const {startLinearChat} = require('../lib/linear-chat');
+  const input = new PassThrough();
+  const output = new PassThrough();
+  let out = '';
+  output.on('data', chunk => { out += chunk.toString(); });
+  const chat = startLinearChat({input, output, color: false, echo: true, interactive: true, saveImages: response => response, ...options});
+  for (const line of lines) {
+    input.write(line + '\n');
+    // Each line waits for the prompt, so commands run after the reply before them.
+    await waitFor(() => out.endsWith('You: ') && out.split('You: ').length - 1 > lines.indexOf(line) + 1);
+  }
+  input.end();
+  await chat.finished;
+  return out;
+}
+
+test('linear and full-screen chat continue each other’s saved conversation', async () => {
+  const {directory, file} = historyDirectory();
+  const saveDirectory = path.join(directory, 'saved');
+  fs.mkdirSync(saveDirectory);
+  const replies = [
+    {message: 'Linear answer [1].', model: 'linear-model', webSources: [{number: 1, title: 'Linear source', url: 'https://example.com/linear'}]},
+    {message: 'Full-screen answer [2].', model: 'screen-model', webSources: [{number: 2, title: 'Screen source', url: 'https://example.com/screen'}]},
+    {message: 'Last answer.', model: 'linear-model'}
+  ];
+  const requests = [];
+  const services = {
+    ...client, ensureChatServiceAwake: async () => {},
+    requestChat: async messages => {
+      requests.push(messages);
+      return replies[requests.length - 1];
+    }
+  };
+  try {
+    const first = await linearSession(['Asked in linear'], {services, historyFile: file, now: () => Date.UTC(2026, 10, 16, 9, 5)});
+    assert.doesNotMatch(first, /Continuing/);
+    assert(fs.existsSync(file));
+
+    const screen = await terminalApp({columns: 80, services, historyFile: file, saveDirectory});
+    try {
+      assert.match(screen.screen(), /Restored your last conversation/);
+      assert.match(screen.screen(), /YOU\n\s*Asked in linear/);
+      assert.match(screen.screen(), /linear-model · [\w ]*\d{2}:05\n\s*Linear answer \[1\]\.\n\s*\n\s*Sources: \[1\] Linear source/);
+      assert.deepStrictEqual(terminalLinks(screen.raw()), ['https://example.com/linear [1] Linear source']);
+      await screen.type('\u001b[A');
+      await screen.expectScreen(/│ › Asked in linear/);
+      await screen.type('\u0015Asked in full screen\r');
+      await waitFor(() => screen.screen().includes('Full-screen answer [2].'));
+      assert.deepStrictEqual(requests[1].map(message => message.content.split('\n')[0]),
+        ['Asked in linear', 'Linear answer [1].', 'Asked in full screen']);
+      assert.deepStrictEqual(requests[1][1].webSources, replies[0].webSources);
+      await waitFor(() => chatHistory.loadHistory(file)?.messages.filter(message => message.role === 'assistant').length === 2);
+    } finally {
+      await screen.close();
+    }
+
+    const last = await linearSession(['Asked in linear again', '/save'], {services, historyFile: file, saveDirectory});
+    assert.strictEqual(last.split('Continuing your saved conversation (2 questions).').length - 1, 1);
+    assert.doesNotMatch(last, /Linear answer|Full-screen answer/, 'restored replies are not printed again');
+    assert.deepStrictEqual(requests[2].map(message => message.content.split('\n')[0]),
+      ['Asked in linear', 'Linear answer [1].', 'Asked in full screen', 'Full-screen answer [2].', 'Asked in linear again']);
+    const [saved] = fs.readdirSync(saveDirectory);
+    const markdown = fs.readFileSync(path.join(saveDirectory, saved), 'utf8');
+    assert.match(markdown, /## linear-model · 2026-11-16 \d{2}:05\n\nLinear answer \[1\]\.\n\nSources: \[\\\[1\\\] Linear source\]\(https:\/\/example\.com\/linear\)\n/);
+    assert.match(markdown, /## screen-model · \d{4}-\d{2}-\d{2} \d{2}:\d{2}\n\nFull-screen answer \[2\]\.\n\nSources: \[\\\[2\\\] Screen source\]\(https:\/\/example\.com\/screen\)\n/);
+    assert.match(markdown, /## You\n\nAsked in linear again\n\n## linear-model · .*\n\nLast answer\.\n$/);
+    assert.deepStrictEqual(chatHistory.loadHistory(file).prompts, ['Asked in linear', 'Asked in full screen', 'Asked in linear again']);
   } finally {
     fs.rmSync(directory, {recursive: true, force: true});
   }
@@ -1282,6 +1427,176 @@ test('/retry after a reply replaces that turn in the request, transcript and sav
       assert.doesNotMatch(restored.screen(), /New answer/);
     } finally {
       await restored.close();
+    }
+  } finally {
+    fs.rmSync(directory, {recursive: true, force: true});
+  }
+});
+
+const requestContents = request => request.map(message => message.content);
+
+test('a failed replacing /retry keeps the previous answer, its saved history and its context', async () => {
+  const {directory, file} = historyDirectory();
+  const requests = [];
+  // Each request's outcome in order: two answers, a failed /retry, a second /retry, then a follow-up.
+  const outcomes = [
+    {message: 'First answer.'},
+    {message: 'Second answer.'},
+    new client.ChatApiError('Chat service request timed out.', {code: 'request_timeout', requestId: 'retry-failure'}),
+    {message: 'Second answer, retried.'},
+    {message: 'Follow-up answer.'}
+  ];
+  const services = {
+    ...client, ensureChatServiceAwake: async () => {},
+    async requestChat(messages) {
+      const outcome = outcomes[requests.push(messages) - 1];
+      if (outcome instanceof Error) throw outcome;
+      return outcome;
+    }
+  };
+  try {
+    const ui = await terminalApp({services, historyFile: file});
+    try {
+      await ui.type('First question\r');
+      await waitFor(() => ui.screen().includes('First answer.'));
+      await ui.type('Second question\r');
+      await waitFor(() => ui.screen().includes('Second answer.'));
+      await waitFor(() => chatHistory.loadHistory(file)?.history[3]?.content === 'Second answer.');
+      const before = checksum(file);
+
+      await ui.type('/retry\r');
+      await ui.expectScreen(/Chat service request timed out\. \(Request ID: retry-failure\)/);
+      assert.deepStrictEqual(requests[2], requests[1], 'the retry resends the second turn');
+      assert.match(ui.screen(), /CHAT ERROR/);
+      assert.match(ui.screen(), /Second answer\./, 'the answered turn stays after a failed retry');
+      assert.strictEqual(ui.screen().match(/Second question/g).length, 1);
+      await ui.settle();
+      assert.strictEqual(checksum(file), before, 'a failed retry leaves the saved history byte for byte');
+
+      // The answered turn is still the one /retry replaces.
+      await ui.type('/retry\r');
+      await waitFor(() => ui.screen().includes('Second answer, retried.'));
+      assert.deepStrictEqual(requests[3], requests[1], 'a retry after the failure resends the original second turn');
+      assert.doesNotMatch(ui.screen(), /Second answer\./);
+      assert.strictEqual(ui.screen().match(/Second question/g).length, 1);
+      await waitFor(() => chatHistory.loadHistory(file)?.history[3]?.content === 'Second answer, retried.');
+      assert.deepStrictEqual(requestContents(chatHistory.loadHistory(file).history),
+        ['First question', 'First answer.', 'Second question', 'Second answer, retried.']);
+
+      await ui.type('Follow-up question\r');
+      await waitFor(() => ui.screen().includes('Follow-up answer.'));
+      assert.deepStrictEqual(requestContents(requests[4]),
+        ['First question', 'First answer.', 'Second question', 'Second answer, retried.', 'Follow-up question']);
+      assert.strictEqual(requests.length, 5);
+    } finally {
+      await ui.close();
+    }
+  } finally {
+    fs.rmSync(directory, {recursive: true, force: true});
+  }
+});
+
+test('a cancelled replacing /retry keeps the previous answer and never commits provisional or late text', async () => {
+  const {directory, file} = historyDirectory();
+  const requests = [];
+  /** @type {{resolve: (reply: object) => void, onDelta: (text: string) => void, signal: AbortSignal}} */
+  let retry;
+  const services = {
+    ...client, ensureChatServiceAwake: async () => {},
+    requestChat(messages, options) {
+      requests.push(messages);
+      if (requests.length !== 3) return Promise.resolve({message: ['First answer.', 'Second answer.', '', 'Follow-up answer.'][requests.length - 1]});
+      // A reply that finishes just after it was cancelled: it ignores the abort and resolves late.
+      return new Promise(resolve => {retry = {resolve, onDelta: options.onDelta, signal: options.signal};});
+    }
+  };
+  try {
+    const ui = await terminalApp({services, historyFile: file});
+    try {
+      await ui.type('First question\r');
+      await waitFor(() => ui.screen().includes('First answer.'));
+      await ui.type('Second question\r');
+      await waitFor(() => ui.screen().includes('Second answer.'));
+      await waitFor(() => chatHistory.loadHistory(file)?.history[3]?.content === 'Second answer.');
+      const before = checksum(file);
+
+      await ui.type('/retry\r');
+      await waitFor(() => Boolean(retry));
+      assert.deepStrictEqual(requests[2], requests[1], 'the retry resends the second turn');
+      retry.onDelta('Provisional retry text');
+      await ui.expectScreen(/Provisional retry text/);
+      assert.match(ui.screen(), /Second answer\./, 'the answered turn stays while its replacement streams');
+      await ui.type('\u001b');
+      await waitFor(() => retry.signal.aborted);
+      retry.onDelta(' late delta');
+      retry.resolve({message: 'Late retry answer.'});
+      await ui.expectScreen(/Cancelled\. Ready for your next message\./);
+      await ui.settle();
+      assert.doesNotMatch(ui.screen(), /Provisional retry text|late delta|Late retry answer/);
+      assert.match(ui.screen(), /Second answer\./);
+      assert.strictEqual(ui.screen().match(/Second question/g).length, 1);
+      assert.strictEqual(checksum(file), before, 'a cancelled retry leaves the saved history byte for byte');
+
+      await ui.type('Follow-up question\r');
+      await waitFor(() => ui.screen().includes('Follow-up answer.'));
+      assert.deepStrictEqual(requestContents(requests[3]),
+        ['First question', 'First answer.', 'Second question', 'Second answer.', 'Follow-up question']);
+      await waitFor(() => chatHistory.loadHistory(file)?.history[5]?.content === 'Follow-up answer.');
+      assert.doesNotMatch(fs.readFileSync(file, 'utf8'), /Provisional retry text|late delta|Late retry answer/);
+    } finally {
+      await ui.close();
+    }
+  } finally {
+    fs.rmSync(directory, {recursive: true, force: true});
+  }
+});
+
+test('a long conversation stays bounded in the transcript, saved history and requests, and scrolls end to end', async () => {
+  const {directory, file} = historyDirectory();
+  const turns = 60;
+  const label = turn => String(turn).padStart(3, '0');
+  const requests = [];
+  const services = {
+    ...client, ensureChatServiceAwake: async () => {},
+    requestChat: async messages => ({message: `Answer ${label(requests.push(messages))}.`})
+  };
+  // Every transcript entry the conversation produced, oldest first.
+  const entries = Array.from({length: turns}, (_,index) => [`Question ${label(index + 1)}`, `Answer ${label(index + 1)}.`]).flat();
+  // The 16th question is the first whose request leaves out a turn, so one notice says so before it.
+  const shown = entries.toSpliced(30, 0, client.TRIMMED_CONTEXT_NOTICE);
+  try {
+    const ui = await terminalApp({services, historyFile: file});
+    try {
+      for (let turn = 1; turn <= turns; turn += 1) {
+        await ui.type(`Question ${label(turn)}\r`);
+        await waitFor(() => ui.screen().includes(`Answer ${label(turn)}.`), `turn ${turn} was not answered in time`);
+      }
+      assert.strictEqual(requests.length, turns);
+
+      await waitFor(() => chatHistory.loadHistory(file)?.messages.at(-1)?.content === entries.at(-1));
+      const saved = chatHistory.loadHistory(file);
+      assert.strictEqual(saved.messages.length, chatHistory.MAX_MESSAGES);
+      assert.deepStrictEqual(requestContents(saved.messages), shown.slice(-chatHistory.MAX_MESSAGES));
+      assert(requests.every(request => !requestContents(request).includes(client.TRIMMED_CONTEXT_NOTICE)));
+
+      const last = requests.at(-1);
+      assert(last.length > 2 && last.length <= client.MAX_MESSAGES, `the final request sent ${last.length} messages`);
+      assert.deepStrictEqual(requestContents(last), entries.slice(0, -1).slice(-last.length),
+        'the final request sends the newest turns, ending with the newest question');
+
+      // The oldest retained entry is the first answer after the 100-entry bound: the notice took one entry.
+      const oldest = shown.at(-chatHistory.MAX_MESSAGES);
+      assert.strictEqual(oldest, `Answer ${label(turns - chatHistory.MAX_MESSAGES / 2 + 1)}.`);
+      await ui.type('\u001b[1;5H');
+      await ui.expectScreen(new RegExp(oldest.replace('.', '\\.')));
+      assert.doesNotMatch(ui.screen(), new RegExp(`${shown.at(-chatHistory.MAX_MESSAGES - 1)}\\b`));
+      assert.doesNotMatch(ui.screen(), /Question 0(?:0\d|10)\b|Answer 060\./);
+      await ui.type('\u001b[1;5F');
+      await ui.expectScreen(/Answer 060\./);
+      assert.match(ui.screen(), /│ › Ask anything/);
+      assert.doesNotMatch(ui.screen(), new RegExp(oldest));
+    } finally {
+      await ui.close();
     }
   } finally {
     fs.rmSync(directory, {recursive: true, force: true});
@@ -1935,6 +2250,134 @@ test('/copy copies replies restored from saved history with their source links',
       await ui.type('/copy\r');
       await waitFor(() => shows(ui, 'Copied the latest reply (with 1 source) to the clipboard'));
       assert.deepStrictEqual(copied, ['Saved answer [1].\n\nSources: [\\[1\\] Saved source](https://example.com/saved)\n']);
+    } finally {
+      await ui.close();
+    }
+  } finally {
+    fs.rmSync(directory, {recursive: true, force: true});
+  }
+});
+
+// The saved transcript's entries as "role: content", and how many trim notices it holds.
+const savedEntries = file => (chatHistory.loadHistory(file)?.messages || []).map(message => `${message.role}: ${message.content}`);
+const trimNotices = file => savedEntries(file).filter(entry => entry === `notice: ${client.TRIMMED_CONTEXT_NOTICE}`).length;
+
+test('a long conversation says once that follow-ups leave out older turns, never in /save, and again after /clear', async () => {
+  const {directory, file} = historyDirectory();
+  const saveDirectory = path.join(directory, 'saved');
+  fs.mkdirSync(saveDirectory);
+  const requests = [];
+  const services = {
+    ...client, ensureChatServiceAwake: async () => {},
+    requestChat: async messages => ({message: `Reply ${requests.push(messages)}.`})
+  };
+  const ask = async (ui, question) => {
+    const answered = requests.length + 1;
+    await ui.type(`${question}\r`);
+    await waitFor(() => ui.screen().includes(`Reply ${answered}.`), `${question} was not answered in time`);
+    await waitFor(() => savedEntries(file).at(-1) === `assistant: Reply ${answered}.`);
+  };
+  try {
+    const ui = await terminalApp({services, historyFile: file, saveDirectory});
+    try {
+      // 14 answered turns and the 15th question still fit in one request.
+      for (let turn = 1; turn <= 15; turn += 1) await ask(ui, `Question ${turn}`);
+      assert.strictEqual(requests.at(-1)[0].content, 'Question 1');
+      assert.strictEqual(trimNotices(file), 0);
+      assert.doesNotMatch(ui.screen(), /Older turns stay on screen/);
+
+      await ask(ui, 'Question 16');
+      assert.strictEqual(requests.at(-1)[0].content, 'Question 2', 'the 16th request leaves out the first turn');
+      await ui.expectScreen(/•\s*\n\s*Older turns stay on screen and in \/save, but follow-ups now send only the\s/);
+      assert.strictEqual(trimNotices(file), 1);
+      const entries = savedEntries(file);
+      assert.strictEqual(entries[entries.indexOf(`notice: ${client.TRIMMED_CONTEXT_NOTICE}`) + 1], 'user: Question 16',
+        'the notice comes just before the question it applies to');
+
+      await ask(ui, 'Question 17');
+      await ui.type('/retry\r');
+      await waitFor(() => ui.screen().includes(`Reply ${requests.length}.`) && requests.length === 18);
+      await waitFor(() => savedEntries(file).at(-1) === 'assistant: Reply 18.');
+      assert.strictEqual(trimNotices(file), 1, 'later trimming follow-ups and /retry do not repeat it');
+      assert(requests.every(request => request.every(message => message.content !== client.TRIMMED_CONTEXT_NOTICE)));
+      assert(chatHistory.loadHistory(file).history.every(message => message.content !== client.TRIMMED_CONTEXT_NOTICE));
+
+      await ui.type('/save\r');
+      await waitFor(() => ui.screen().includes('Saved the conversation to'));
+      const [saved] = fs.readdirSync(saveDirectory);
+      const markdown = fs.readFileSync(path.join(saveDirectory, saved), 'utf8');
+      assert.match(markdown, /## You\n\nQuestion 1\n/);
+      assert.doesNotMatch(markdown, /follow-ups now send/);
+
+      await ui.type('/clear\r');
+      await waitFor(() => ui.screen().includes("Hi, I'm Ömer"));
+      requests.length = 0;
+      for (let turn = 1; turn <= 15; turn += 1) await ask(ui, `Again ${turn}`);
+      assert.strictEqual(trimNotices(file), 0);
+      await ask(ui, 'Again 16');
+      assert.strictEqual(trimNotices(file), 1, '/clear starts a conversation that is told again');
+      await ui.expectScreen(/Older turns stay on screen/);
+    } finally {
+      await ui.close();
+    }
+  } finally {
+    fs.rmSync(directory, {recursive: true, force: true});
+  }
+});
+
+test('a restored conversation whose request history is shorter than its transcript says so on the first follow-up', async () => {
+  const {directory, file} = historyDirectory();
+  const requests = [];
+  const services = {
+    ...client, ensureChatServiceAwake: async () => {},
+    requestChat: async messages => ({message: `Reply ${requests.push(messages)}.`})
+  };
+  // The transcript shows ten turns; large replies left only the last two in the saved request history.
+  const messages = [];
+  for (let turn = 1; turn <= 10; turn += 1) {
+    messages.push({role: 'user', content: `Old ${turn}`}, {role: 'assistant', model: 'fixture-model', content: `Old answer ${turn}`});
+  }
+  const history = messages.slice(-4).map(({role, content}) => ({role, content}));
+  try {
+    chatHistory.saveHistory(file, {history, messages, prompts: []});
+    const ui = await terminalApp({services, historyFile: file});
+    try {
+      assert.doesNotMatch(ui.screen(), /Older turns stay on screen/);
+      await ui.type('Follow up\r');
+      await waitFor(() => ui.screen().includes('Reply 1.'));
+      await ui.expectScreen(/Older turns stay on screen/);
+      assert.deepStrictEqual(requestContents(requests[0]), ['Old 9', 'Old answer 9', 'Old 10', 'Old answer 10', 'Follow up']);
+      await waitFor(() => savedEntries(file).at(-1) === 'assistant: Reply 1.');
+      assert.deepStrictEqual(savedEntries(file).slice(-3), [`notice: ${client.TRIMMED_CONTEXT_NOTICE}`, 'user: Follow up', 'assistant: Reply 1.']);
+      await ui.type('Another\r');
+      await waitFor(() => savedEntries(file).at(-1) === 'assistant: Reply 2.');
+      assert.strictEqual(trimNotices(file), 1);
+    } finally {
+      await ui.close();
+    }
+  } finally {
+    fs.rmSync(directory, {recursive: true, force: true});
+  }
+});
+
+test('a short restored conversation whose requests carry every turn shows no trim notice', async () => {
+  const {directory, file} = historyDirectory();
+  const requests = [];
+  const services = {
+    ...client, ensureChatServiceAwake: async () => {},
+    requestChat: async messages => ({message: `Reply ${requests.push(messages)}.`})
+  };
+  const messages = [{role: 'user', content: 'Old 1'}, {role: 'assistant', model: 'fixture-model', content: 'Old answer 1'}];
+  try {
+    chatHistory.saveHistory(file, {history: messages.map(({role, content}) => ({role, content})), messages, prompts: []});
+    const ui = await terminalApp({services, historyFile: file});
+    try {
+      await ui.type('Follow up\r');
+      await waitFor(() => savedEntries(file).at(-1) === 'assistant: Reply 1.');
+      await ui.type('/retry\r');
+      await waitFor(() => savedEntries(file).at(-1) === 'assistant: Reply 2.');
+      assert.strictEqual(trimNotices(file), 0);
+      assert.doesNotMatch(ui.screen(), /Older turns stay on screen/);
     } finally {
       await ui.close();
     }

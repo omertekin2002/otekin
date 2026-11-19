@@ -12,8 +12,9 @@ const {
 const { formatChatResponse } = require('../lib/chat-format');
 const { saveGeneratedImages } = require('../lib/chat-images');
 const { browserCommand } = require('../lib/browser');
-const { historyFileFor } = require('../lib/chat-history');
-const { cleanText, createTheme, startProgress, createActivityDisplay } = require('../lib/terminal');
+const chatHistory = require('../lib/chat-history');
+const { historyFileFor } = chatHistory;
+const { cleanText, createTheme, startProgress, createActivityDisplay, reducedMotionFor } = require('../lib/terminal');
 const { createStreamPreview } = require('../lib/stream-preview');
 const profile = require('../lib/profile');
 const { installPilcrow } = require('../lib/install-pilcrow');
@@ -45,8 +46,9 @@ Options:
   --non-interactive       Print text + links and exit (no prompt)
   --json                  Output profile or one-shot chat JSON and exit
   --no-open               Don't open links in a browser (print them instead)
-  --no-history            Don't load or save full-screen chat history this run
+  --no-history            Don't load or save chat history this run
   --linear                Chat line by line: no animation, each reply printed once
+  --reduced-motion        Show a static status instead of spinners and timers
   --cv, --resume          Open the CV download link directly
   -s, --select <choice>   Select directly: website | linkedin | cv | chat | exit
   --                      End options; later arguments are prompt text or a choice
@@ -88,8 +90,9 @@ Environment:
   NO_COLOR                Disable terminal colors
   OTEKIN_CHAT_API_URL      Override the HTTP(S) chat endpoint (no API key required)
   OTEKIN_CHAT_HEALTH_URL   Override its HTTP(S) health endpoint (defaults to /healthz)
-  OTEKIN_NO_HISTORY=1      Never load or save full-screen chat history
-  OTEKIN_HISTORY_FILE      Save full-screen chat history to this file instead
+  OTEKIN_NO_HISTORY=1      Never load or save chat history
+  OTEKIN_HISTORY_FILE      Save chat history to this file instead
+  OTEKIN_REDUCED_MOTION=1  Same as --reduced-motion (0 or empty leaves motion on)
 
 In a terminal, one-shot chat shows the reply as it streams in, then replaces it
 with the final answer. Ctrl+C cancels it and exits with code 130. Piped, --json
@@ -99,12 +102,19 @@ Linear chat (otekin chat --linear) reads one question per line, from the keyboar
 or piped input, and prints each finished reply once, with numbered sources and
 their URLs. It never redraws or animates. /retry sends the last message again,
 /save writes the conversation to a Markdown file, and /copy copies the latest
-reply (or saves it to a file when no clipboard works). Ctrl+C cancels a reply;
-Ctrl+C or Ctrl+D when idle, /exit or /quit ends it. A promptless "otekin chat"
-on a TERM=dumb terminal opens it automatically. It does not use saved history yet.
+reply (or saves it to a file when no clipboard works). /clear forgets the
+conversation. Ctrl+C cancels a reply; Ctrl+C or Ctrl+D when idle, /exit or /quit
+ends it. A promptless "otekin chat" on a TERM=dumb terminal opens it automatically.
 
-The full-screen chat saves its conversation and recent prompts so they come back
-next time. One-shot, --json and piped chat never read or write it.
+Reduced motion (--reduced-motion or OTEKIN_REDUCED_MOTION=1) keeps the full-screen
+workspace and one-shot chat still: the status shows "… <what is happening>" with
+no spinner or seconds counter and changes only when that text does, and streamed
+text is redrawn at most once a second. Linear chat never animates anyway.
+
+The full-screen and linear chats save their conversation and recent prompts in
+one file, so either picks up where the other left off; /clear deletes it.
+One-shot, --json and piped chat (including piped linear chat) never read or
+write it.
 `.trim();
 
   stream.write(help + '\n');
@@ -146,6 +156,7 @@ function parseArgs(argv) {
     noOpen: false,
     noHistory: false,
     linear: false,
+    reducedMotion: false,
     upgrade: false,
     select: null,
     command: null,
@@ -169,6 +180,7 @@ function parseArgs(argv) {
     else if (a === '--no-open') opts.noOpen = true;
     else if (a === '--no-history') opts.noHistory = true;
     else if (a === '--linear') opts.linear = true;
+    else if (a === '--reduced-motion') opts.reducedMotion = true;
     else if (a === '--upgrade' && opts.command === 'pilcrow') opts.upgrade = true;
     else if (a === '--cv' || a === '--resume') opts.select = 'cv';
     else if (a === '-s' || a === '--select' || a.startsWith('--select=')) {
@@ -289,10 +301,11 @@ async function runOneShotChat(prompt, opts) {
     return;
   }
 
+  const reducedMotion = reducedMotionFor(opts, process.env);
   const clearWakeProgress = opts.json ? () => {} : startProgress(
     process.stderr,
     'Waking chat service',
-    { delayMs: 750 }
+    { delayMs: 750, reducedMotion }
   );
   try {
     await ensureChatServiceAwake();
@@ -304,11 +317,12 @@ async function runOneShotChat(prompt, opts) {
     return;
   }
 
-  const activity = !opts.json && process.stderr.isTTY ? createActivityDisplay(process.stderr) : null;
+  const activity = !opts.json && process.stderr.isTTY ? createActivityDisplay(process.stderr, { reducedMotion }) : null;
   // On a terminal, the reply streams in as a provisional preview under the AI header.
   const preview = !opts.json && outputTheme.interactive
     ? await createStreamPreview(process.stdout, {
       theme: outputTheme,
+      reducedMotion,
       startedAt: activity ? activity.startedAt : undefined,
       statusLabel: () => activity && activity.runningLabel(),
       onShow: () => activity && activity.pause()
@@ -358,9 +372,10 @@ async function runOneShotChat(prompt, opts) {
   }
 }
 
-// Never reads or writes saved history. Resolves when the session ends; it always exits 0.
+// Shares saved history with the full-screen chat when stdin is a terminal; piped sessions never
+// touch it. Resolves when the session ends; it always exits 0.
 // /save and the /copy fallback write to the current directory.
-async function runLinearChat(firstPrompt) {
+async function runLinearChat(firstPrompt, opts) {
   const session = startLinearChat({
     input: process.stdin,
     output: process.stdout,
@@ -368,7 +383,9 @@ async function runLinearChat(firstPrompt) {
     services: { prepareRequestMessages, ensureChatServiceAwake, requestChat, assistantMessageFromResponse },
     firstPrompt,
     saveDirectory: process.cwd(),
-    copy: (text) => copyToClipboard(text)
+    copy: (text) => copyToClipboard(text),
+    historyFile: historyFileFor(opts),
+    historyStore: chatHistory
   });
   const onInterrupt = () => session.interrupt();
   process.on('SIGINT', onInterrupt);
@@ -412,7 +429,8 @@ async function main() {
   }
 
   if (opts.command === 'pilcrow') {
-    if (opts.commandArgs.length || opts.select || opts.json || opts.noOpen || opts.noHistory || opts.linear) {
+    if (opts.commandArgs.length || opts.select || opts.json || opts.noOpen || opts.noHistory || opts.linear ||
+        opts.reducedMotion) {
       process.stderr.write('Pilcrow installation accepts only --upgrade, --help, --version, and --non-interactive. Run "otekin pilcrow --help".\n');
       process.exitCode = 1;
       return;
@@ -440,7 +458,7 @@ async function main() {
         process.exitCode = 1;
         return;
       }
-      await runLinearChat(prompt);
+      await runLinearChat(prompt, opts);
       return;
     }
 
@@ -461,7 +479,7 @@ async function main() {
       term: process.env.TERM,
       nonInteractive: opts.nonInteractive
     })) {
-      await runLinearChat('');
+      await runLinearChat('', opts);
       return;
     }
 
