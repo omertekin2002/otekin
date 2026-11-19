@@ -1562,6 +1562,8 @@ test('a long conversation stays bounded in the transcript, saved history and req
   };
   // Every transcript entry the conversation produced, oldest first.
   const entries = Array.from({length: turns}, (_,index) => [`Question ${label(index + 1)}`, `Answer ${label(index + 1)}.`]).flat();
+  // The 16th question is the first whose request leaves out a turn, so one notice says so before it.
+  const shown = entries.toSpliced(30, 0, client.TRIMMED_CONTEXT_NOTICE);
   try {
     const ui = await terminalApp({services, historyFile: file});
     try {
@@ -1574,19 +1576,20 @@ test('a long conversation stays bounded in the transcript, saved history and req
       await waitFor(() => chatHistory.loadHistory(file)?.messages.at(-1)?.content === entries.at(-1));
       const saved = chatHistory.loadHistory(file);
       assert.strictEqual(saved.messages.length, chatHistory.MAX_MESSAGES);
-      assert.deepStrictEqual(requestContents(saved.messages), entries.slice(-chatHistory.MAX_MESSAGES));
+      assert.deepStrictEqual(requestContents(saved.messages), shown.slice(-chatHistory.MAX_MESSAGES));
+      assert(requests.every(request => !requestContents(request).includes(client.TRIMMED_CONTEXT_NOTICE)));
 
       const last = requests.at(-1);
       assert(last.length > 2 && last.length <= client.MAX_MESSAGES, `the final request sent ${last.length} messages`);
       assert.deepStrictEqual(requestContents(last), entries.slice(0, -1).slice(-last.length),
         'the final request sends the newest turns, ending with the newest question');
 
-      // The oldest retained entry is the first question after the 100-entry bound.
-      const oldest = entries.at(-chatHistory.MAX_MESSAGES);
-      assert.strictEqual(oldest, `Question ${label(turns - chatHistory.MAX_MESSAGES / 2 + 1)}`);
+      // The oldest retained entry is the first answer after the 100-entry bound: the notice took one entry.
+      const oldest = shown.at(-chatHistory.MAX_MESSAGES);
+      assert.strictEqual(oldest, `Answer ${label(turns - chatHistory.MAX_MESSAGES / 2 + 1)}.`);
       await ui.type('\u001b[1;5H');
-      await ui.expectScreen(new RegExp(oldest));
-      assert.doesNotMatch(ui.screen(), new RegExp(entries.at(-chatHistory.MAX_MESSAGES - 1).replace('.', '\\.')));
+      await ui.expectScreen(new RegExp(oldest.replace('.', '\\.')));
+      assert.doesNotMatch(ui.screen(), new RegExp(`${shown.at(-chatHistory.MAX_MESSAGES - 1)}\\b`));
       assert.doesNotMatch(ui.screen(), /Question 0(?:0\d|10)\b|Answer 060\./);
       await ui.type('\u001b[1;5F');
       await ui.expectScreen(/Answer 060\./);
@@ -2247,6 +2250,134 @@ test('/copy copies replies restored from saved history with their source links',
       await ui.type('/copy\r');
       await waitFor(() => shows(ui, 'Copied the latest reply (with 1 source) to the clipboard'));
       assert.deepStrictEqual(copied, ['Saved answer [1].\n\nSources: [\\[1\\] Saved source](https://example.com/saved)\n']);
+    } finally {
+      await ui.close();
+    }
+  } finally {
+    fs.rmSync(directory, {recursive: true, force: true});
+  }
+});
+
+// The saved transcript's entries as "role: content", and how many trim notices it holds.
+const savedEntries = file => (chatHistory.loadHistory(file)?.messages || []).map(message => `${message.role}: ${message.content}`);
+const trimNotices = file => savedEntries(file).filter(entry => entry === `notice: ${client.TRIMMED_CONTEXT_NOTICE}`).length;
+
+test('a long conversation says once that follow-ups leave out older turns, never in /save, and again after /clear', async () => {
+  const {directory, file} = historyDirectory();
+  const saveDirectory = path.join(directory, 'saved');
+  fs.mkdirSync(saveDirectory);
+  const requests = [];
+  const services = {
+    ...client, ensureChatServiceAwake: async () => {},
+    requestChat: async messages => ({message: `Reply ${requests.push(messages)}.`})
+  };
+  const ask = async (ui, question) => {
+    const answered = requests.length + 1;
+    await ui.type(`${question}\r`);
+    await waitFor(() => ui.screen().includes(`Reply ${answered}.`), `${question} was not answered in time`);
+    await waitFor(() => savedEntries(file).at(-1) === `assistant: Reply ${answered}.`);
+  };
+  try {
+    const ui = await terminalApp({services, historyFile: file, saveDirectory});
+    try {
+      // 14 answered turns and the 15th question still fit in one request.
+      for (let turn = 1; turn <= 15; turn += 1) await ask(ui, `Question ${turn}`);
+      assert.strictEqual(requests.at(-1)[0].content, 'Question 1');
+      assert.strictEqual(trimNotices(file), 0);
+      assert.doesNotMatch(ui.screen(), /Older turns stay on screen/);
+
+      await ask(ui, 'Question 16');
+      assert.strictEqual(requests.at(-1)[0].content, 'Question 2', 'the 16th request leaves out the first turn');
+      await ui.expectScreen(/•\s*\n\s*Older turns stay on screen and in \/save, but follow-ups now send only the\s/);
+      assert.strictEqual(trimNotices(file), 1);
+      const entries = savedEntries(file);
+      assert.strictEqual(entries[entries.indexOf(`notice: ${client.TRIMMED_CONTEXT_NOTICE}`) + 1], 'user: Question 16',
+        'the notice comes just before the question it applies to');
+
+      await ask(ui, 'Question 17');
+      await ui.type('/retry\r');
+      await waitFor(() => ui.screen().includes(`Reply ${requests.length}.`) && requests.length === 18);
+      await waitFor(() => savedEntries(file).at(-1) === 'assistant: Reply 18.');
+      assert.strictEqual(trimNotices(file), 1, 'later trimming follow-ups and /retry do not repeat it');
+      assert(requests.every(request => request.every(message => message.content !== client.TRIMMED_CONTEXT_NOTICE)));
+      assert(chatHistory.loadHistory(file).history.every(message => message.content !== client.TRIMMED_CONTEXT_NOTICE));
+
+      await ui.type('/save\r');
+      await waitFor(() => ui.screen().includes('Saved the conversation to'));
+      const [saved] = fs.readdirSync(saveDirectory);
+      const markdown = fs.readFileSync(path.join(saveDirectory, saved), 'utf8');
+      assert.match(markdown, /## You\n\nQuestion 1\n/);
+      assert.doesNotMatch(markdown, /follow-ups now send/);
+
+      await ui.type('/clear\r');
+      await waitFor(() => ui.screen().includes("Hi, I'm Ömer"));
+      requests.length = 0;
+      for (let turn = 1; turn <= 15; turn += 1) await ask(ui, `Again ${turn}`);
+      assert.strictEqual(trimNotices(file), 0);
+      await ask(ui, 'Again 16');
+      assert.strictEqual(trimNotices(file), 1, '/clear starts a conversation that is told again');
+      await ui.expectScreen(/Older turns stay on screen/);
+    } finally {
+      await ui.close();
+    }
+  } finally {
+    fs.rmSync(directory, {recursive: true, force: true});
+  }
+});
+
+test('a restored conversation whose request history is shorter than its transcript says so on the first follow-up', async () => {
+  const {directory, file} = historyDirectory();
+  const requests = [];
+  const services = {
+    ...client, ensureChatServiceAwake: async () => {},
+    requestChat: async messages => ({message: `Reply ${requests.push(messages)}.`})
+  };
+  // The transcript shows ten turns; large replies left only the last two in the saved request history.
+  const messages = [];
+  for (let turn = 1; turn <= 10; turn += 1) {
+    messages.push({role: 'user', content: `Old ${turn}`}, {role: 'assistant', model: 'fixture-model', content: `Old answer ${turn}`});
+  }
+  const history = messages.slice(-4).map(({role, content}) => ({role, content}));
+  try {
+    chatHistory.saveHistory(file, {history, messages, prompts: []});
+    const ui = await terminalApp({services, historyFile: file});
+    try {
+      assert.doesNotMatch(ui.screen(), /Older turns stay on screen/);
+      await ui.type('Follow up\r');
+      await waitFor(() => ui.screen().includes('Reply 1.'));
+      await ui.expectScreen(/Older turns stay on screen/);
+      assert.deepStrictEqual(requestContents(requests[0]), ['Old 9', 'Old answer 9', 'Old 10', 'Old answer 10', 'Follow up']);
+      await waitFor(() => savedEntries(file).at(-1) === 'assistant: Reply 1.');
+      assert.deepStrictEqual(savedEntries(file).slice(-3), [`notice: ${client.TRIMMED_CONTEXT_NOTICE}`, 'user: Follow up', 'assistant: Reply 1.']);
+      await ui.type('Another\r');
+      await waitFor(() => savedEntries(file).at(-1) === 'assistant: Reply 2.');
+      assert.strictEqual(trimNotices(file), 1);
+    } finally {
+      await ui.close();
+    }
+  } finally {
+    fs.rmSync(directory, {recursive: true, force: true});
+  }
+});
+
+test('a short restored conversation whose requests carry every turn shows no trim notice', async () => {
+  const {directory, file} = historyDirectory();
+  const requests = [];
+  const services = {
+    ...client, ensureChatServiceAwake: async () => {},
+    requestChat: async messages => ({message: `Reply ${requests.push(messages)}.`})
+  };
+  const messages = [{role: 'user', content: 'Old 1'}, {role: 'assistant', model: 'fixture-model', content: 'Old answer 1'}];
+  try {
+    chatHistory.saveHistory(file, {history: messages.map(({role, content}) => ({role, content})), messages, prompts: []});
+    const ui = await terminalApp({services, historyFile: file});
+    try {
+      await ui.type('Follow up\r');
+      await waitFor(() => savedEntries(file).at(-1) === 'assistant: Reply 1.');
+      await ui.type('/retry\r');
+      await waitFor(() => savedEntries(file).at(-1) === 'assistant: Reply 2.');
+      assert.strictEqual(trimNotices(file), 0);
+      assert.doesNotMatch(ui.screen(), /Older turns stay on screen/);
     } finally {
       await ui.close();
     }

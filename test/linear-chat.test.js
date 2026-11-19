@@ -12,7 +12,7 @@ const {
   commandName,
   modelLabel
 } = require('../lib/linear-chat');
-const { prepareRequestMessages, assistantMessageFromResponse } = require('../lib/chat-client');
+const { prepareRequestMessages, assistantMessageFromResponse, TRIMMED_CONTEXT_NOTICE, MAX_MESSAGES } = require('../lib/chat-client');
 const chatHistory = require('../lib/chat-history');
 
 // Cursor movement, erase and alternate-screen sequences, plus any carriage return.
@@ -1033,4 +1033,105 @@ test('linear chat ignores a history store that cannot load', async () => {
   await s.chat.finished;
   assert.doesNotMatch(s.out(), /Continuing/);
   assert.deepStrictEqual(s.requests[0].messages, [{ role: 'user', content: 'Q1' }]);
+});
+
+// How often the notice that follow-ups leave out older turns was printed.
+const trimNotices = (out) => out.split(TRIMMED_CONTEXT_NOTICE).length - 1;
+const questions = (from, to) => Array.from({ length: to - from + 1 }, (_value, index) => `Q${from + index}\n`).join('');
+
+test('linear chat says once, before Researching, when a follow-up first leaves out older turns', async () => {
+  const saveDirectory = tempDirectory();
+  try {
+    // 14 answered turns and the 15th question fit in MAX_MESSAGES; 15 turns and the 16th question do not.
+    assert.strictEqual(MAX_MESSAGES, 30);
+    const s = session(async (_messages, _opts, number) => ({ message: `Answer ${number}.` }),
+      { start: { saveDirectory } });
+    s.send(questions(1, 15));
+    await s.idle(16);
+    assert.strictEqual(trimNotices(s.out()), 0, 'every request so far carried every earlier turn');
+    s.send(questions(16, 20) + '/retry\n/save\n');
+    s.input.end();
+    await s.chat.finished;
+    const out = s.out();
+    assert.strictEqual(trimNotices(out), 1);
+    assert(out.includes(`You: Q16\n${TRIMMED_CONTEXT_NOTICE}\nResearching…\n`), out);
+    assert.strictEqual(s.requests[14].messages[0].content, 'Q1');
+    assert.strictEqual(s.requests[15].messages[0].content, 'Q2', 'the 16th request is the first to drop a turn');
+    assert.strictEqual(s.requests.length, 21);
+    for (const request of s.requests) {
+      assert(request.messages.every((message) => !message.content.includes(TRIMMED_CONTEXT_NOTICE)));
+    }
+    const [saved] = filesIn(saveDirectory);
+    const markdown = fs.readFileSync(path.join(saveDirectory, saved), 'utf8');
+    assert.match(markdown, /## You\n\nQ1\n/);
+    assert.doesNotMatch(markdown, /follow-ups now send/);
+    assert.strictEqual(s.err(), '');
+  } finally {
+    fs.rmSync(saveDirectory, { recursive: true, force: true });
+  }
+});
+
+test('linear chat never prints the trim notice while requests carry every earlier turn', async () => {
+  const s = session(async (_messages, _opts, number) => ({ message: `Answer ${number}.` }));
+  // A replacing /retry of the 15th turn sends the same 14 earlier turns.
+  s.send(questions(1, 15) + '/retry\n');
+  s.input.end();
+  await s.chat.finished;
+  assert.strictEqual(s.requests.length, 16);
+  assert.strictEqual(s.requests[15].messages.length, MAX_MESSAGES - 1);
+  assert.strictEqual(trimNotices(s.out()), 0);
+});
+
+test('linear chat prints the trim notice again after /clear, for a typed or piped session', async () => {
+  for (const interactive of [false, true]) {
+    const s = session(async (_messages, _opts, number) => ({ message: `Answer ${number}.` }), { start: { interactive } });
+    s.send(questions(1, 17));
+    await s.idle(18);
+    assert.strictEqual(trimNotices(s.out()), 1);
+    s.send('/clear\n' + questions(1, 15));
+    await s.idle(34);
+    assert.strictEqual(trimNotices(s.out()), 1, 'the new conversation still carries every turn');
+    s.send(questions(16, 17));
+    s.input.end();
+    await s.chat.finished;
+    assert.strictEqual(trimNotices(s.out()), 2, `interactive: ${interactive}`);
+    const afterClear = s.out().slice(s.out().indexOf('Conversation cleared'));
+    assert.match(afterClear, /You: Q16\nOlder turns stay on screen/);
+  }
+});
+
+test('linear chat says follow-ups leave out older turns on the first follow-up of a restored conversation', async () => {
+  const { directory, file } = historyFixture();
+  try {
+    // The transcript shows ten turns; the saved request history kept only the last two.
+    const messages = [];
+    for (let index = 1; index <= 10; index += 1) {
+      messages.push({ role: 'user', content: `Old ${index}` }, { role: 'assistant', model: 'fixture-model', content: `Old answer ${index}` });
+    }
+    const history = messages.slice(-4).map(({ role, content }) => ({ role, content }));
+    chatHistory.saveHistory(file, { history, messages, prompts: [] });
+    const s = historySession(async (_messages, _opts, number) => ({ message: `Answer ${number}.` }), file);
+    s.send('Follow up\n');
+    await s.idle(2);
+    s.send('/retry\nAnother\n');
+    s.input.end();
+    await s.chat.finished;
+    const out = s.out();
+    assert.strictEqual(trimNotices(out), 1);
+    assert.match(out, /You: Follow up\nOlder turns stay on screen/);
+    assert.deepStrictEqual(s.requests[0].messages.map((message) => message.content),
+      ['Old 9', 'Old answer 9', 'Old 10', 'Old answer 10', 'Follow up']);
+    const saved = chatHistory.loadHistory(file);
+    assert(saved.messages.every((message) => !message.content.includes(TRIMMED_CONTEXT_NOTICE)));
+    assert(saved.history.every((message) => !message.content.includes(TRIMMED_CONTEXT_NOTICE)));
+
+    // A new session over the same saved conversation says it again.
+    const next = historySession(async () => ({ message: 'Later.' }), file);
+    next.send('Again\n');
+    next.input.end();
+    await next.chat.finished;
+    assert.strictEqual(trimNotices(next.out()), 1);
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
 });
