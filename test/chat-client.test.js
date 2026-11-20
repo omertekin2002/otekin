@@ -474,7 +474,7 @@ test('history keeps only the newest source catalog and respects serialized and U
   const before = JSON.stringify(history);
   const messages = prepareRequestMessages(history, 'Follow up');
   assert.strictEqual(messages.filter(message => message.webSources).length, 1);
-  assert.strictEqual(messages[messages.length - 2].webSources[0].title, 'Source 13');
+  assert.strictEqual((/** @type {{ title: string }[]} */ (messages[messages.length - 2].webSources))[0].title, 'Source 13');
   assert.ok(Buffer.byteLength(JSON.stringify({ messages, stream: false })) <= 128 * 1024);
   assert.strictEqual(messages[0].role, 'user');
   assert.strictEqual(messages.length % 2, 1);
