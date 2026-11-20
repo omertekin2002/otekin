@@ -210,7 +210,10 @@ function printNonInteractive() {
 
 /** @returns {Promise<void>} Resolves once the browser process has started. */
 function openInBrowser(url) {
-  const { command, args } = browserCommand(process.platform, url);
+  const launch = browserCommand(process.platform, url);
+  // Not an http(s) link: callers report it like any other failed open and show the URL instead.
+  if (!launch) return Promise.reject(new Error('Not an http(s) link'));
+  const { command, args } = launch;
 
   return new Promise((resolve, reject) => {
     const child = spawn(command, args, { stdio: 'ignore', detached: true });
