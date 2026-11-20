@@ -168,6 +168,11 @@ test('composer edits whole graphemes and keeps its cursor inside wrapped Unicode
   assert.deepStrictEqual(editDraft({text: 'e\u0301!', cursor: 2}, 'left'), {text: 'e\u0301!', cursor: 0});
   assert.strictEqual(editDraft({text: '\nHello', cursor: 0}, 'home').cursor, 0);
   assert.strictEqual(sanitizeInput('a\u001b[2J\r\nb\t!'), 'a\nb  !');
+  // Terminals often send pasted line breaks as a lone carriage return.
+  assert.strictEqual(sanitizeInput('a\rb'), 'a\nb');
+  assert.strictEqual(sanitizeInput('a\r\nb'), 'a\nb');
+  assert.strictEqual(sanitizeInput('a\r\rb'), 'a\n\nb');
+  assert.strictEqual(sanitizeInput('a\u001b[2J\rb\u0007'), 'a\nb');
   const layout = layoutDraft('界界界', 3, 4);
   assert.deepStrictEqual(layout.lines, ['界界', '界']);
   assert.deepStrictEqual(layout.caret, {row: 1, column: 2});
@@ -479,6 +484,33 @@ test('bracketed paste is edited as a draft and never submits embedded newlines',
     await ui.type('\r');
     await waitFor(() => requests.length === 2);
     assert.strictEqual(requests[1][2].content, 'one\ntwo');
+  } finally {
+    await ui.close();
+  }
+});
+
+test('bracketed pastes with carriage-return line breaks keep every line', async () => {
+  const requests = [];
+  const ui = await terminalApp({services: {
+    ...client, ensureChatServiceAwake: async () => {},
+    requestChat: async messages => {requests.push(messages); return {message: 'Received.'};}
+  }});
+  // True when each word is drawn on a screen row that holds none of the other words.
+  const onOwnRows = words => words.every(word => ui.screen().split('\n').some(row =>
+    row.includes(word) && words.every(other => other === word || !row.includes(other))));
+  try {
+    await ui.type('\u001b[200~Hello\r界\rworld\u001b[201~');
+    await ui.waitUntil(() => onOwnRows(['Hello', '界', 'world']), 'the pasted lines were not kept apart');
+    assert.strictEqual(requests.length, 0);
+    await ui.type('\r');
+    await waitFor(() => requests.length === 1);
+    assert.strictEqual(requests[0][0].content, 'Hello\n界\nworld');
+    await ui.type('\u001b[200~alpha\r\nbeta\r\ngamma\u001b[201~');
+    await ui.waitUntil(() => onOwnRows(['alpha', 'beta', 'gamma']), 'the pasted lines were not kept apart');
+    assert.strictEqual(requests.length, 1);
+    await ui.type('\r');
+    await waitFor(() => requests.length === 2);
+    assert.strictEqual(requests[1][2].content, 'alpha\nbeta\ngamma');
   } finally {
     await ui.close();
   }
