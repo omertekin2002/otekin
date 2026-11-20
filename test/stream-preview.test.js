@@ -3,6 +3,7 @@
 const assert = require('assert');
 const { Writable } = require('stream');
 const { Terminal } = require('@xterm/headless');
+const { MAX_RESPONSE_BYTES } = require('../lib/chat-client');
 const { PROGRESS_FRAMES, createTheme, createActivityDisplay } = require('../lib/terminal');
 const {
   createStreamPreview, provisionalText, REDRAW_INTERVAL_MS, REDUCED_MOTION_TEXT_INTERVAL_MS
@@ -70,6 +71,69 @@ test('provisional text removes terminal escapes and hides inline image data', ()
   assert.strictEqual(provisionalText('  a\u001b]52;c;ZXZpbA==\u0007b\u001b[2Jc  '), 'abc');
   assert.strictEqual(provisionalText('see ![x](data:image/png;base64,AAAA'), 'see [generating image…]');
   assert.strictEqual(provisionalText('x'.repeat(5000)).length, 4001);
+});
+
+// A full-size reply of raw image data: `data:image/png;base64,` then 76-character words.
+function largeImageData(separator) {
+  const size = MAX_RESPONSE_BYTES;
+  return ('data:image/png;base64,AAAA' + (separator + 'A'.repeat(76)).repeat(Math.ceil(size / 77))).slice(0, size);
+}
+
+test('provisional text hides 24 MiB of raw image data without overflowing the stack', () => {
+  for (const separator of [' ', '\n']) {
+    const text = largeImageData(separator);
+    const started = Date.now();
+    const visible = provisionalText(text);
+    const elapsed = Date.now() - started;
+    assert.strictEqual(visible, '[generating image…]');
+    // About 0.3 s here; a quadratic scan would take minutes.
+    assert(elapsed < 3000, `took ${elapsed} ms`);
+    assert.strictEqual(provisionalText('before ' + text.slice(0, 1000) + ' after'), 'before [generating image…] after');
+  }
+});
+
+test('provisional text still hides short and Markdown image data and keeps ordinary data: text', () => {
+  const words = ' ' + 'QUJD'.repeat(10);
+  assert.strictEqual(provisionalText('a data:image/png;base64,AAAA' + words + words + ' b'), 'a [generating image…] b');
+  // Words shorter than 40 base64 characters are ordinary text.
+  assert.strictEqual(provisionalText('a data:image/png;base64,AA BBBB'), 'a [generating image…] BBBB');
+  assert.strictEqual(provisionalText('see (data:image/png) here'), 'see ([generating image…]) here');
+  assert.strictEqual(provisionalText('DATA:IMAGE/png;base64,AAAA' + words), '[generating image…]');
+  assert.strictEqual(provisionalText('data:text/plain;base64,' + 'A'.repeat(60)), 'data:text/plain;base64,' + 'A'.repeat(60));
+  assert.strictEqual(provisionalText('![x](data:image/png;base64,AAAA) and ![y](data:image/png;base64,BB'),
+    '[generating image…] and [generating image…]');
+});
+
+test('a failure while building provisional text never escapes the redraw timer', async () => {
+  const streamPreview = require('../lib/stream-preview');
+  const original = streamPreview.provisionalText;
+  const uncaught = [];
+  const record = (error) => uncaught.push(error);
+  process.on('uncaughtException', record);
+  let calls = 0;
+  streamPreview.provisionalText = () => {
+    calls += 1;
+    throw new RangeError('Maximum call stack size exceeded');
+  };
+  let run;
+  try {
+    assert.strictEqual(streamPreview.safeProvisionalText('anything'), streamPreview.UNAVAILABLE_PLACEHOLDER);
+    run = await previewRun(['first '], { columns: 60 });
+    // Later deltas are drawn from the redraw timer, not from update().
+    const before = calls;
+    run.preview.update('second');
+    assert.strictEqual(calls, before);
+    for (let waited = 0; calls === before && waited < 2000; waited += REDRAW_INTERVAL_MS) await tick(REDRAW_INTERVAL_MS);
+    assert(calls > before, 'the timer redrew the preview');
+    assert.deepStrictEqual(uncaught, []);
+    assert.match(await run.term.screen(), /\[reply preview unavailable\]\n {2}. Writing/);
+    run.preview.clear();
+    assert.strictEqual(await run.term.screen(), PROMPT);
+  } finally {
+    streamPreview.provisionalText = original;
+    process.removeListener('uncaughtException', record);
+    if (run) run.term.dispose();
+  }
 });
 
 test('stream preview draws under the AI header and is fully replaced by the canonical answer', async () => {
