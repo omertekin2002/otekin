@@ -105,27 +105,32 @@ test('provisional text still hides short and Markdown image data and keeps ordin
 });
 
 test('a failure while building provisional text never escapes the redraw timer', async () => {
-  const module = require('../lib/stream-preview');
-  const original = module.provisionalText;
+  const streamPreview = require('../lib/stream-preview');
+  const original = streamPreview.provisionalText;
   const uncaught = [];
   const record = (error) => uncaught.push(error);
   process.on('uncaughtException', record);
-  module.provisionalText = () => {
+  let calls = 0;
+  streamPreview.provisionalText = () => {
+    calls += 1;
     throw new RangeError('Maximum call stack size exceeded');
   };
   let run;
   try {
-    assert.strictEqual(module.safeProvisionalText('anything'), module.UNAVAILABLE_PLACEHOLDER);
+    assert.strictEqual(streamPreview.safeProvisionalText('anything'), streamPreview.UNAVAILABLE_PLACEHOLDER);
     run = await previewRun(['first '], { columns: 60 });
-    // Later deltas are drawn from the timer.
+    // Later deltas are drawn from the redraw timer, not from update().
+    const before = calls;
     run.preview.update('second');
-    await tick(REDRAW_INTERVAL_MS * 3);
+    assert.strictEqual(calls, before);
+    for (let waited = 0; calls === before && waited < 2000; waited += REDRAW_INTERVAL_MS) await tick(REDRAW_INTERVAL_MS);
+    assert(calls > before, 'the timer redrew the preview');
     assert.deepStrictEqual(uncaught, []);
     assert.match(await run.term.screen(), /\[reply preview unavailable\]\n {2}. Writing/);
     run.preview.clear();
     assert.strictEqual(await run.term.screen(), PROMPT);
   } finally {
-    module.provisionalText = original;
+    streamPreview.provisionalText = original;
     process.removeListener('uncaughtException', record);
     if (run) run.term.dispose();
   }
