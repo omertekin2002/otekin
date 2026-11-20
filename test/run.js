@@ -15,6 +15,7 @@ global.test = (name, run) => {
 };
 
 require('./chat-client.test');
+require('./image-data.test');
 require('./chat-history.test');
 require('./chat-format.test');
 require('./chat-export.test');
