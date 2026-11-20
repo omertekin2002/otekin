@@ -208,6 +208,7 @@ function printNonInteractive() {
   process.stdout.write(`- CV: ${LINKS.cv}\n`);
 }
 
+/** @returns {Promise<void>} Resolves once the browser process has started. */
 function openInBrowser(url) {
   const { command, args } = browserCommand(process.platform, url);
 
