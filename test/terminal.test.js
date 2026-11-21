@@ -183,3 +183,27 @@ test('JSON output is unchanged without unsafe characters, including emoji ZWJ, Z
     assert.strictEqual(stringifyJsonForOutput(value), JSON.stringify(value, null, 2));
   }
 });
+
+test('chatErrorMessage shows a cleaned category, a well-formed request ID and what the failure stage means', () => {
+  const { chatErrorMessage } = require('../lib/terminal');
+  const busy = Object.assign(new Error('Chat service is busy.\u001b]52;c;ZXZpbA==\u0007‮'), { requestId: ' req-42 ' });
+  // Without a stage, as for a prompt rejected before anything is sent, only the category and ID.
+  assert.strictEqual(chatErrorMessage(busy), 'Chat service is busy. (Request ID: req-42)');
+  assert.strictEqual(chatErrorMessage(null), 'Chat request failed.');
+  assert.strictEqual(chatErrorMessage({ message: 'Bad id', requestId: 'bad id\u001b[2J' }), 'Bad id');
+  for (const requestId of ['-starts-with-dash', 'a'.repeat(129), 'has space', 42]) {
+    assert.strictEqual(chatErrorMessage({ message: 'Failed.', requestId }), 'Failed.');
+  }
+  assert.strictEqual(chatErrorMessage({ message: 'Failed.', requestId: 'A1._:-z' }), 'Failed. (Request ID: A1._:-z)');
+  assert.strictEqual(chatErrorMessage(busy, null, { retryHint: true }), 'Chat service is busy. (Request ID: req-42)');
+
+  assert.strictEqual(chatErrorMessage(new Error('Chat service did not wake up in time.'), 'readiness'),
+    'Chat service did not wake up in time. Your question was not sent.');
+  assert.strictEqual(chatErrorMessage(new Error('Unable to wake chat service.'), 'readiness', { retryHint: true }),
+    'Unable to wake chat service. Your question was not sent. Type /retry to send it again.');
+  assert.strictEqual(chatErrorMessage(busy, 'request'),
+    'Chat service is busy. (Request ID: req-42) The chat service may have received your question.');
+  assert.strictEqual(chatErrorMessage({ message: 'Bad id' }, 'request', { retryHint: true }),
+    'Bad id. The chat service may have received your question. Type /retry to send it again.');
+  assert.doesNotMatch(chatErrorMessage(busy, 'request', { retryHint: true }), /not sent/);
+});

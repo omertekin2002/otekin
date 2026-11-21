@@ -194,6 +194,8 @@ Conversation content is transmitted to SLgateway and its configured model provid
 
 When the gateway returns a safe structured failure, the CLI shows a specific category and its request ID. The request ID can be used to correlate server logs without exposing provider responses or credentials.
 
+A failed question also says how far it got. When the `GET /healthz` readiness check fails, nothing of the conversation has been sent, so the error ends with `Your question was not sent.`, for example `Chat error: Chat service did not wake up in time. Your question was not sent.` When the chat request itself fails, the gateway may already have started on it, so the error says `The chat service may have received your question.` after the category and request ID. The CLI never resends a chat request on its own. In the full-screen chat and in linear chat at a terminal, both errors end with `Type /retry to send it again.`, and `/retry` sends the same question with the same earlier turns as context; the full-screen status line says `/retry sends it again`. One-shot `otekin chat "…"` and piped linear chat print the same message without the `/retry` hint, since there is nowhere to type it. Cancelling with Esc or Ctrl+C prints no error.
+
 For local development or testing, override the non-secret endpoint:
 
 ```bash
