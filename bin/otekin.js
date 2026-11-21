@@ -15,7 +15,7 @@ const { browserCommand } = require('../lib/browser');
 const chatHistory = require('../lib/chat-history');
 const { historyFileFor } = chatHistory;
 const {
-  cleanText, createTheme, startProgress, createActivityDisplay, reducedMotionFor, stringifyJsonForOutput
+  cleanText, chatErrorMessage, createTheme, startProgress, createActivityDisplay, reducedMotionFor, stringifyJsonForOutput
 } = require('../lib/terminal');
 const { createStreamPreview } = require('../lib/stream-preview');
 const profile = require('../lib/profile');
@@ -288,21 +288,12 @@ function writeLine(value) {
   process.stdout.write(String(value).replace(/(?:\r?\n[ \t]*)+$/, '') + '\n');
 }
 
-function errorMessage(error) {
-  const message = error && error.message ? cleanText(error.message) : 'Chat request failed.';
-  const requestId = error && typeof error.requestId === 'string'
-    ? error.requestId.trim()
-    : '';
-  if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(requestId)) return message;
-  return `${message} (Request ID: ${requestId})`;
-}
-
 async function runOneShotChat(prompt, opts) {
   let messages;
   try {
     messages = prepareRequestMessages([], prompt);
   } catch (error) {
-    process.stderr.write(`Chat error: ${errorMessage(error)}\n`);
+    process.stderr.write(`Chat error: ${chatErrorMessage(error)}\n`);
     process.exitCode = 1;
     return;
   }
@@ -318,7 +309,8 @@ async function runOneShotChat(prompt, opts) {
     clearWakeProgress();
   } catch (error) {
     clearWakeProgress();
-    process.stderr.write(`Chat error: ${errorMessage(error)}\n`);
+    // One-shot chat has no composer to type /retry in, so it never offers the hint.
+    process.stderr.write(`Chat error: ${chatErrorMessage(error, 'readiness')}\n`);
     process.exitCode = 1;
     return;
   }
@@ -371,7 +363,7 @@ async function runOneShotChat(prompt, opts) {
       process.exitCode = 130;
       return;
     }
-    process.stderr.write(`Chat error: ${errorMessage(error)}\n`);
+    process.stderr.write(`Chat error: ${chatErrorMessage(error, 'request')}\n`);
     process.exitCode = 1;
   } finally {
     if (preview) process.removeListener('SIGINT', onInterrupt);

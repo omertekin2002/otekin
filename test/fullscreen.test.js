@@ -812,7 +812,7 @@ test('reduced motion keeps the status row still and shows every status change', 
     await ui.type('Fail me\r');
     await waitFor(() => Boolean(state.onDelta));
     state.reject(new Error('Service unavailable'));
-    await ui.expectScreen(/Try again when you’re ready/);
+    await ui.expectScreen(/\/retry sends it again/);
     assert.doesNotMatch(ui.raw(), MOTION);
   } finally {
     await ui.close();
@@ -2482,5 +2482,140 @@ test('a short restored conversation whose requests carry every turn shows no tri
     }
   } finally {
     fs.rmSync(directory, {recursive: true, force: true});
+  }
+});
+
+// One chat stage the test settles by hand: `release()` lets it succeed, `fail(error)` fails it.
+function heldStage() {
+  /** @type {(value?: unknown) => void} */
+  let release = () => {};
+  /** @type {(error: unknown) => void} */
+  let fail = () => {};
+  const promise = new Promise((resolve, reject) => {
+    release = resolve;
+    fail = reject;
+  });
+  return {promise, release, fail};
+}
+
+// Fails the second question at `stage`, with a draft typed while it was on its way, then /retry and /save.
+async function failThenRetry(stage, error) {
+  const {directory} = historyDirectory();
+  const saveDirectory = path.join(directory, 'saved');
+  fs.mkdirSync(saveDirectory);
+  const requests = [];
+  const held = {readiness: [], request: []};
+  let wakes = 0;
+  const services = {
+    ...client,
+    async ensureChatServiceAwake() {
+      wakes += 1;
+      if (stage === 'readiness' && wakes === 2) {
+        const pending = heldStage();
+        held.readiness.push(pending);
+        return pending.promise;
+      }
+    },
+    async requestChat(messages) {
+      requests.push(messages);
+      if (stage === 'request' && requests.length === 2) {
+        const pending = heldStage();
+        held.request.push(pending);
+        return pending.promise;
+      }
+      return {message: requests.length === 1 ? 'First answer.' : 'Second answer.'};
+    }
+  };
+  const ui = await terminalApp({columns: 160, services, saveDirectory});
+  const flat = () => ui.screen().replace(/\s+/g, ' ');
+  const composer = () => ui.screen().split('\n').find(line => line.includes('│ ›')) || '';
+  try {
+    await ui.type('First question\r');
+    await ui.expectScreen(/First answer\./);
+    await ui.type('Second question\r');
+    await waitFor(() => held[stage].length === 1, `the ${stage} stage never started`);
+    await ui.type('Draft typed while waiting');
+    await ui.expectScreen(/│ › Draft typed while waiting/);
+    held[stage][0].fail(error);
+    await ui.expectScreen(/CHAT ERROR/);
+    await ui.waitUntil(() => /Type \/retry to send it again\./.test(flat()), 'the /retry hint never showed');
+    const failed = flat();
+    // The draft survives the failure, and the earlier answer is still on screen.
+    assert.match(composer(), /│ › Draft typed while waiting/);
+    assert.match(failed, /First answer\./);
+    const postsAtFailure = requests.length;
+
+    await ui.type('\u0015/retry\r');
+    await ui.expectScreen(/Second answer\./);
+    await ui.type('/save\r');
+    await waitFor(() => fs.readdirSync(saveDirectory).length === 1);
+    const markdown = fs.readFileSync(path.join(saveDirectory, fs.readdirSync(saveDirectory)[0]), 'utf8');
+    return {failed, postsAtFailure, requests, markdown, ui};
+  } catch (thrown) {
+    await ui.close();
+    throw thrown;
+  } finally {
+    fs.rmSync(directory, {recursive: true, force: true});
+  }
+}
+
+test('a question stopped at the wake-up check says it was not sent, keeps the draft, and /retry sends it', async () => {
+  const result = await failThenRetry('readiness',
+    new client.ChatApiError('Chat service did not wake up in time.', {requestId: 'wake-req-1'}));
+  const {failed, postsAtFailure, requests, markdown, ui} = result;
+  try {
+    assert.match(failed, /Chat service did not wake up in time\. \(Request ID: wake-req-1\) Your question was not sent\. Type \/retry to send it again\./);
+    assert.match(failed, /Not sent · \/retry sends it again/);
+    // The gateway never saw the failed question; /retry sends it with the first turn as context.
+    assert.strictEqual(postsAtFailure, 1);
+    assert.strictEqual(requests.length, 2);
+    assert.deepStrictEqual(requestContents(requests[1]), ['First question', 'First answer.', 'Second question']);
+    assert.match(markdown, /First question[^]*First answer\.[^]*Second question[^]*Second answer\./);
+  } finally {
+    await ui.close();
+  }
+});
+
+test('a failed chat request never says it was not sent, keeps the draft, and /retry resends the same request', async () => {
+  const result = await failThenRetry('request', new client.ChatApiError(
+    'Chat generation is temporarily unavailable. Try again later.', {code: 'generation_unavailable', requestId: 'gen-req-2'}));
+  const {failed, postsAtFailure, requests, markdown, ui} = result;
+  try {
+    assert.match(failed, /Chat generation is temporarily unavailable\. Try again later\. \(Request ID: gen-req-2\) The chat service may have received your question\. Type \/retry to send it again\./);
+    assert.doesNotMatch(failed, /not sent/i);
+    assert.strictEqual(postsAtFailure, 2);
+    assert.strictEqual(requests.length, 3);
+    assert.deepStrictEqual(requests[2], requests[1]);
+    assert.deepStrictEqual(requestContents(requests[2]), ['First question', 'First answer.', 'Second question']);
+    assert.match(markdown, /First question[^]*First answer\.[^]*Second question[^]*Second answer\./);
+  } finally {
+    await ui.close();
+  }
+});
+
+test('Esc during the wake-up check cancels quietly and sends nothing', async () => {
+  const wake = heldStage();
+  const requests = [];
+  const services = {
+    ...client,
+    // Like the real check, it stops as soon as the request is cancelled.
+    ensureChatServiceAwake: ({signal}) => new Promise((resolve, reject) => {
+      signal.addEventListener('abort', () => reject(new client.ChatApiError('Chat request was cancelled.')), {once: true});
+      wake.promise.then(resolve);
+    }),
+    requestChat: async messages => {requests.push(messages); return {message: 'Unused.'};}
+  };
+  const ui = await terminalApp({services});
+  try {
+    await ui.type('Cancel while waking\r');
+    await ui.expectScreen(/Connecting to chat service/);
+    await ui.type('\u001b');
+    await ui.expectScreen(/Cancelled\. Ready for your next message\./);
+    wake.release();
+    await ui.settle();
+    assert.doesNotMatch(ui.screen(), /CHAT ERROR|not sent|\/retry sends/);
+    assert.strictEqual(requests.length, 0);
+  } finally {
+    await ui.close();
   }
 });

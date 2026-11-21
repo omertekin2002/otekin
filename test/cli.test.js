@@ -551,7 +551,8 @@ test('CLI chat failures show safe categories and request IDs while hiding respon
       error: 'secret internal failure detail',
       code: 'generation_unavailable'
     }));
-  }, async (endpoint) => {
+  }, async (endpoint, fixture) => {
+    const posts = () => fixture.getRequests().filter((request) => request.method === 'POST').length;
     const result = await runCli(['chat', 'Question'], {
       OTEKIN_CHAT_API_URL: endpoint
     });
@@ -562,6 +563,16 @@ test('CLI chat failures show safe categories and request IDs while hiding respon
     assert.doesNotMatch(result.stderr, /--research/);
     assert.doesNotMatch(result.stderr, /secret internal failure detail/);
     assert.doesNotMatch(result.stderr, /\n\s+at /);
+    // The question reached the gateway: never "not sent", and no /retry hint without a composer.
+    assert.strictEqual(result.stderr, 'Chat error: Chat generation is temporarily unavailable. Try again later. ' +
+      '(Request ID: gateway-request-123) The chat service may have received your question.\n');
+    assert.strictEqual(posts(), 1);
+
+    const json = await runCli(['--json', 'chat', 'Question'], { OTEKIN_CHAT_API_URL: endpoint });
+    assert.strictEqual(json.code, 1);
+    assert.strictEqual(json.stdout, '');
+    assert.strictEqual(json.stderr, result.stderr);
+    assert.strictEqual(posts(), 2);
   });
 });
 
@@ -579,11 +590,19 @@ test('CLI does not send conversation data when the health check fails', async ()
     assert.strictEqual(result.code, 1);
     assert.strictEqual(result.stdout, '');
     assert.match(result.stderr, /health check failed/i);
+    // One-shot chat says the question never left, without a /retry hint it has no composer for.
+    assert.strictEqual(result.stderr, 'Chat error: Chat service health check failed (HTTP 500). Your question was not sent.\n');
     assert.strictEqual(chatRequests, 0);
     assert.deepStrictEqual(
       fixture.getRequests().map((request) => `${request.method} ${request.url}`),
       ['GET /healthz']
     );
+
+    const json = await runCli(['--json', 'chat', 'Private question'], { OTEKIN_CHAT_API_URL: endpoint });
+    assert.strictEqual(json.code, 1);
+    assert.strictEqual(json.stdout, '');
+    assert.strictEqual(json.stderr, result.stderr);
+    assert.strictEqual(chatRequests, 0);
   }, (request, response) => {
     request.resume();
     response.writeHead(500, { 'Content-Type': 'application/json' });
@@ -873,6 +892,23 @@ test('CLI linear chat sends a prompt argument that looks like a command as a que
   });
 });
 
+test('CLI linear chat says a question was not sent when the health check fails, and sends nothing', async () => {
+  const bodies = [];
+  await withServer(linearGateway(bodies, (_body, number) => sourcedReply(number)), async (endpoint, fixture) => {
+    const result = await runCli(['chat', '--linear'], { OTEKIN_CHAT_API_URL: endpoint }, [], 'Q1\nQ2\n');
+    assert.strictEqual(result.code, 0);
+    // Piped questions run in order, so there is no /retry hint.
+    assert.strictEqual(result.stderr,
+      'Chat error: Chat service health check failed (HTTP 500). Your question was not sent.\n'.repeat(2));
+    assert.strictEqual(bodies.length, 0);
+    assert(fixture.getRequests().every((request) => request.method === 'GET'));
+  }, (request, response) => {
+    request.resume();
+    response.writeHead(500, { 'Content-Type': 'application/json' });
+    response.end(JSON.stringify({ error: 'unavailable' }));
+  });
+});
+
 test('CLI linear chat reports a gateway error and keeps going with the previous history', async () => {
   const bodies = [];
   await withServer(linearGateway(bodies, (_body, number) => number === 2
@@ -880,8 +916,10 @@ test('CLI linear chat reports a gateway error and keeps going with the previous 
     : sourcedReply(number)), async (endpoint) => {
     const result = await runCli(['chat', '--linear'], { OTEKIN_CHAT_API_URL: endpoint }, [], 'Q1\nQ2\nQ3\n');
     assert.strictEqual(result.code, 0);
+    // Piped questions run in order, so there is no /retry hint.
     assert.strictEqual(result.stderr,
-      'Chat error: Chat generation is temporarily unavailable. Try again later. (Request ID: linear-req-7)\n');
+      'Chat error: Chat generation is temporarily unavailable. Try again later. (Request ID: linear-req-7) ' +
+      'The chat service may have received your question.\n');
     assert.doesNotMatch(result.stdout + result.stderr, /secret provider detail/);
     assert.deepStrictEqual(bodies[2].messages.map((message) => message.content.split('\n')[0]), ['Q1', 'Answer 1 [1].', 'Q3']);
     assert.match(result.stdout, /Answer 3 \[1\]\./);
