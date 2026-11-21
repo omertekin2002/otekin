@@ -616,6 +616,22 @@ test('cancelling a request keeps the app usable and cannot commit a stale reply'
   }
 });
 
+test('a reply with a megabyte of blank lines renders and Ctrl+C still exits', async () => {
+  const ui = await terminalApp({services: {
+    ...client, ensureChatServiceAwake: async () => {},
+    // Trimming blank lines used to rescan the rest of a reply like this from every line break.
+    requestChat: async () => ({message: 'Blank lines follow' + '\n\n'.repeat(512 * 1024) + 'Last line\n\n \n'})
+  }});
+  try {
+    await ui.type('Hello\r');
+    await ui.expectScreen(/Last line/);
+    await ui.type('\u0003');
+    await waitFor(() => ui.emulator.buffer.active.type === 'normal');
+  } finally {
+    await ui.close();
+  }
+});
+
 function streamingServices() {
   const state = {requests: 0};
   return {state, services: {
