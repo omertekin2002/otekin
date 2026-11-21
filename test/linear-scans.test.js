@@ -3,7 +3,7 @@
 const assert = require('assert');
 const path = require('path');
 const { spawnSync } = require('child_process');
-const { cleanText } = require('../lib/terminal');
+const { cleanText, stringifyJsonForOutput } = require('../lib/terminal');
 const { trimTrailingBlankLines } = require('../lib/chat-format');
 const { assistantMessageFromResponse } = require('../lib/chat-client');
 const { provisionalText } = require('../lib/stream-preview');
@@ -78,6 +78,15 @@ test('trailing blank lines and whitespace are trimmed exactly as their regular e
     const text = 'x' + String.fromCharCode(code).repeat(2);
     assert.strictEqual(text.trimEnd(), text.replace(/\s+$/, ''), `U+${code.toString(16)}`);
   }
+});
+
+test('JSON output escapes a 4 MB run of CSI introducers in linear time', () => {
+  const text = '\u009B'.repeat(4 * 1024 * 1024);
+  const started = Date.now();
+  const output = stringifyJsonForOutput({ message: text });
+  const elapsed = Date.now() - started;
+  assert.strictEqual(output.length, JSON.stringify({ message: text }, null, 2).length + 5 * text.length);
+  assert.ok(elapsed < 5000, `took ${elapsed} ms`);
 });
 
 test('worst-case 24 MiB replies are cleaned, compacted, previewed and saved in seconds', () => {

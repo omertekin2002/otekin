@@ -2,7 +2,8 @@
 
 const assert = require('assert');
 const {
-  PROGRESS_FRAMES, cleanText, createTheme, clipLine, createActivityDisplay, reducedMotionFor, startProgress
+  PROGRESS_FRAMES, cleanText, createTheme, clipLine, createActivityDisplay, reducedMotionFor, startProgress,
+  stringifyJsonForOutput
 } = require('../lib/terminal');
 
 test('terminal styling respects pipes, NO_COLOR, and dumb terminals', () => {
@@ -121,4 +122,36 @@ test('reduced-motion activity display shows static tool labels and keeps complet
 
 test('display text strips remote terminal control sequences but keeps readable content', () => {
   assert.strictEqual(cleanText('Hello\u001b[2J\nWorld\u001b]0;bad title\u0007'), 'Hello\nWorld');
+});
+
+// DEL, C1 controls and the bidi marks, embeddings, overrides and isolates.
+const JSON_UNSAFE_CODES = [0x7f, ...Array.from({ length: 0x20 }, (_, index) => 0x80 + index),
+  0x61c, 0x200e, 0x200f, 0x202a, 0x202b, 0x202c, 0x202d, 0x202e, 0x2066, 0x2067, 0x2068, 0x2069];
+const RAW_JSON_UNSAFE = /[\u007F-\u009F\u061C\u200E\u200F\u202A-\u202E\u2066-\u2069]/;
+
+test('JSON output escapes DEL, C1 and bidi controls and parses to the same value', () => {
+  for (const code of JSON_UNSAFE_CODES) {
+    const char = String.fromCharCode(code);
+    const value = { [`key${char}`]: [`a${char}b`, { nested: char }], n: 1 };
+    const output = stringifyJsonForOutput(value);
+    assert.doesNotMatch(output, RAW_JSON_UNSAFE, `U+${code.toString(16)}`);
+    const escape = '\\u' + code.toString(16).padStart(4, '0');
+    assert.strictEqual(output.split(escape).length - 1, 3, `U+${code.toString(16)}`);
+    assert.deepStrictEqual(JSON.parse(output), value);
+    assert.strictEqual(output, JSON.stringify(value, null, 2).split(char).join(escape));
+  }
+  const reply = { message: 'x\u009B31m\u009D0;t\u0007\u202E\u0085\u007F', sources: [{ title: '\u2066a\u2069', url: 'https://e.test/\u009b' }] };
+  assert.deepStrictEqual(JSON.parse(stringifyJsonForOutput(reply)), reply);
+  // Escapes already in a string stay literal text, not a second level of escaping.
+  assert.deepStrictEqual(JSON.parse(stringifyJsonForOutput({ text: '\\u009b' })), { text: '\\u009b' });
+});
+
+test('JSON output is unchanged without unsafe characters, including emoji ZWJ, ZWNJ and BOM', () => {
+  const values = [
+    { message: 'Ömer · Koç 界 \u{1F469}\u200D\u{1F4BB} می\u200Cخواهم \u200B\uFEFF', list: [1, true, null] },
+    'plain', 42, null, [], {}, { control: '\u0000\u001b[2J\n\t' }
+  ];
+  for (const value of values) {
+    assert.strictEqual(stringifyJsonForOutput(value), JSON.stringify(value, null, 2));
+  }
 });

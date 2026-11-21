@@ -195,6 +195,7 @@ test('Pilcrow CLI dispatches installation and upgrade without entering chat', as
 test('CLI preserves bare profile JSON output', async () => {
   const result = await runCli(['--json']);
   assert.strictEqual(result.code, 0);
+  assert.strictEqual(result.stdout, JSON.stringify(JSON.parse(result.stdout), null, 2) + '\n');
   assert.deepStrictEqual(JSON.parse(result.stdout), {
     message: `${GREETING} ${TAGLINE}`,
     links: {
@@ -449,6 +450,57 @@ test('CLI one-shot --json preserves the complete gateway response', async () => 
     assert.strictEqual(result.code, 0);
     assert.deepStrictEqual(JSON.parse(result.stdout), gatewayResponse);
     assert.strictEqual(result.stderr, '');
+  });
+});
+
+test('CLI one-shot --json escapes C1 and bidi controls in the reply, sources and URLs', async () => {
+  const controls = '\u009B2J\u009D0;owned\u0007\u0085\u007F\u202E';
+  const gatewayResponse = {
+    message: `Answer ${controls} end`,
+    provider: 'fixture',
+    webSources: [{ title: `Title ${controls}`, url: `https://example.com/${controls}` }]
+  };
+
+  await withServer((request, response) => {
+    request.resume();
+    response.writeHead(200, { 'Content-Type': 'application/json' });
+    response.end(JSON.stringify(gatewayResponse));
+  }, async (endpoint) => {
+    const result = await runCli(['--json', 'chat', 'Question'], { OTEKIN_CHAT_API_URL: endpoint });
+    assert.strictEqual(result.code, 0);
+    assert.strictEqual(result.stderr, '');
+    assert.doesNotMatch(result.stdout, /[\u007F-\u009F\u061C\u200E\u200F\u202A-\u202E\u2066-\u2069]/);
+    for (const escape of ['\\u009b', '\\u009d', '\\u0085', '\\u007f', '\\u202e']) {
+      assert.strictEqual(result.stdout.split(escape).length - 1, 3, escape);
+    }
+    assert.deepStrictEqual(JSON.parse(result.stdout), gatewayResponse);
+
+    // Printed to a terminal, the output changes neither the title nor the screen.
+    const emulator = new Terminal({ cols: 200, rows: 20, convertEol: true, allowProposedApi: true, scrollback: 0 });
+    let title = null;
+    emulator.onTitleChange((value) => { title = value; });
+    await new Promise((resolve) => emulator.write('before\n', () => resolve(undefined)));
+    await new Promise((resolve) => emulator.write(result.stdout, () => resolve(undefined)));
+    const buffer = emulator.buffer.active;
+    const screen = Array.from({ length: buffer.length }, (_, index) =>
+      buffer.getLine(index).translateToString(true)).join('\n');
+    emulator.dispose();
+    assert.strictEqual(title, null);
+    assert.match(screen, /^before\n\{/);
+    assert.match(screen, /"message": "Answer \\u009b2J\\u009d0;owned\\u0007\\u0085\\u007f\\u202e end"/);
+  });
+});
+
+test('CLI one-shot --json output is byte-identical to JSON.stringify without control characters', async () => {
+  const gatewayResponse = { message: 'Ömer · Koç 界 \u{1F469}\u200D\u{1F4BB}', webSources: [{ title: 'T', url: 'https://e.test' }] };
+  await withServer((request, response) => {
+    request.resume();
+    response.writeHead(200, { 'Content-Type': 'application/json' });
+    response.end(JSON.stringify(gatewayResponse));
+  }, async (endpoint) => {
+    const result = await runCli(['--json', 'chat', 'Question'], { OTEKIN_CHAT_API_URL: endpoint });
+    assert.strictEqual(result.code, 0);
+    assert.strictEqual(result.stdout, JSON.stringify(gatewayResponse, null, 2) + '\n');
   });
 });
 
