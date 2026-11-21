@@ -206,4 +206,15 @@ test('chatErrorMessage shows a cleaned category, a well-formed request ID and wh
   assert.strictEqual(chatErrorMessage({ message: 'Bad id' }, 'request', { retryHint: true }),
     'Bad id. The chat service may have received your question. Type /retry to send it again.');
   assert.doesNotMatch(chatErrorMessage(busy, 'request', { retryHint: true }), /not sent/);
+
+  // Where the full-screen chat put the question back in the composer, Enter sends it again.
+  assert.strictEqual(chatErrorMessage(new Error('Unable to wake chat service.'), 'readiness', { retryHint: 'composer' }),
+    'Unable to wake chat service. Your question was not sent. Your question is back in the composer. Press Enter to send it again.');
+  assert.strictEqual(chatErrorMessage(busy, 'request', { retryHint: 'composer' }),
+    'Chat service is busy. (Request ID: req-42) The chat service may have received your question. ' +
+    'Your question is back in the composer. Press Enter to send it again.');
+  // Without a stage there is no hint of either kind, and without the option, as in one-shot and piped chat, none either.
+  assert.strictEqual(chatErrorMessage(busy, null, { retryHint: 'composer' }), 'Chat service is busy. (Request ID: req-42)');
+  assert.strictEqual(chatErrorMessage(busy, 'request', { retryHint: false }),
+    'Chat service is busy. (Request ID: req-42) The chat service may have received your question.');
 });

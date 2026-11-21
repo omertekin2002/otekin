@@ -649,6 +649,76 @@ test('linear chat /retry while a reply is on the way sends nothing and says so',
   assert.match(s.out(), /OTEKIN:\nOnly answer\.\n\nYou: \n$/);
 });
 
+test('linear chat at a terminal names the question /retry sends again, cleaned and on one line', async () => {
+  // An unanswered question, typed with terminal controls that the line leaves out.
+  const s = session(async (_messages, _opts, number) => {
+    if (number === 1) throw new Error('Chat service is busy.');
+    return { message: `Answer ${number}.` };
+  }, { start: { interactive: true } });
+  s.send('Q1 \u001b[31mred\u001b[0m‮\n');
+  await s.idle(2);
+  s.send('/retry\n');
+  await s.idle(3);
+  assert.match(s.out(), /You: \/retry\nSending again: Q1 red\nResearching…\nOTEKIN:\nAnswer 2\.\n/);
+  assert.strictEqual(s.requests.length, 2);
+
+  // A replacing /retry of a long question is cut to 60 characters; a 60-character one is not.
+  const long = 'L'.repeat(59) + 'é' + ' and the rest';
+  const sixty = 'S'.repeat(60);
+  s.send(`${long}\n`);
+  await s.idle(4);
+  s.send('/retry\n');
+  await s.idle(5);
+  s.send(`${sixty}\n`);
+  await s.idle(6);
+  s.send('/retry\n');
+  await s.idle(7);
+  s.input.end();
+  await s.chat.finished;
+  assert.match(s.out(), new RegExp(`You: /retry\\nSending again: ${'L'.repeat(59)}é…\\nResearching…\\n`));
+  assert.match(s.out(), new RegExp(`You: /retry\\nSending again: ${sixty}\\nResearching…\\n`));
+  // One request per question and per /retry.
+  assert.strictEqual(s.requests.length, 6);
+  assert.strictEqual(s.out().split('Sending again:').length - 1, 3);
+});
+
+test('linear chat marks a multi-line question that /retry sends again with …', async () => {
+  for (const [firstPrompt, label] of [
+    ['First line\nsecond line', 'First line…'],
+    ['M'.repeat(65) + '\nmore', 'M'.repeat(60) + '…']
+  ]) {
+    const s = session(async (_messages, _opts, number) => {
+      if (number === 1) throw new Error('Chat service is busy.');
+      return { message: 'Answered.' };
+    }, { start: { interactive: true, firstPrompt } });
+    await s.idle(1);
+    s.send('/retry\n');
+    s.input.end();
+    await s.chat.finished;
+    assert.ok(s.out().includes(`You: /retry\nSending again: ${label}\nResearching…\n`), s.out());
+    assert.deepStrictEqual(s.requests.map((request) => request.messages), Array(2).fill([{ role: 'user', content: firstPrompt }]));
+  }
+});
+
+test('linear chat piped /retry output is unchanged', async () => {
+  const s = session(async (_messages, _opts, number) => {
+    if (number === 1) throw new Error('Chat service is busy.');
+    return { message: `Answer ${number}.` };
+  });
+  s.send('Q1\n/retry\nQ2\n/retry\n');
+  // Ending the input after the last prompt keeps how the session ends the same on every run.
+  await s.idle(5);
+  s.input.end();
+  await s.chat.finished;
+  assert.strictEqual(s.out(), 'otekin linear chat · one line at a time, no animation\n' +
+    'Type a question and press Enter. /help lists commands, /exit ends the chat. Ctrl+C cancels a reply.\n' +
+    'You: Q1\nResearching…\n' +
+    'You: /retry\nResearching…\nOTEKIN:\nAnswer 2.\n\n' +
+    'You: Q2\nResearching…\nOTEKIN:\nAnswer 3.\n\n' +
+    'You: /retry\nResearching…\nOTEKIN:\nAnswer 4.\n\nYou: \n');
+  assert.strictEqual(s.requests.length, 4);
+});
+
 test('linear chat /save writes the questions and replies only, and nothing when there is nothing to save', async () => {
   const directory = tempDirectory();
   const s = session(async (_messages, opts, number) => {

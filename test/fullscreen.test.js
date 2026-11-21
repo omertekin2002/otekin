@@ -610,7 +610,8 @@ test('cancelling a request keeps the app usable and cannot commit a stale reply'
     rejectRequest(Object.assign(new Error('Service unavailable'), {requestId: 'fixture-request'}));
     await waitFor(() => ui.screen().includes('fixture-request'));
     assert.match(ui.screen(), /CHAT ERROR/);
-    assert.match(ui.screen(), /│ › Ask anything/);
+    // The failed question goes back into the empty composer; the cancelled one never did.
+    await ui.expectScreen(/│ › Keep this draft/);
   } finally {
     await ui.close();
   }
@@ -758,7 +759,8 @@ test('cancel, /clear, and request errors discard provisional text, including lat
     assert.doesNotMatch(ui.screen(), /provisional/);
 
     state.onDelta = null;
-    await ui.type('Fourth\r');
+    await ui.expectScreen(/│ › Third/);
+    await ui.type('\u0015Fourth\r');
     await waitFor(() => Boolean(state.onDelta));
     state.onDelta('Working again');
     await waitFor(() => ui.screen().includes('Working again'));
@@ -812,7 +814,7 @@ test('reduced motion keeps the status row still and shows every status change', 
     await ui.type('Fail me\r');
     await waitFor(() => Boolean(state.onDelta));
     state.reject(new Error('Service unavailable'));
-    await ui.expectScreen(/\/retry sends it again/);
+    await ui.expectScreen(/^ +Press Enter to send it again$/m);
     assert.doesNotMatch(ui.raw(), MOTION);
   } finally {
     await ui.close();
@@ -1397,7 +1399,9 @@ test('/retry sends a failed or cancelled prompt again with the same request mess
   try {
     await ui.type('Flaky question\r');
     await waitFor(() => ui.screen().includes('Gateway timed out.'));
-    await ui.type('/retry\r');
+    // The failed question is back in the composer; /retry still works once it is cleared.
+    await ui.expectScreen(/│ › Flaky question/);
+    await ui.type('\u0015/retry\r');
     await waitFor(() => requests.length === 2);
     assert.deepStrictEqual(requests[1], requests[0]);
     await ui.type('/retry\r');
@@ -1519,6 +1523,9 @@ test('a failed replacing /retry keeps the previous answer, its saved history and
       assert.match(ui.screen(), /Second answer\./, 'the answered turn stays after a failed retry');
       assert.strictEqual(ui.screen().match(/Second question/g).length, 1);
       await ui.settle();
+      // Nothing is put back in the composer: the answered turn is still on screen, and /retry is the way back.
+      assert.match(ui.screen().replace(/\s+/g, ' '), /may have received your question\. Type \/retry to send it again\./);
+      assert.match(ui.screen(), /│ › Ask anything/);
       assert.strictEqual(checksum(file), before, 'a failed retry leaves the saved history byte for byte');
 
       // The answered turn is still the one /retry replaces.
@@ -2617,5 +2624,178 @@ test('Esc during the wake-up check cancels quietly and sends nothing', async () 
     assert.strictEqual(requests.length, 0);
   } finally {
     await ui.close();
+  }
+});
+
+// The composer's first line on screen.
+const composerLine = ui => ui.screen().split('\n').find(line => line.includes('│ ›')) || '';
+
+// Fails the second question at `stage` with nothing typed meanwhile, then sends it again with Enter.
+async function failThenResend(stage, error) {
+  const {directory, file} = historyDirectory();
+  const requests = [];
+  const held = {readiness: [], request: []};
+  let wakes = 0;
+  const services = {
+    ...client,
+    async ensureChatServiceAwake() {
+      wakes += 1;
+      if (stage === 'readiness' && wakes === 2) {
+        const pending = heldStage();
+        held.readiness.push(pending);
+        return pending.promise;
+      }
+    },
+    async requestChat(messages) {
+      requests.push(messages);
+      if (stage === 'request' && requests.length === 2) {
+        const pending = heldStage();
+        held.request.push(pending);
+        return pending.promise;
+      }
+      return {message: requests.length === 1 ? 'First answer.' : 'Second answer.'};
+    }
+  };
+  const ui = await terminalApp({columns: 160, services, historyFile: file});
+  const flat = () => ui.screen().replace(/\s+/g, ' ');
+  try {
+    await ui.type('First question\r');
+    await ui.expectScreen(/First answer\./);
+    await ui.type('Second question\r');
+    await waitFor(() => held[stage].length === 1, `the ${stage} stage never started`);
+    await ui.expectScreen(/│ › Ask anything/);
+    held[stage][0].fail(error);
+    await ui.expectScreen(/CHAT ERROR/);
+    await ui.waitUntil(() => /Press Enter to send it again\./.test(flat()), 'the composer hint never showed');
+    await ui.expectScreen(/│ › Second question/);
+    const failed = flat();
+    const postsAtFailure = requests.length;
+    const wakesAtFailure = wakes;
+    // The caret is at the end of the restored question.
+    const caret = composerLine(ui).indexOf('Second question') + 'Second question'.length;
+    await ui.waitUntil(() => ui.emulator.buffer.active.cursorX === caret, 'the caret is not at the end of the question');
+
+    // Enter alone sends it again: one wake-up check and one request.
+    await ui.type('\r');
+    await ui.expectScreen(/Second answer\./);
+    await ui.expectScreen(/│ › Ask anything/);
+    assert.strictEqual(wakes, wakesAtFailure + 1);
+    // ↑ recalls the question once, then the one before it.
+    await ui.type('\u001b[A');
+    await ui.expectScreen(/│ › Second question/);
+    await ui.type('\u001b[A');
+    await ui.expectScreen(/│ › First question/);
+    await waitFor(() => chatHistory.loadHistory(file)?.history.length === 4);
+    const saved = chatHistory.loadHistory(file);
+    return {failed, postsAtFailure, requests, saved, ui};
+  } catch (thrown) {
+    await ui.close();
+    throw thrown;
+  } finally {
+    fs.rmSync(directory, {recursive: true, force: true});
+  }
+}
+
+test('a question stopped at the wake-up check goes back into an empty composer, and Enter sends it once', async () => {
+  const {failed, postsAtFailure, requests, saved, ui} = await failThenResend('readiness',
+    new client.ChatApiError('Chat service did not wake up in time.', {requestId: 'wake-req-3'}));
+  try {
+    assert.match(failed, /Chat service did not wake up in time\. \(Request ID: wake-req-3\) Your question was not sent\. Your question is back in the composer\. Press Enter to send it again\./);
+    assert.match(failed, /Not sent · press Enter to send it again/);
+    assert.doesNotMatch(failed, /Type \/retry/);
+    assert.strictEqual(postsAtFailure, 1);
+    // The resent question is the same request a fresh send makes.
+    assert.strictEqual(requests.length, 2);
+    assert.deepStrictEqual(requestContents(requests[1]), ['First question', 'First answer.', 'Second question']);
+    assert.deepStrictEqual(saved.prompts, ['First question', 'Second question']);
+  } finally {
+    await ui.close();
+  }
+});
+
+test('a failed chat request goes back into an empty composer without saying it was not sent', async () => {
+  const {failed, postsAtFailure, requests, saved, ui} = await failThenResend('request', new client.ChatApiError(
+    'Chat generation is temporarily unavailable. Try again later.', {code: 'generation_unavailable', requestId: 'gen-req-4'}));
+  try {
+    assert.match(failed, /\(Request ID: gen-req-4\) The chat service may have received your question\. Your question is back in the composer\. Press Enter to send it again\./);
+    assert.match(failed, /Press Enter to send it again(?! ·)/);
+    assert.doesNotMatch(failed, /not sent|Type \/retry/i);
+    assert.strictEqual(postsAtFailure, 2);
+    assert.strictEqual(requests.length, 3);
+    assert.deepStrictEqual(requests[2], requests[1]);
+    assert.deepStrictEqual(requestContents(requests[2]), ['First question', 'First answer.', 'Second question']);
+    assert.deepStrictEqual(saved.prompts, ['First question', 'Second question']);
+  } finally {
+    await ui.close();
+  }
+});
+
+test('a failed //question comes back as typed, and a failed /retry of it comes back escaped', async () => {
+  const requests = [];
+  const services = {
+    ...client, ensureChatServiceAwake: async () => {},
+    async requestChat(messages) {
+      requests.push(messages);
+      if (requests.length < 4) throw new client.ChatApiError('Chat service is busy.');
+      return {message: 'Literal answer.'};
+    }
+  };
+  const ui = await terminalApp({services});
+  try {
+    await ui.type('//literal\r');
+    await ui.expectScreen(/│ › \/\/literal/);
+    // Enter sends the restored text as a question, not as a command.
+    await ui.type('\r');
+    await waitFor(() => requests.length === 2);
+    await ui.expectScreen(/│ › \/\/literal/);
+    // A /retry has no typed text; the question still comes back escaped.
+    await ui.type('\u0015/retry\r');
+    await waitFor(() => requests.length === 3);
+    await ui.expectScreen(/│ › \/\/literal/);
+    await ui.type('\r');
+    await ui.expectScreen(/Literal answer\./);
+    assert.strictEqual(requests.length, 4);
+    for (const request of requests) assert.deepStrictEqual(requestContents(request), ['/literal']);
+    assert.doesNotMatch(ui.screen(), /Unknown command/);
+    // Recall holds the question once.
+    await ui.type('\u001b[A');
+    await ui.expectScreen(/│ › \/\/literal/);
+    await ui.type('\u001b[A');
+    await ui.settle();
+    assert.match(composerLine(ui), /│ › \/\/literal\s/);
+  } finally {
+    await ui.close();
+  }
+});
+
+test('Esc, Ctrl+C or /clear during a request leaves the composer empty', async () => {
+  for (const [key, notice] of [
+    ['\u001b', /Cancelled\. Ready for your next message\./],
+    ['\u0003', /Cancelled\. Ready for your next message\./],
+    ['/clear\r', /Conversation cleared/]
+  ]) {
+    const requests = [];
+    const services = {
+      ...client, ensureChatServiceAwake: async () => {},
+      requestChat(messages, options) {
+        requests.push(messages);
+        return new Promise((_resolve, reject) => {
+          options.signal.addEventListener('abort', () => reject(new client.ChatApiError('Chat request was cancelled.')), {once: true});
+        });
+      }
+    };
+    const ui = await terminalApp({services});
+    try {
+      await ui.type('Stop this question\r');
+      await waitFor(() => requests.length === 1);
+      await ui.type(key);
+      await ui.expectScreen(notice);
+      await ui.settle();
+      assert.match(composerLine(ui), /│ › Ask anything/);
+      assert.doesNotMatch(ui.screen(), /CHAT ERROR|back in the composer/);
+      assert.strictEqual(requests.length, 1);
+    } finally {
+      await ui.close();
+    }
   }
 });
