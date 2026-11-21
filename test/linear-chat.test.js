@@ -344,6 +344,20 @@ test('linear chat sanitizes replies, sources and model labels', async () => {
   assert.doesNotMatch(out, /javascript:/);
 });
 
+test('linear chat prints replies and sources without bidi overrides or zero-width characters', async () => {
+  const s = session(async () => ({
+    message: 'Answer \u202egnp.exe\u202c \u2067x\u2069\u200b [1] 👩\u200d💻.',
+    webSources: [{ title: 'Title \u202eevil\u202c\ufeff', url: 'https://example.com/a' }]
+  }));
+  s.send('Q\n');
+  s.input.end();
+  await s.chat.finished;
+  const out = s.out();
+  assert.doesNotMatch(out, /[\u200B\u202A-\u202E\u2060-\u2064\u2066-\u2069\uFEFF]/);
+  assert.match(out, /OTEKIN:\nAnswer gnp\.exe x \[1\] 👩\u200d💻\./);
+  assert.match(out, /1\. Title evil https:\/\/example\.com\/a\n/);
+});
+
 test('linear chat echoes questions without terminal controls but sends them as typed', async () => {
   const typed = 'clear\u001b[2J this \u001b]52;c;ZXZpbA==\u0007now';
   const s = session(async () => ({ message: 'Answer.' }), { start: { firstPrompt: 'first\u001b[1A' } });

@@ -2033,6 +2033,57 @@ test('/sources opens the selected link, or shows it with --no-open, and never sh
   }
 });
 
+// Bidi embeddings, overrides and isolates, and the stray zero-width characters cleanText removes.
+const INVISIBLE_FORMAT = /[\u200B\u202A-\u202E\u2060-\u2064\u2066-\u2069\uFEFF]/;
+
+test('replies, /sources, /save and restored history never show bidi overrides or zero-width characters', async () => {
+  const {directory, file} = historyDirectory();
+  const saveDirectory = fs.mkdtempSync(path.join(os.tmpdir(), 'otekin-fullscreen-bidi-'));
+  const services = {...client, ensureChatServiceAwake: async () => {}, requestChat: async () => ({
+    message: 'Live \u202Egnp.exe\u202C answer\u200B [1].\n\nSources:\n1. [Live \u202Eevil\u202C](https://example.com/live)',
+    model: 'bidi-model',
+    webSources: [{title: 'Live \u202Eevil\u202C\uFEFF', url: 'https://example.com/live'}]
+  })};
+  const savedFiles = () => fs.readdirSync(saveDirectory).filter(name => name.endsWith('.md')).sort();
+  try {
+    fs.mkdirSync(path.dirname(file), {recursive: true});
+    fs.writeFileSync(file, JSON.stringify({version: 1, history: [], prompts: [], messages: [
+      {role: 'user', content: 'Saved \u2067question\u2069'},
+      {role: 'assistant', model: 'saved-model', content: 'Saved \u202Eanswer\u202C [1].', answer: 'Saved \u202Eanswer\u202C [1].', sources: [
+        {number: 1, title: 'Saved \u202Etitle\u202C', url: 'https://example.com/saved'}
+      ]}
+    ]}));
+    const ui = await terminalApp({columns: 100, rows: 40, services, historyFile: file, saveDirectory});
+    try {
+      await ui.expectScreen(/Saved answer \[1\]/);
+      await ui.type('Ask\r');
+      await ui.expectScreen(/Live gnp\.exe answer \[1\]\.\n+\s*Sources: \[1\] Live evil/);
+      await ui.type('/sources\r');
+      await ui.expectScreen(/Sources · reply 2 of 2/);
+      assert.match(ui.screen(), /› \[1\] Live evil\n.*https:\/\/example\.com\/live/);
+      await ui.type('\u001b[D');
+      await ui.expectScreen(/Sources · reply 1 of 2/);
+      assert.match(ui.screen(), /› \[1\] Saved title\n.*https:\/\/example\.com\/saved/);
+      await ui.type('\u001b');
+      await ui.type('/save\r');
+      await waitFor(() => savedFiles().length === 1);
+      const text = fs.readFileSync(path.join(saveDirectory, savedFiles()[0]), 'utf8');
+      assert.match(text, /Saved question\n\n## saved-model\n\nSaved answer \[1\]\.\n\nSources: \[\\\[1\\\] Saved title\]\(https:\/\/example\.com\/saved\)\n/);
+      assert.match(text, /Live gnp\.exe answer \[1\]\.\n\nSources: \[\\\[1\\\] Live evil\]\(https:\/\/example\.com\/live\)\n$/);
+      assert.doesNotMatch(text, INVISIBLE_FORMAT);
+      assert.doesNotMatch(ui.raw(), INVISIBLE_FORMAT);
+    } finally {
+      await ui.close();
+    }
+    // The transcript saved after the reply holds the cleaned answers and titles. The request
+    // history keeps the gateway's text, as it does for every other character cleanText removes.
+    assert.doesNotMatch(JSON.stringify(JSON.parse(fs.readFileSync(file, 'utf8')).messages), INVISIBLE_FORMAT);
+  } finally {
+    fs.rmSync(directory, {recursive: true, force: true});
+    fs.rmSync(saveDirectory, {recursive: true, force: true});
+  }
+});
+
 test('/sources without a cited reply adds a notice and stays in chat', async () => {
   const ui = await terminalApp({services: {
     ...client, ensureChatServiceAwake: async () => {}, requestChat: async () => ({message: 'Uncited answer.'})

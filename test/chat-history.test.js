@@ -389,6 +389,29 @@ test('chat history strips terminal escapes from restored text', () => {
   assert.deepStrictEqual(restored.prompts, ['Recall  me']);
 });
 
+test('chat history removes bidi overrides and zero-width characters from restored text and titles', () => {
+  const restored = store.parseHistory(JSON.stringify({
+    version: 1,
+    history: [],
+    messages: [
+      { role: 'user', content: 'Ask \u202eabout\u202c it' },
+      { role: 'assistant', model: 'fixture-model', content: 'Answer \u202egnp.exe\u202c [1][2].', answer: 'Answer \u202egnp.exe\u202c [1][2].',
+        sources: [{ number: 1, title: 'Title \u202eevil\u202c', url: 'https://example.com/a' }, { number: 2, title: '\u2066👩\u200d💻\u2069\ufeff' }] }
+    ],
+    prompts: ['Ask \u202eabout\u202c it\u200b']
+  }));
+  assert.deepStrictEqual(restored.messages, [
+    { role: 'user', content: 'Ask about it' },
+    { role: 'assistant', model: 'fixture-model', content: 'Answer gnp.exe [1][2].', answer: 'Answer gnp.exe [1][2].',
+      sources: [{ number: 1, title: 'Title evil', url: 'https://example.com/a' }, { number: 2, title: '👩\u200d💻', url: null }] }
+  ]);
+  assert.deepStrictEqual(restored.prompts, ['Ask about it']);
+  // Saving it again writes the cleaned title and answer.
+  const saved = JSON.parse(store.serializeHistory({ history: [], messages: restored.messages, prompts: [] }));
+  assert.deepStrictEqual(saved.messages[1].sources, [{ number: 1, title: 'Title evil', url: 'https://example.com/a' }, { number: 2, title: '👩\u200d💻' }]);
+  assert.strictEqual(saved.messages[1].answer, 'Answer gnp.exe [1][2].');
+});
+
 if (process.platform !== 'win32') {
   test('chat history file is owner-only on POSIX', () => {
     const { directory, file } = tempFile();
