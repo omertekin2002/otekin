@@ -524,6 +524,22 @@ test('CLI compacts researched source links in ordinary output', async () => {
   });
 });
 
+test('CLI one-shot chat prints the answer and sources without bidi overrides or zero-width characters', async () => {
+  await withServer((request, response) => {
+    request.resume();
+    response.writeHead(200, { 'Content-Type': 'application/json' });
+    response.end(JSON.stringify({
+      message: 'Answer \u202egnp.exe\u202c\u200b [1].\n\nSources:\n1. [Title \u2067evil\u2069\ufeff](https://example.com/a)',
+      webSources: [{ title: 'Title \u2067evil\u2069\ufeff', url: 'https://example.com/a' }]
+    }));
+  }, async (endpoint) => {
+    const result = await runCli(['chat', 'Question'], { OTEKIN_CHAT_API_URL: endpoint });
+    assert.strictEqual(result.code, 0);
+    assert.strictEqual(result.stdout, 'Answer gnp.exe [1].\n\nSources: [1] Title evil\n');
+    assert.strictEqual(result.stderr, '');
+  });
+});
+
 test('CLI chat failures show safe categories and request IDs while hiding response bodies', async () => {
   await withServer((request, response) => {
     request.resume();

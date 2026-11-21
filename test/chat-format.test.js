@@ -353,6 +353,35 @@ test('source titles lose C1 control characters, so saved history keeps them', ()
   assert.deepStrictEqual(saved.messages[0].sources, resolved.sources);
 });
 
+test('answers and source titles lose bidi overrides, isolates and stray zero-width characters', () => {
+  const resolved = resolveChatResponse({
+    message: 'Answer \u202egnp.exe\u202c [1][2].\n\nSources:\n1. [Title \u202eevil\u202c](https://example.com/a)\n' +
+      '2. [👩\u200d💻 می\u200cخواهم\u200f](https://example.com/c)\n'
+  });
+  assert.strictEqual(resolved.answer, 'Answer gnp.exe [1][2].');
+  assert.deepStrictEqual(resolved.sources, [
+    { number: 1, title: 'Title evil', url: 'https://example.com/a' },
+    { number: 2, title: '👩\u200d💻 می\u200cخواهم\u200f', url: 'https://example.com/c' }
+  ]);
+  // A title made only of removed characters is treated exactly like an empty one.
+  const footer = (title) => `Answer [1].\n\nSources:\n1. [${title}](https://example.com/b)\n2. https://example.com/d\n`;
+  assert.deepStrictEqual(resolveChatResponse({ message: footer('\u2067\u200b\ufeff') }), resolveChatResponse({ message: footer('') }));
+  assert.deepStrictEqual(
+    resolveChatResponse({ message: 'A [1].', webSources: [{ title: '\u2067\u200b\ufeff', url: 'https://example.com/b' }] }),
+    resolveChatResponse({ message: 'A [1].', webSources: [{ title: '', url: 'https://example.com/b' }] }));
+  const structured = resolveChatResponse({
+    message: 'Answer [1][2].',
+    webSources: [{ number: 1, title: '\ufeffNews\u2060 \u202dTitle', url: 'https://example.com/news' },
+      { number: 2, title: '\u202a\u202b\u2068' }]
+  });
+  assert.deepStrictEqual(structured.sources, [
+    { number: 1, title: 'News Title', url: 'https://example.com/news' },
+    { number: 2, title: 'Source 2', url: null }
+  ]);
+  assert.doesNotMatch(formatResolvedResponse(resolved, { hyperlinks: true }) + formatResolvedResponse(structured),
+    /[\u200B\u202A-\u202E\u2060-\u2064\u2066-\u2069\uFEFF]/);
+});
+
 test('sources keep their whole title, up to what saved history accepts, while the source row shortens it', () => {
   const store = require('../lib/chat-history');
   const long = 'A remarkably long source title that keeps going well past the forty-eight characters';

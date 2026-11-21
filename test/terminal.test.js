@@ -124,6 +124,34 @@ test('display text strips remote terminal control sequences but keeps readable c
   assert.strictEqual(cleanText('Hello\u001b[2J\nWorld\u001b]0;bad title\u0007'), 'Hello\nWorld');
 });
 
+// Bidi embeddings, overrides and isolates, the zero-width space, word joiner and invisible
+// operators, and the BOM.
+const REMOVED_FORMAT_CODES = [0x200b, 0x202a, 0x202b, 0x202c, 0x202d, 0x202e, 0x2060, 0x2061, 0x2062, 0x2063, 0x2064,
+  0x2066, 0x2067, 0x2068, 0x2069, 0xfeff];
+// ZWNJ, ZWJ, LRM, RLM and ALM.
+const KEPT_FORMAT_CODES = [0x200c, 0x200d, 0x200e, 0x200f, 0x61c];
+
+test('display text drops bidi embeddings, overrides, isolates and stray zero-width characters', () => {
+  for (const code of REMOVED_FORMAT_CODES) {
+    const char = String.fromCharCode(code);
+    assert.strictEqual(cleanText(`a${char}b${char}`), 'ab', `U+${code.toString(16)}`);
+  }
+  // The characters just outside each removed range stay.
+  for (const code of [...KEPT_FORMAT_CODES, 0x200a, 0x2029, 0x202f, 0x205f, 0x2065, 0x206a, 0xfefe, 0xff00]) {
+    const text = `a${String.fromCharCode(code)}b`;
+    assert.strictEqual(cleanText(text), text, `U+${code.toString(16)}`);
+  }
+  assert.strictEqual(cleanText('a \u202eexe.gnp\u202c \u2067x\u2069 \u200bz\u2060w\ufeff'), 'a exe.gnp x zw');
+  // An emoji ZWJ sequence, a Persian word with ZWNJ and RTL text with its marks come out unchanged.
+  for (const text of ['👩\u200d💻', 'می\u200cخواهم', 'שלום\u200f (123)\u200e', 'مرحبا\u061c 1']) {
+    assert.strictEqual(cleanText(text), text);
+  }
+  assert.strictEqual(cleanText('a \u202eb\u202c \u2067c\u2069 \u200bd\u2060e\ufeff 👩\u200d💻 می\u200cخواهم \u200ff'),
+    'a b c de 👩\u200d💻 می\u200cخواهم \u200ff');
+  // Removing them never joins the pieces of an escape sequence.
+  assert.strictEqual(cleanText('\u001b\u202e[31mred'), '[31mred');
+});
+
 // DEL, C1 controls and the bidi marks, embeddings, overrides and isolates.
 const JSON_UNSAFE_CODES = [0x7f, ...Array.from({ length: 0x20 }, (_, index) => 0x80 + index),
   0x61c, 0x200e, 0x200f, 0x202a, 0x202b, 0x202c, 0x202d, 0x202e, 0x2066, 0x2067, 0x2068, 0x2069];

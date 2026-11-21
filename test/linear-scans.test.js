@@ -14,7 +14,8 @@ const { hideCompleteImageData, hidePartialImageData } = require('../lib/image-da
 const oldCleanText = (text) => text
   .replace(/(?:\u001B\]|\u009D)[^\u0007\u001B]*(?:\u0007|\u001B\\)/g, '')
   .replace(/(?:\u001B\[|\u009B)[0-?]*[ -/]*[@-~]/g, '')
-  .replace(/[\u0000-\u0008\u000B-\u001F\u007F-\u009F]/g, '');
+  .replace(/[\u0000-\u0008\u000B-\u001F\u007F-\u009F]/g, '')
+  .replace(/[\u200B\u202A-\u202E\u2060-\u2064\u2066-\u2069\uFEFF]/g, '');
 const oldCompactImages = (text) => hideCompleteImageData(
   text.replace(/!\[([^\]]*)\]\(\s*data:image\/[a-z0-9.+-]+;base64,[^)]+\)/gi,
     (_match, alt) => `[generated image${alt.trim() ? `: ${alt.trim()}` : ''}]`),
@@ -48,7 +49,7 @@ function randomTexts(pieces, runs, maxPieces) {
 test('cleanText removes OSC and other escapes exactly as its regular expressions did', () => {
   const pieces = [
     '\u001B', '\u001B]', '\u001B\\', '\u001B[', '\u009D', '\u009B', '\u0007', '\\', ']', '[', 'a', ' ', '\n', '\r',
-    '0;', '8;;https://x.test', 'm', '1', '\u0085', '\u009C', 'é'
+    '0;', '8;;https://x.test', 'm', '1', '\u0085', '\u009C', 'é', '\u202E', '\u2066', '\u200B', '\uFEFF', '\u200D', '\u200F'
   ];
   for (const text of randomTexts(pieces, 20000, 20)) {
     assert.strictEqual(cleanText(text), oldCleanText(text), JSON.stringify(text));
@@ -78,6 +79,16 @@ test('trailing blank lines and whitespace are trimmed exactly as their regular e
     const text = 'x' + String.fromCharCode(code).repeat(2);
     assert.strictEqual(text.trimEnd(), text.replace(/\s+$/, ''), `U+${code.toString(16)}`);
   }
+});
+
+test('cleanText removes 4 MB of alternating invisible format and kept characters in linear time', () => {
+  const pair = '\u202E\u200D\u2066\u200C\u200B\u200F\uFEFFx';
+  const text = pair.repeat(512 * 1024);
+  const started = Date.now();
+  const output = cleanText(text);
+  const elapsed = Date.now() - started;
+  assert.strictEqual(output, '\u200D\u200C\u200Fx'.repeat(512 * 1024));
+  assert.ok(elapsed < 1000, `took ${elapsed} ms`);
 });
 
 test('JSON output escapes a 4 MB run of CSI introducers in linear time', () => {
