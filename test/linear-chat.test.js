@@ -180,9 +180,108 @@ test('linear chat reports errors safely and keeps the previous history', async (
   s.send('Q1\nQ2\nQ3\nQ4\n');
   s.input.end();
   await s.chat.finished;
-  assert.strictEqual(s.err(), 'Chat error: Chat service is busy. (Request ID: req-42)\nChat error: Bad id\n');
+  // Piped input runs questions in order, so no /retry hint; the request had been sent.
+  assert.strictEqual(s.err(), 'Chat error: Chat service is busy. (Request ID: req-42) The chat service may have received your question.\n' +
+    'Chat error: Bad id. The chat service may have received your question.\n');
   assert.deepStrictEqual(s.requests[3].messages.map((message) => message.content), ['Q1', 'Answer 1.', 'Q4']);
   assert.match(s.out(), /Answer 4\./);
+});
+
+test('linear chat says a question stopped at the wake-up check was not sent, and /retry sends it with its context', async () => {
+  const directory = tempDirectory();
+  try {
+    let wakes = 0;
+    const s = session(async (_messages, _opts, number) => cited(number), {
+      ensureChatServiceAwake: async () => {
+        wakes += 1;
+        if (wakes === 2) throw Object.assign(new Error('Chat service did not wake up in time.'), { requestId: 'wake-9' });
+        return { ok: true };
+      },
+      start: { interactive: true, saveDirectory: directory, now: () => FIXED_NOW }
+    });
+    s.send('Q1\n');
+    await s.idle(2);
+    s.send('Q2\n');
+    await s.idle(3);
+    // The wake-up check failed, so the gateway never saw Q2.
+    assert.strictEqual(s.requests.length, 1);
+    assert.strictEqual(s.err(), 'Chat error: Chat service did not wake up in time. (Request ID: wake-9) ' +
+      'Your question was not sent. Type /retry to send it again.\n');
+    s.send('/retry\n');
+    await s.idle(4);
+    s.send('/save\n');
+    s.input.end();
+    await s.chat.finished;
+    assert.strictEqual(s.requests.length, 2);
+    const contents = (request) => request.messages.map((message) => message.content.split('\n')[0]);
+    assert.deepStrictEqual(contents(s.requests[1]), ['Q1', 'Answer 1 [1].', 'Q2']);
+    const markdown = fs.readFileSync(path.join(directory, filesIn(directory)[0]), 'utf8');
+    assert.match(markdown, /## You\n\nQ1\n\n## fixture-model · [^\n]+\n\nAnswer 1 \[1\]\.[\s\S]*## You\n\nQ2\n\n## fixture-model · [^\n]+\n\nAnswer 2 \[1\]\./);
+    assert.strictEqual(markdown.split('## You\n').length - 1, 2);
+    assert.doesNotMatch(markdown, /Chat error|not sent|\/retry/);
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('linear chat never claims a failed chat request was not sent, and /retry resends the same request', async () => {
+  const directory = tempDirectory();
+  try {
+    const s = session(async (_messages, _opts, number) => {
+      if (number === 2) {
+        throw Object.assign(new Error('Chat generation is temporarily unavailable. Try again later.'), { requestId: 'gen-5' });
+      }
+      return cited(number);
+    }, { start: { interactive: true, saveDirectory: directory, now: () => FIXED_NOW } });
+    s.send('Q1\n');
+    await s.idle(2);
+    s.send('Q2\n');
+    await s.idle(3);
+    assert.strictEqual(s.requests.length, 2);
+    assert.strictEqual(s.err(), 'Chat error: Chat generation is temporarily unavailable. Try again later. (Request ID: gen-5) ' +
+      'The chat service may have received your question. Type /retry to send it again.\n');
+    assert.doesNotMatch(s.err(), /not sent/);
+    s.send('/retry\n');
+    await s.idle(4);
+    s.send('/save\n');
+    s.input.end();
+    await s.chat.finished;
+    assert.strictEqual(s.requests.length, 3);
+    assert.deepStrictEqual(s.requests[2].messages, s.requests[1].messages);
+    const markdown = fs.readFileSync(path.join(directory, filesIn(directory)[0]), 'utf8');
+    assert.match(markdown, /Answer 1 \[1\]\.[\s\S]*## You\n\nQ2\n\n## fixture-model · [^\n]+\n\nAnswer 3 \[1\]\./);
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('linear chat piped input reports a wake-up failure without a /retry hint', async () => {
+  const s = session(async () => ({ message: 'Unused.' }), {
+    ensureChatServiceAwake: async () => { throw new Error('Unable to wake chat service.'); }
+  });
+  s.send('Q1\n');
+  s.input.end();
+  await s.chat.finished;
+  assert.strictEqual(s.requests.length, 0);
+  assert.strictEqual(s.err(), 'Chat error: Unable to wake chat service. Your question was not sent.\n');
+});
+
+test('linear chat cancelling during the wake-up check prints no error and sends nothing', async () => {
+  const wake = deferred();
+  const s = session(async () => ({ message: 'Unused.' }), {
+    ensureChatServiceAwake: () => wake.promise,
+    start: { interactive: true, wakeNoticeDelayMs: 1000 }
+  });
+  s.send('Q1\n');
+  await tick(5);
+  s.chat.interrupt();
+  await s.idle(2);
+  wake.resolve();
+  s.input.end();
+  await s.chat.finished;
+  assert.strictEqual(s.requests.length, 0);
+  assert.strictEqual(s.err(), '');
+  assert.match(s.out(), /Cancelled\./);
 });
 
 test('linear chat cancels a reply in flight and never prints the late reply', async () => {
@@ -300,7 +399,7 @@ test('linear chat retries a failed first prompt that looks like a command and sa
     s.send('/retry\n/save\n/retry\n/save\n');
     s.input.end();
     await s.chat.finished;
-    assert.strictEqual(s.err(), 'Chat error: Try again.\n');
+    assert.strictEqual(s.err(), 'Chat error: Try again. The chat service may have received your question.\n');
     assert.deepStrictEqual(s.requests.map((request) => request.messages), Array(3).fill([{ role: 'user', content: '/exit' }]));
     // One save after each reply; file names do not sort in the order they were written.
     const answers = filesIn(directory).map((file) => {
@@ -342,6 +441,20 @@ test('linear chat sanitizes replies, sources and model labels', async () => {
   // Titles lose their control characters; a javascript: URL is not printed.
   assert.match(out, /1\. Title\[1A here https:\/\/example\.com\/a\n2\. Bad\n/);
   assert.doesNotMatch(out, /javascript:/);
+});
+
+test('linear chat prints replies and sources without bidi overrides or zero-width characters', async () => {
+  const s = session(async () => ({
+    message: 'Answer \u202egnp.exe\u202c \u2067x\u2069\u200b [1] 👩\u200d💻.',
+    webSources: [{ title: 'Title \u202eevil\u202c\ufeff', url: 'https://example.com/a' }]
+  }));
+  s.send('Q\n');
+  s.input.end();
+  await s.chat.finished;
+  const out = s.out();
+  assert.doesNotMatch(out, /[\u200B\u202A-\u202E\u2060-\u2064\u2066-\u2069\uFEFF]/);
+  assert.match(out, /OTEKIN:\nAnswer gnp\.exe x \[1\] 👩\u200d💻\./);
+  assert.match(out, /1\. Title evil https:\/\/example\.com\/a\n/);
 });
 
 test('linear chat echoes questions without terminal controls but sends them as typed', async () => {
@@ -421,7 +534,7 @@ test('linear chat /retry after a failed reply sends the same question and prints
   assert.strictEqual(s.requests.length, 2);
   assert.deepStrictEqual(s.requests[0].messages, [{ role: 'user', content: 'Q1' }]);
   assert.deepStrictEqual(s.requests[1].messages, s.requests[0].messages);
-  assert.strictEqual(s.err(), 'Chat error: Chat service is busy.\n');
+  assert.strictEqual(s.err(), 'Chat error: Chat service is busy. The chat service may have received your question.\n');
   assert.strictEqual(s.out().split('Retried answer.').length - 1, 1);
   assert.match(s.out(), /You: \/retry\nResearching…\nOTEKIN:\nRetried answer\.\n/);
   assert.doesNotMatch(s.out(), REDRAW);
@@ -534,6 +647,76 @@ test('linear chat /retry while a reply is on the way sends nothing and says so',
   assert.strictEqual(s.requests.length, 1);
   assert.strictEqual(s.out().split('Only answer.').length - 1, 1);
   assert.match(s.out(), /OTEKIN:\nOnly answer\.\n\nYou: \n$/);
+});
+
+test('linear chat at a terminal names the question /retry sends again, cleaned and on one line', async () => {
+  // An unanswered question, typed with terminal controls that the line leaves out.
+  const s = session(async (_messages, _opts, number) => {
+    if (number === 1) throw new Error('Chat service is busy.');
+    return { message: `Answer ${number}.` };
+  }, { start: { interactive: true } });
+  s.send('Q1 \u001b[31mred\u001b[0m‮\n');
+  await s.idle(2);
+  s.send('/retry\n');
+  await s.idle(3);
+  assert.match(s.out(), /You: \/retry\nSending again: Q1 red\nResearching…\nOTEKIN:\nAnswer 2\.\n/);
+  assert.strictEqual(s.requests.length, 2);
+
+  // A replacing /retry of a long question is cut to 60 characters; a 60-character one is not.
+  const long = 'L'.repeat(59) + 'é' + ' and the rest';
+  const sixty = 'S'.repeat(60);
+  s.send(`${long}\n`);
+  await s.idle(4);
+  s.send('/retry\n');
+  await s.idle(5);
+  s.send(`${sixty}\n`);
+  await s.idle(6);
+  s.send('/retry\n');
+  await s.idle(7);
+  s.input.end();
+  await s.chat.finished;
+  assert.match(s.out(), new RegExp(`You: /retry\\nSending again: ${'L'.repeat(59)}é…\\nResearching…\\n`));
+  assert.match(s.out(), new RegExp(`You: /retry\\nSending again: ${sixty}\\nResearching…\\n`));
+  // One request per question and per /retry.
+  assert.strictEqual(s.requests.length, 6);
+  assert.strictEqual(s.out().split('Sending again:').length - 1, 3);
+});
+
+test('linear chat marks a multi-line question that /retry sends again with …', async () => {
+  for (const [firstPrompt, label] of [
+    ['First line\nsecond line', 'First line…'],
+    ['M'.repeat(65) + '\nmore', 'M'.repeat(60) + '…']
+  ]) {
+    const s = session(async (_messages, _opts, number) => {
+      if (number === 1) throw new Error('Chat service is busy.');
+      return { message: 'Answered.' };
+    }, { start: { interactive: true, firstPrompt } });
+    await s.idle(1);
+    s.send('/retry\n');
+    s.input.end();
+    await s.chat.finished;
+    assert.ok(s.out().includes(`You: /retry\nSending again: ${label}\nResearching…\n`), s.out());
+    assert.deepStrictEqual(s.requests.map((request) => request.messages), Array(2).fill([{ role: 'user', content: firstPrompt }]));
+  }
+});
+
+test('linear chat piped /retry output is unchanged', async () => {
+  const s = session(async (_messages, _opts, number) => {
+    if (number === 1) throw new Error('Chat service is busy.');
+    return { message: `Answer ${number}.` };
+  });
+  s.send('Q1\n/retry\nQ2\n/retry\n');
+  // Ending the input after the last prompt keeps how the session ends the same on every run.
+  await s.idle(5);
+  s.input.end();
+  await s.chat.finished;
+  assert.strictEqual(s.out(), 'otekin linear chat · one line at a time, no animation\n' +
+    'Type a question and press Enter. /help lists commands, /exit ends the chat. Ctrl+C cancels a reply.\n' +
+    'You: Q1\nResearching…\n' +
+    'You: /retry\nResearching…\nOTEKIN:\nAnswer 2.\n\n' +
+    'You: Q2\nResearching…\nOTEKIN:\nAnswer 3.\n\n' +
+    'You: /retry\nResearching…\nOTEKIN:\nAnswer 4.\n\nYou: \n');
+  assert.strictEqual(s.requests.length, 4);
 });
 
 test('linear chat /save writes the questions and replies only, and nothing when there is nothing to save', async () => {

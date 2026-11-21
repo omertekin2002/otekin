@@ -14,7 +14,9 @@ const { saveGeneratedImages } = require('../lib/chat-images');
 const { browserCommand } = require('../lib/browser');
 const chatHistory = require('../lib/chat-history');
 const { historyFileFor } = chatHistory;
-const { cleanText, createTheme, startProgress, createActivityDisplay, reducedMotionFor } = require('../lib/terminal');
+const {
+  cleanText, chatErrorMessage, createTheme, startProgress, createActivityDisplay, reducedMotionFor, stringifyJsonForOutput
+} = require('../lib/terminal');
 const { createStreamPreview } = require('../lib/stream-preview');
 const profile = require('../lib/profile');
 const { installPilcrow } = require('../lib/install-pilcrow');
@@ -210,7 +212,10 @@ function printNonInteractive() {
 
 /** @returns {Promise<void>} Resolves once the browser process has started. */
 function openInBrowser(url) {
-  const { command, args } = browserCommand(process.platform, url);
+  const launch = browserCommand(process.platform, url);
+  // Not an http(s) link: callers report it like any other failed open and show the URL instead.
+  if (!launch) return Promise.reject(new Error('Not an http(s) link'));
+  const { command, args } = launch;
 
   return new Promise((resolve, reject) => {
     const child = spawn(command, args, { stdio: 'ignore', detached: true });
@@ -283,21 +288,12 @@ function writeLine(value) {
   process.stdout.write(String(value).replace(/(?:\r?\n[ \t]*)+$/, '') + '\n');
 }
 
-function errorMessage(error) {
-  const message = error && error.message ? cleanText(error.message) : 'Chat request failed.';
-  const requestId = error && typeof error.requestId === 'string'
-    ? error.requestId.trim()
-    : '';
-  if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(requestId)) return message;
-  return `${message} (Request ID: ${requestId})`;
-}
-
 async function runOneShotChat(prompt, opts) {
   let messages;
   try {
     messages = prepareRequestMessages([], prompt);
   } catch (error) {
-    process.stderr.write(`Chat error: ${errorMessage(error)}\n`);
+    process.stderr.write(`Chat error: ${chatErrorMessage(error)}\n`);
     process.exitCode = 1;
     return;
   }
@@ -313,7 +309,8 @@ async function runOneShotChat(prompt, opts) {
     clearWakeProgress();
   } catch (error) {
     clearWakeProgress();
-    process.stderr.write(`Chat error: ${errorMessage(error)}\n`);
+    // One-shot chat has no composer to type /retry in, so it never offers the hint.
+    process.stderr.write(`Chat error: ${chatErrorMessage(error, 'readiness')}\n`);
     process.exitCode = 1;
     return;
   }
@@ -350,7 +347,7 @@ async function runOneShotChat(prompt, opts) {
     if (preview) preview.clear();
     if (activity) activity.finish(response);
     if (opts.json) {
-      process.stdout.write(JSON.stringify(response, null, 2) + '\n');
+      process.stdout.write(stringifyJsonForOutput(response) + '\n');
     } else {
       if (outputTheme.interactive) process.stdout.write('\n' + outputTheme.strong('  AI') + '\n\n');
       writeLine(formatChatResponse(saveGeneratedImages(response), {
@@ -366,7 +363,7 @@ async function runOneShotChat(prompt, opts) {
       process.exitCode = 130;
       return;
     }
-    process.stderr.write(`Chat error: ${errorMessage(error)}\n`);
+    process.stderr.write(`Chat error: ${chatErrorMessage(error, 'request')}\n`);
     process.exitCode = 1;
   } finally {
     if (preview) process.removeListener('SIGINT', onInterrupt);
@@ -495,7 +492,7 @@ async function main() {
   }
 
   if (opts.json) {
-    process.stdout.write(JSON.stringify({ message: `${profile.greeting} ${profile.tagline}`, links: LINKS }, null, 2) + '\n');
+    process.stdout.write(stringifyJsonForOutput({ message: `${profile.greeting} ${profile.tagline}`, links: LINKS }) + '\n');
     return;
   }
 

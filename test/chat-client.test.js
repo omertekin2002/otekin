@@ -465,6 +465,40 @@ test('assistant history retains tool replay and compacts generated images', () =
   assert.match(reply.message, /base64/);
 });
 
+test('completed replies and their follow-up history compact 24 MiB of raw image data', () => {
+  const { MAX_RESPONSE_BYTES, assistantMessageFromResponse } = require('../lib/chat-client');
+  for (const separator of [' ', '\n']) {
+    const message = ('data:image/png;base64,AAAA' + (separator + 'A'.repeat(76)).repeat(Math.ceil(MAX_RESPONSE_BYTES / 77)))
+      .slice(0, MAX_RESPONSE_BYTES);
+    let started = Date.now();
+    const assistant = assistantMessageFromResponse({ message });
+    // About 0.1 s here; a quadratic scan would take minutes.
+    assert(Date.now() - started < 3000, `reply took ${Date.now() - started} ms`);
+    assert.strictEqual(assistant.content, '[generated image data]');
+    started = Date.now();
+    const messages = prepareRequestMessages([{ role: 'user', content: 'Draw' }, { role: 'assistant', content: message }], 'Again');
+    assert(Date.now() - started < 3000, `history took ${Date.now() - started} ms`);
+    assert.strictEqual(messages[1].content, '[generated image data]');
+  }
+});
+
+test('completed replies compact only image data long enough to be an image', () => {
+  const { assistantMessageFromResponse } = require('../lib/chat-client');
+  const content = (message) => assistantMessageFromResponse({ message }).content;
+  const data = 'QUJD'.repeat(30) + '\n' + 'QUJD'.repeat(30) + '==';
+  assert.strictEqual(content(`See data:image/png;base64,${data}. Done`), 'See [generated image data]. Done');
+  assert.strictEqual(content(`DATA:IMAGE/SVG+XML;BASE64,${data}`), '[generated image data]');
+  assert.strictEqual(content(`![ A chart ](data:image/png;base64,${data})`), '[generated image: A chart]');
+  assert.strictEqual(content(`![](data:image/png;base64,${data})`), '[generated image]');
+  const unchanged = [
+    `data:image/png;base64,${'A'.repeat(199)}`,
+    `data:text/plain;base64,${data}`,
+    `data:image/;base64,${data}`,
+    `data:image/png,${data}`
+  ];
+  for (const message of unchanged) assert.strictEqual(content(message), message.slice(0, MAX_MESSAGE_CHARACTERS));
+});
+
 test('history keeps only the newest source catalog and respects serialized and UTF-8 budgets', () => {
   const history = [];
   for (let index = 0; index < 14; index += 1) {

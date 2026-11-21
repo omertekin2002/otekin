@@ -195,6 +195,7 @@ test('Pilcrow CLI dispatches installation and upgrade without entering chat', as
 test('CLI preserves bare profile JSON output', async () => {
   const result = await runCli(['--json']);
   assert.strictEqual(result.code, 0);
+  assert.strictEqual(result.stdout, JSON.stringify(JSON.parse(result.stdout), null, 2) + '\n');
   assert.deepStrictEqual(JSON.parse(result.stdout), {
     message: `${GREETING} ${TAGLINE}`,
     links: {
@@ -452,6 +453,57 @@ test('CLI one-shot --json preserves the complete gateway response', async () => 
   });
 });
 
+test('CLI one-shot --json escapes C1 and bidi controls in the reply, sources and URLs', async () => {
+  const controls = '\u009B2J\u009D0;owned\u0007\u0085\u007F\u202E';
+  const gatewayResponse = {
+    message: `Answer ${controls} end`,
+    provider: 'fixture',
+    webSources: [{ title: `Title ${controls}`, url: `https://example.com/${controls}` }]
+  };
+
+  await withServer((request, response) => {
+    request.resume();
+    response.writeHead(200, { 'Content-Type': 'application/json' });
+    response.end(JSON.stringify(gatewayResponse));
+  }, async (endpoint) => {
+    const result = await runCli(['--json', 'chat', 'Question'], { OTEKIN_CHAT_API_URL: endpoint });
+    assert.strictEqual(result.code, 0);
+    assert.strictEqual(result.stderr, '');
+    assert.doesNotMatch(result.stdout, /[\u007F-\u009F\u061C\u200E\u200F\u202A-\u202E\u2066-\u2069]/);
+    for (const escape of ['\\u009b', '\\u009d', '\\u0085', '\\u007f', '\\u202e']) {
+      assert.strictEqual(result.stdout.split(escape).length - 1, 3, escape);
+    }
+    assert.deepStrictEqual(JSON.parse(result.stdout), gatewayResponse);
+
+    // Printed to a terminal, the output changes neither the title nor the screen.
+    const emulator = new Terminal({ cols: 200, rows: 20, convertEol: true, allowProposedApi: true, scrollback: 0 });
+    let title = null;
+    emulator.onTitleChange((value) => { title = value; });
+    await new Promise((resolve) => emulator.write('before\n', () => resolve(undefined)));
+    await new Promise((resolve) => emulator.write(result.stdout, () => resolve(undefined)));
+    const buffer = emulator.buffer.active;
+    const screen = Array.from({ length: buffer.length }, (_, index) =>
+      buffer.getLine(index).translateToString(true)).join('\n');
+    emulator.dispose();
+    assert.strictEqual(title, null);
+    assert.match(screen, /^before\n\{/);
+    assert.match(screen, /"message": "Answer \\u009b2J\\u009d0;owned\\u0007\\u0085\\u007f\\u202e end"/);
+  });
+});
+
+test('CLI one-shot --json output is byte-identical to JSON.stringify without control characters', async () => {
+  const gatewayResponse = { message: 'Ömer · Koç 界 \u{1F469}\u200D\u{1F4BB}', webSources: [{ title: 'T', url: 'https://e.test' }] };
+  await withServer((request, response) => {
+    request.resume();
+    response.writeHead(200, { 'Content-Type': 'application/json' });
+    response.end(JSON.stringify(gatewayResponse));
+  }, async (endpoint) => {
+    const result = await runCli(['--json', 'chat', 'Question'], { OTEKIN_CHAT_API_URL: endpoint });
+    assert.strictEqual(result.code, 0);
+    assert.strictEqual(result.stdout, JSON.stringify(gatewayResponse, null, 2) + '\n');
+  });
+});
+
 test('CLI compacts researched source links in ordinary output', async () => {
   const redirect = 'https://vertexaisearch.cloud.google.com/grounding-api-redirect/very-long-token';
   await withServer((request, response) => {
@@ -472,6 +524,22 @@ test('CLI compacts researched source links in ordinary output', async () => {
   });
 });
 
+test('CLI one-shot chat prints the answer and sources without bidi overrides or zero-width characters', async () => {
+  await withServer((request, response) => {
+    request.resume();
+    response.writeHead(200, { 'Content-Type': 'application/json' });
+    response.end(JSON.stringify({
+      message: 'Answer \u202egnp.exe\u202c\u200b [1].\n\nSources:\n1. [Title \u2067evil\u2069\ufeff](https://example.com/a)',
+      webSources: [{ title: 'Title \u2067evil\u2069\ufeff', url: 'https://example.com/a' }]
+    }));
+  }, async (endpoint) => {
+    const result = await runCli(['chat', 'Question'], { OTEKIN_CHAT_API_URL: endpoint });
+    assert.strictEqual(result.code, 0);
+    assert.strictEqual(result.stdout, 'Answer gnp.exe [1].\n\nSources: [1] Title evil\n');
+    assert.strictEqual(result.stderr, '');
+  });
+});
+
 test('CLI chat failures show safe categories and request IDs while hiding response bodies', async () => {
   await withServer((request, response) => {
     request.resume();
@@ -483,7 +551,8 @@ test('CLI chat failures show safe categories and request IDs while hiding respon
       error: 'secret internal failure detail',
       code: 'generation_unavailable'
     }));
-  }, async (endpoint) => {
+  }, async (endpoint, fixture) => {
+    const posts = () => fixture.getRequests().filter((request) => request.method === 'POST').length;
     const result = await runCli(['chat', 'Question'], {
       OTEKIN_CHAT_API_URL: endpoint
     });
@@ -494,6 +563,16 @@ test('CLI chat failures show safe categories and request IDs while hiding respon
     assert.doesNotMatch(result.stderr, /--research/);
     assert.doesNotMatch(result.stderr, /secret internal failure detail/);
     assert.doesNotMatch(result.stderr, /\n\s+at /);
+    // The question reached the gateway: never "not sent", and no /retry hint without a composer.
+    assert.strictEqual(result.stderr, 'Chat error: Chat generation is temporarily unavailable. Try again later. ' +
+      '(Request ID: gateway-request-123) The chat service may have received your question.\n');
+    assert.strictEqual(posts(), 1);
+
+    const json = await runCli(['--json', 'chat', 'Question'], { OTEKIN_CHAT_API_URL: endpoint });
+    assert.strictEqual(json.code, 1);
+    assert.strictEqual(json.stdout, '');
+    assert.strictEqual(json.stderr, result.stderr);
+    assert.strictEqual(posts(), 2);
   });
 });
 
@@ -511,11 +590,19 @@ test('CLI does not send conversation data when the health check fails', async ()
     assert.strictEqual(result.code, 1);
     assert.strictEqual(result.stdout, '');
     assert.match(result.stderr, /health check failed/i);
+    // One-shot chat says the question never left, without a /retry hint it has no composer for.
+    assert.strictEqual(result.stderr, 'Chat error: Chat service health check failed (HTTP 500). Your question was not sent.\n');
     assert.strictEqual(chatRequests, 0);
     assert.deepStrictEqual(
       fixture.getRequests().map((request) => `${request.method} ${request.url}`),
       ['GET /healthz']
     );
+
+    const json = await runCli(['--json', 'chat', 'Private question'], { OTEKIN_CHAT_API_URL: endpoint });
+    assert.strictEqual(json.code, 1);
+    assert.strictEqual(json.stdout, '');
+    assert.strictEqual(json.stderr, result.stderr);
+    assert.strictEqual(chatRequests, 0);
   }, (request, response) => {
     request.resume();
     response.writeHead(500, { 'Content-Type': 'application/json' });
@@ -805,6 +892,23 @@ test('CLI linear chat sends a prompt argument that looks like a command as a que
   });
 });
 
+test('CLI linear chat says a question was not sent when the health check fails, and sends nothing', async () => {
+  const bodies = [];
+  await withServer(linearGateway(bodies, (_body, number) => sourcedReply(number)), async (endpoint, fixture) => {
+    const result = await runCli(['chat', '--linear'], { OTEKIN_CHAT_API_URL: endpoint }, [], 'Q1\nQ2\n');
+    assert.strictEqual(result.code, 0);
+    // Piped questions run in order, so there is no /retry hint.
+    assert.strictEqual(result.stderr,
+      'Chat error: Chat service health check failed (HTTP 500). Your question was not sent.\n'.repeat(2));
+    assert.strictEqual(bodies.length, 0);
+    assert(fixture.getRequests().every((request) => request.method === 'GET'));
+  }, (request, response) => {
+    request.resume();
+    response.writeHead(500, { 'Content-Type': 'application/json' });
+    response.end(JSON.stringify({ error: 'unavailable' }));
+  });
+});
+
 test('CLI linear chat reports a gateway error and keeps going with the previous history', async () => {
   const bodies = [];
   await withServer(linearGateway(bodies, (_body, number) => number === 2
@@ -812,8 +916,10 @@ test('CLI linear chat reports a gateway error and keeps going with the previous 
     : sourcedReply(number)), async (endpoint) => {
     const result = await runCli(['chat', '--linear'], { OTEKIN_CHAT_API_URL: endpoint }, [], 'Q1\nQ2\nQ3\n');
     assert.strictEqual(result.code, 0);
+    // Piped questions run in order, so there is no /retry hint.
     assert.strictEqual(result.stderr,
-      'Chat error: Chat generation is temporarily unavailable. Try again later. (Request ID: linear-req-7)\n');
+      'Chat error: Chat generation is temporarily unavailable. Try again later. (Request ID: linear-req-7) ' +
+      'The chat service may have received your question.\n');
     assert.doesNotMatch(result.stdout + result.stderr, /secret provider detail/);
     assert.deepStrictEqual(bodies[2].messages.map((message) => message.content.split('\n')[0]), ['Q1', 'Answer 1 [1].', 'Q3']);
     assert.match(result.stdout, /Answer 3 \[1\]\./);
