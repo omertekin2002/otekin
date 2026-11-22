@@ -1062,3 +1062,173 @@ test('onDelta is not called after the request is aborted', async () => {
     assert.deepStrictEqual(deltas, ['first']);
   });
 });
+
+// One stream that exercises every awkward place a TCP chunk can end: a CRLF line, a blank line, an
+// unknown event, multi-byte UTF-8 characters, and a final event without a trailing newline.
+const awkwardCanonical = { message: 'Son yanıt Ö界 [1]', webSources: [{ title: 'Kaynak', url: 'https://example.com' }] };
+const awkwardStream = Buffer.from([
+  JSON.stringify({ type: 'tool', activity: { id: 's', query: 'Ömer 界', status: 'running' } }) + '\r\n',
+  JSON.stringify({ type: 'delta', text: 'Merhaba Ö' }) + '\n',
+  '\n',
+  JSON.stringify({ type: 'future-event', value: 'ignore' }) + '\n',
+  JSON.stringify({ type: 'delta', text: 'İ界' }) + '\n' + JSON.stringify({ type: 'delta', text: 'x' }) + '\r\n',
+  JSON.stringify({ type: 'tool', activity: { id: 's', query: 'Ömer 界', status: 'complete' } }) + '\n',
+  JSON.stringify({ type: 'done', ...awkwardCanonical })
+].join(''));
+const awkwardEvents = [
+  ['tool', 's', 'Ömer 界', 'running'],
+  ['delta', 'Merhaba Ö'],
+  ['delta', 'İ界'],
+  ['delta', 'x'],
+  ['tool', 's', 'Ömer 界', 'complete']
+];
+
+// Byte offsets around every line ending and inside every multi-byte character, plus the edges.
+function awkwardOffsets(bytes) {
+  const offsets = new Set([1, bytes.length - 1]);
+  for (let index = 0; index < bytes.length; index += 1) {
+    const byte = bytes[index];
+    if (byte === 0x0a || byte === 0x0d) {
+      offsets.add(index);
+      offsets.add(index + 1);
+    } else if (byte >= 0x80) {
+      offsets.add(index);
+      offsets.add(index + 1);
+    }
+  }
+  return [...offsets].filter(offset => offset > 0 && offset < bytes.length).sort((a, b) => a - b);
+}
+
+// `pause` lets the client read each piece before the next arrives. A timer is coarse on Windows,
+// so many-piece streams pass a setImmediate pause instead.
+async function streamPieces(pieces, pause = () => new Promise(resolve => setTimeout(resolve, 2))) {
+  const events = [];
+  let result;
+  await withServer(async (request, response) => {
+    request.resume();
+    response.writeHead(200, { 'Content-Type': 'application/x-ndjson' });
+    for (const piece of pieces.slice(0, -1)) {
+      response.write(piece);
+      await pause();
+    }
+    response.end(pieces[pieces.length - 1]);
+  }, async (endpoint) => {
+    result = await requestChat([], {
+      endpoint,
+      timeoutMs: 5000,
+      onActivity: activity => events.push(['tool', activity.id, activity.query, activity.status]),
+      onDelta: text => events.push(['delta', text])
+    });
+  });
+  return { events, result };
+}
+
+test('streamed events parse identically however the stream is split into chunks', async () => {
+  const whole = await streamPieces([awkwardStream]);
+  assert.deepStrictEqual(whole.events, awkwardEvents);
+  assert.deepStrictEqual(whole.result, awkwardCanonical);
+
+  const offsets = awkwardOffsets(awkwardStream);
+  assert(offsets.length > 20, 'the stream has enough awkward split points to be a meaningful test');
+  for (const offset of offsets) {
+    const split = await streamPieces([awkwardStream.subarray(0, offset), awkwardStream.subarray(offset)]);
+    assert.deepStrictEqual(split.events, awkwardEvents, `split at byte ${offset}`);
+    assert.deepStrictEqual(split.result, awkwardCanonical, `split at byte ${offset}`);
+  }
+
+  // Several splits at once, including pieces that each hold several whole events.
+  const firstLine = awkwardStream.indexOf(0x0a) + 1;
+  const lastLine = awkwardStream.lastIndexOf(0x0a) + 1;
+  const several = await streamPieces([
+    awkwardStream.subarray(0, firstLine - 1),
+    awkwardStream.subarray(firstLine - 1, lastLine),
+    awkwardStream.subarray(lastLine, lastLine + 5),
+    awkwardStream.subarray(lastLine + 5)
+  ]);
+  assert.deepStrictEqual(several.events, awkwardEvents);
+  assert.deepStrictEqual(several.result, awkwardCanonical);
+
+  const bytes = [];
+  for (let index = 0; index < awkwardStream.length; index += 1) bytes.push(awkwardStream.subarray(index, index + 1));
+  const byByte = await streamPieces(bytes, () => new Promise(resolve => setImmediate(resolve)));
+  assert.deepStrictEqual(byByte.events, awkwardEvents);
+  assert.deepStrictEqual(byByte.result, awkwardCanonical);
+});
+
+test('an unfinished stream line that grows past the limit across chunks fails before the stream ends', async () => {
+  const deltas = [];
+  await withServer(async (request, response) => {
+    request.resume();
+    response.writeHead(200, { 'Content-Type': 'application/x-ndjson' });
+    response.write(JSON.stringify({ type: 'delta', text: 'first' }) + '\n' + 'x'.repeat(40));
+    for (let index = 0; index < 3; index += 1) {
+      await new Promise(resolve => setTimeout(resolve, 5));
+      if (response.destroyed) return;
+      response.write('x'.repeat(40));
+    }
+    // Never end the stream: only the unfinished-line limit can reject in time.
+  }, async (endpoint) => {
+    await assert.rejects(requestChat([], {
+      endpoint,
+      maxResponseBytes: 100,
+      timeoutMs: 2000,
+      onDelta: text => deltas.push(text)
+    }), error => {
+      assert(error instanceof ChatApiError);
+      assert.strictEqual(error.message, 'Chat service response was too large.');
+      return true;
+    });
+    assert.deepStrictEqual(deltas, ['first']);
+  });
+});
+
+test('the unfinished stream line limit counts decoded characters, not bytes', async () => {
+  // 60 two-byte characters are 120 bytes but only 60 characters: under a 100 limit while unfinished.
+  await withServer((request, response) => {
+    request.resume();
+    response.writeHead(200, { 'Content-Type': 'application/x-ndjson' });
+    response.write('"' + 'Ö'.repeat(60));
+  }, async (endpoint) => {
+    await assert.rejects(requestChat([], {
+      endpoint, maxResponseBytes: 100, timeoutMs: 150, onDelta() {}
+    }), /took too long/);
+  });
+});
+
+test('a multi-megabyte streamed event is buffered in linear time', async () => {
+  const chunk = 16 * 1024;
+  const timeEvent = async (megabytes) => {
+    const prefix = '{"type":"done","message":"';
+    const suffix = '"}\n';
+    const body = Buffer.from(prefix + 'a'.repeat(megabytes * 1024 * 1024 - prefix.length - suffix.length) + suffix);
+    let elapsed;
+    await withServer((request, response) => {
+      request.resume();
+      response.writeHead(200, { 'Content-Type': 'application/x-ndjson' });
+      let offset = 0;
+      const pump = () => {
+        while (offset < body.length) {
+          const piece = body.subarray(offset, offset + chunk);
+          offset += piece.length;
+          if (!response.write(piece)) {
+            response.once('drain', pump);
+            return;
+          }
+        }
+        response.end();
+      };
+      pump();
+    }, async (endpoint) => {
+      const started = process.hrtime.bigint();
+      const reply = await requestChat([], { endpoint, timeoutMs: 60000, onDelta() {} });
+      elapsed = Number(process.hrtime.bigint() - started) / 1e6;
+      assert.strictEqual(reply.message.length, body.length - prefix.length - suffix.length);
+    });
+    return elapsed;
+  };
+  // Best of two runs each, so one slow garbage collection doesn't decide the result.
+  const small = Math.min(await timeEvent(2), await timeEvent(2));
+  const large = Math.min(await timeEvent(8), await timeEvent(8));
+  // Four times the data: linear buffering takes about 4x as long, quadratic about 16x.
+  assert(large < Math.max(small, 20) * 9, `8 MB took ${large.toFixed(0)} ms, 2 MB took ${small.toFixed(0)} ms`);
+});
