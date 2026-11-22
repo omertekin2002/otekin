@@ -2784,6 +2784,123 @@ test('a failed chat request goes back into an empty composer without saying it w
   }
 });
 
+// Every request waits until the test answers or fails it, in the order they were sent.
+function heldRequests() {
+  const requests = [];
+  const held = [];
+  return {requests, held, services: {
+    ...client, ensureChatServiceAwake: async () => {},
+    requestChat(messages) {
+      requests.push(messages);
+      const pending = heldStage();
+      held.push(pending);
+      return pending.promise;
+    }
+  }};
+}
+
+// The rail item drawn as selected, if any: "› Website ↗" and the like.
+const railSelection = ui => (ui.screen().split('\n').map(line => line.slice(0, 27).match(/› (\S.*?)\s*$/)).find(Boolean) || [])[1];
+
+test('a failed question put back in the composer takes focus back from the rail, so Enter sends it once', async () => {
+  const failure = new client.ChatApiError('Chat service is busy.', {requestId: 'rail-req-1'});
+  const {requests, held, services} = heldRequests();
+  const ui = await terminalApp({columns: 110, services});
+  try {
+    await ui.type('Rail question\r');
+    await waitFor(() => held.length === 1);
+    // Tab moves focus to the rail while the reply is on its way; ↓↓ selects the website.
+    await ui.type('\t\u001b[B\u001b[B');
+    await ui.waitUntil(() => railSelection(ui) === 'Website ↗', 'the rail did not select the website');
+    held[0].fail(failure);
+    // The status row: the error's own hint wraps around the rail.
+    await ui.expectScreen(/ {2}Press Enter to send it again\n/);
+    await ui.expectScreen(/│ › Rail question/);
+    // The rail shows the open view again, not a selection, and the caret is back in the composer.
+    await ui.waitUntil(() => railSelection(ui) === 'Chat', 'the rail kept its selection');
+    const row = ui.screen().split('\n').indexOf(composerLine(ui));
+    await ui.waitUntil(() => ui.emulator.buffer.active.cursorY === row, 'the caret is not in the composer');
+
+    await ui.type('\r');
+    await waitFor(() => held.length === 2);
+    held[1].release({message: 'Rail answer.'});
+    await ui.expectScreen(/Rail answer\./);
+    await ui.settle();
+    assert.strictEqual(requests.length, 2);
+    assert.deepStrictEqual(requestContents(requests[1]), ['Rail question']);
+    assert.deepStrictEqual(ui.opened, [], 'Enter ran no rail item');
+    assert.match(composerLine(ui), /│ › Ask anything/);
+
+    // A draft typed meanwhile is not replaced, so focus stays where the user put it.
+    await ui.type('Third question\r');
+    await waitFor(() => held.length === 3);
+    // The rail still has the website selected from before.
+    await ui.type('kept draft\t');
+    await ui.waitUntil(() => railSelection(ui) === 'Website ↗', 'the rail did not select the website');
+    held[2].fail(failure);
+    await ui.expectScreen(/ {2}\/retry sends it again\n/);
+    await ui.settle();
+    assert.strictEqual(railSelection(ui), 'Website ↗', 'the rail keeps focus when nothing was restored');
+    assert.match(ui.screen(), /kept draft/);
+    assert.strictEqual(requests.length, 3);
+  } finally {
+    await ui.close();
+  }
+});
+
+test('a failed question put back in the composer leaves /sources for the chat, so Enter sends it once', async () => {
+  const failure = new client.ChatApiError('Chat service is busy.', {requestId: 'sources-req-1'});
+  const {requests, held, services} = heldRequests();
+  const ui = await terminalApp({columns: 80, services});
+  const flat = () => ui.screen().replace(/\s+/g, ' ');
+  const openSources = async () => {
+    await ui.type('/sources\r');
+    await ui.expectScreen(/Sources · reply \d of \d/);
+  };
+  try {
+    await ui.type('First question\r');
+    await waitFor(() => held.length === 1);
+    held[0].release(citedReply('First cited [1].', [{number: 1, title: 'First source', url: 'https://example.com/first'}]));
+    await ui.expectScreen(/First cited \[1\]\./);
+
+    await ui.type('Second question\r');
+    await waitFor(() => held.length === 2);
+    await openSources();
+    held[1].fail(failure);
+    // Back in the chat, with the error, its hint and the restored question on screen.
+    await ui.waitUntil(() => !ui.screen().includes('Sources · reply'), 'the inspector stayed open');
+    await ui.expectScreen(/\/ Chat/);
+    await ui.expectScreen(/CHAT ERROR/);
+    await ui.waitUntil(() => /Your question is back in the composer\. Press Enter to send it again\./.test(flat()),
+      'the error and its hint are not on screen');
+    await ui.expectScreen(/│ › Second question/);
+
+    await ui.type('\r');
+    await waitFor(() => held.length === 3);
+    held[2].release({message: 'Second answer.'});
+    await ui.expectScreen(/Second answer\./);
+    await ui.settle();
+    assert.strictEqual(requests.length, 3);
+    assert.deepStrictEqual(requests[2], requests[1], 'Enter resends the same request');
+    assert.strictEqual(requestContents(requests[2]).at(-1), 'Second question');
+    assert.deepStrictEqual(ui.opened, [], 'Enter opened no source');
+
+    // A failed replacing /retry restores nothing, so the inspector stays open with its selection.
+    await ui.type('/retry\r');
+    await waitFor(() => held.length === 4);
+    await openSources();
+    held[3].fail(failure);
+    await ui.settle();
+    assert.match(ui.screen(), /Sources · reply 1 of 1/);
+    assert.match(ui.screen(), /› \[1\] First source/);
+    assert.match(ui.screen(), /\/retry sends it again/);
+    assert.strictEqual(requests.length, 4);
+    assert.deepStrictEqual(ui.opened, []);
+  } finally {
+    await ui.close();
+  }
+});
+
 test('a failed //question comes back as typed, and a failed /retry of it comes back escaped', async () => {
   const requests = [];
   const services = {
