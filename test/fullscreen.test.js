@@ -1153,6 +1153,71 @@ test('linear and full-screen chat continue each other’s saved conversation', a
   }
 });
 
+test('a restored reply without sources keeps its Markdown in /save, /copy, its styling, and linear /last', async () => {
+  const {directory, file} = historyDirectory();
+  const saveDirectory = path.join(directory, 'saved');
+  fs.mkdirSync(saveDirectory);
+  const markdown = '# Title\n\nSome **bold** and `code` here.\n\n- item';
+  const services = {
+    ...client, ensureChatServiceAwake: async () => {},
+    requestChat: async () => ({message: markdown, model: 'fixture-model'})
+  };
+  const {copied, clipboard} = fakeClipboard();
+  const savedFiles = () => fs.readdirSync(saveDirectory).sort();
+  // The reply's section of a /save, from its heading to the end.
+  const replySection = name => fs.readFileSync(path.join(saveDirectory, name), 'utf8').split(/^## fixture-model/m)[1];
+  // The styled reply as the screen draws it: the bold title, and the bold and code spans.
+  const styled = raw => /\u001b\[1mTitle/.test(raw) && /\u001b\[1mbold/.test(raw) && /\u001b\[3\dmcode/.test(raw);
+  try {
+    let before;
+    await withInkColor(async () => {
+      const first = await terminalApp({columns: 80, services, historyFile: file, saveDirectory, clipboard});
+      try {
+        await first.type('Format something\r');
+        await waitFor(() => first.screen().includes('Some bold and code here.'));
+        assert(styled(first.raw()), 'the live reply is styled');
+        await waitFor(() => chatHistory.loadHistory(file)?.messages.length === 2);
+        await first.type('/save\r');
+        await waitFor(() => savedFiles().length === 1);
+        await first.type('/copy\r');
+        await waitFor(() => copied.length === 1);
+      } finally {
+        await first.close();
+      }
+      before = replySection(savedFiles()[0]);
+      assert(before.endsWith(`\n\n${markdown}\n`), before);
+      assert.strictEqual(copied[0], `${markdown}\n`);
+
+      const second = await terminalApp({columns: 80, services, historyFile: file, saveDirectory, clipboard});
+      try {
+        assert.match(second.screen(), /Restored your last conversation/);
+        assert.match(second.screen(), /fixture-model · [\w ]*\d{2}:\d{2}\n\s*Title\n\s*\n\s*Some bold and code here\.\n\s*\n\s*- item/);
+        assert(styled(second.raw()), 'the restored reply keeps its styling');
+        await second.type('/save\r');
+        await waitFor(() => savedFiles().length === 2);
+        await second.type('/copy\r');
+        await waitFor(() => copied.length === 2);
+      } finally {
+        await second.close();
+      }
+    });
+    assert.strictEqual(replySection(savedFiles()[1]), before);
+    assert.strictEqual(copied[1], copied[0]);
+
+    // Linear chat restores the same file with the same Markdown.
+    const linearCopied = [];
+    const out = await linearSession(['/last', '/save', '/copy'], {
+      services, historyFile: file, saveDirectory, copy: async text => { linearCopied.push(text); return 'pbcopy'; }
+    });
+    assert(out.includes(`You: /last\nfixture-model`) && out.includes(`:\n${markdown}\n\nYou: /save`), out);
+    assert.deepStrictEqual(linearCopied, [`${markdown}\n`]);
+    assert.strictEqual(savedFiles().length, 3);
+    assert.strictEqual(replySection(savedFiles()[2]), before);
+  } finally {
+    fs.rmSync(directory, {recursive: true, force: true});
+  }
+});
+
 test('restored replies without color keep their links, and bad saved sources stay plain text', async () => {
   const {directory, file} = historyDirectory();
   const reply = (sources, extra = {}) => ({
