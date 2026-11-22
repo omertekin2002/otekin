@@ -942,6 +942,59 @@ test('saved history restores the conversation, prompt recall and sources, and /c
   }
 });
 
+test('full-screen chat stops saving when another chat changes or clears the history file', async () => {
+  const {directory, file} = historyDirectory();
+  const services = {
+    ...client, ensureChatServiceAwake: async () => {},
+    requestChat: async messages => ({message: `Answer ${messages.length}.`, model: 'fixture-model'})
+  };
+  const questions = () => chatHistory.loadHistory(file)?.history.filter(message => message.role === 'user')
+    .map(message => message.content);
+  const conversation = content => ({history: [{role: 'user', content}, {role: 'assistant', content: 'Saved.'}],
+    messages: [{role: 'user', content}, {role: 'assistant', model: 'fixture-model', content: 'Saved.'}], prompts: [content]});
+  try {
+    chatHistory.saveHistory(file, conversation('Saved before'));
+    const ui = await terminalApp({columns: 80, services, historyFile: file});
+    try {
+      await ui.expectScreen(/Restored your last conversation/);
+      // Another chat saves its own conversation while this one is open.
+      chatHistory.saveHistory(file, conversation('Saved by another chat'));
+      const before = checksum(file);
+      await ui.type('Asked here\r');
+      await waitFor(() => ui.screen().includes('Answer 3.'));
+      // The whole notice fits the status line at 80 columns.
+      await ui.expectScreen(new RegExp(chatHistory.HISTORY_CHANGED_NOTICE.replace(/[.*+?^${}()|[\]\\/]/g, '\\$&')));
+      assert.strictEqual(checksum(file), before);
+      await ui.type('Asked again\r');
+      await waitFor(() => ui.screen().includes('Answer 5.'));
+      await ui.settle();
+      assert.strictEqual(checksum(file), before, 'later replies are not saved either');
+      assert.doesNotMatch(ui.screen(), /Could not save/);
+      // This chat's own /clear starts it over, and it saves again.
+      await ui.type('/clear\r');
+      await waitFor(() => ui.screen().includes("Hi, I'm Ömer"));
+      assert.strictEqual(fs.existsSync(file), false);
+      await ui.type('Fresh start\r');
+      await waitFor(() => ui.screen().includes('Answer 1.'));
+      await waitFor(() => fs.existsSync(file));
+      assert.deepStrictEqual(questions(), ['Fresh start']);
+      assert.doesNotMatch(ui.screen(), /Another chat changed/);
+
+      // Another chat's /clear deletes the file: this chat does not write the conversation back.
+      chatHistory.clearHistory(file);
+      await ui.type('After the other clear\r');
+      await waitFor(() => ui.screen().includes('Answer 3.'));
+      await ui.expectScreen(/Another chat changed saved history/);
+      await ui.settle();
+      assert.strictEqual(fs.existsSync(file), false);
+    } finally {
+      await ui.close();
+    }
+  } finally {
+    fs.rmSync(directory, {recursive: true, force: true});
+  }
+});
+
 // Every clickable label in the output, as "url label".
 const terminalLinks = raw => [...new Set([...raw.matchAll(/\u001b\]8;;(https?:[^\u0007]+)\u0007([^\u001b]*)\u001b\]8;;\u0007/g)]
   .map(([, url, label]) => `${url} ${label}`))].sort();

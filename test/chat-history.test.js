@@ -428,3 +428,87 @@ if (process.platform !== 'win32') {
     }
   });
 }
+
+test('a save with a snapshot writes only over the file this session last saw', () => {
+  const { directory, file } = tempFile();
+  const other = { history: [], messages: [{ role: 'notice', content: 'Other session' }], prompts: [] };
+  const mine = { history: [], messages: [{ role: 'notice', content: 'This session' }], prompts: [] };
+  try {
+    // Unchanged since an empty start: saves, and saves again after its own save.
+    const session = {};
+    assert.strictEqual(store.loadHistory(file, session), null);
+    assert.strictEqual(session.fingerprint, 'absent');
+    assert.strictEqual(store.saveHistory(file, mine, session), true);
+    assert.match(session.fingerprint, /^sha256:[0-9a-f]{64}$/);
+    assert.strictEqual(store.readHistoryFile(file).fingerprint, session.fingerprint);
+    mine.prompts = ['Again'];
+    assert.strictEqual(store.saveHistory(file, mine, session), true);
+    assert.deepStrictEqual(store.loadHistory(file).prompts, ['Again']);
+
+    // Rewritten by another writer: refuses, and leaves the file as the other writer left it.
+    const loaded = {};
+    assert(store.loadHistory(file, loaded));
+    store.saveHistory(file, other);
+    const before = fs.readFileSync(file);
+    assert.strictEqual(store.saveHistory(file, mine, loaded), false);
+    assert.deepStrictEqual(fs.readFileSync(file), before);
+    // The same bytes written again by someone else still count as unchanged.
+    const same = {};
+    store.loadHistory(file, same);
+    fs.writeFileSync(file, before);
+    assert.strictEqual(store.saveHistory(file, mine, same), true);
+
+    // Deleted after loading, as another chat's /clear does: refuses, and the file stays deleted.
+    const cleared = {};
+    assert(store.loadHistory(file, cleared));
+    store.clearHistory(file);
+    assert.strictEqual(store.saveHistory(file, mine, cleared), false);
+    assert.strictEqual(fs.existsSync(file), false);
+
+    // Created after an empty start: refuses.
+    const empty = {};
+    assert.strictEqual(store.loadHistory(file, empty), null);
+    store.saveHistory(file, other);
+    assert.strictEqual(store.saveHistory(file, mine, empty), false);
+    assert.deepStrictEqual(store.loadHistory(file).messages, other.messages);
+
+    // A session's own /clear forgets what it saw, so it saves a fresh file next.
+    store.clearHistory(file, empty);
+    assert.strictEqual(empty.fingerprint, 'absent');
+    assert.strictEqual(store.saveHistory(file, mine, empty), true);
+    assert.deepStrictEqual(store.loadHistory(file).messages, mine.messages);
+
+    // Without a snapshot a save writes as it always has.
+    assert.strictEqual(store.saveHistory(file, other), true);
+    assert.deepStrictEqual(store.loadHistory(file).messages, other.messages);
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('a snapshot also covers history files the chat cannot load', () => {
+  const { directory, file } = tempFile();
+  try {
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    // A damaged file loads as nothing, but saving over it unchanged still works, as it did before.
+    fs.writeFileSync(file, '{"version": 1, broken');
+    const damaged = {};
+    assert.strictEqual(store.loadHistory(file, damaged), null);
+    assert.match(damaged.fingerprint, /^sha256:/);
+    assert.strictEqual(store.saveHistory(file, conversation(), damaged), true);
+    assert(store.loadHistory(file));
+
+    // A file over the size limit is described without being read; a rewrite changes that description.
+    const large = {};
+    fs.writeFileSync(file, Buffer.alloc(store.MAX_FILE_BYTES + 1, 0x20));
+    assert.strictEqual(store.loadHistory(file, large), null);
+    assert.match(large.fingerprint, /^other:file:/);
+    assert.strictEqual(store.readHistoryFile(file).fingerprint, large.fingerprint);
+    fs.writeFileSync(file, Buffer.alloc(store.MAX_FILE_BYTES + 2, 0x20));
+    assert.notStrictEqual(store.readHistoryFile(file).fingerprint, large.fingerprint);
+    assert.strictEqual(store.saveHistory(file, conversation(), large), false);
+    assert.strictEqual(fs.statSync(file).size, store.MAX_FILE_BYTES + 2);
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});

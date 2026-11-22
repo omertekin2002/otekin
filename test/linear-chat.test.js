@@ -1176,6 +1176,102 @@ test('linear chat replaces a restored last turn with /retry', async () => {
   }
 });
 
+// The questions a saved history file holds, in order.
+function savedQuestions(file) {
+  const saved = chatHistory.loadHistory(file);
+  return saved && saved.history.filter((message) => message.role === 'user').map((message) => message.content);
+}
+
+const CHANGED = chatHistory.HISTORY_CHANGED_NOTICE;
+const notices = (out) => out.split(CHANGED).length - 1;
+
+test('a second linear chat never overwrites the conversation another one saved', async () => {
+  const { directory, file } = historyFixture();
+  try {
+    const a = historySession(async () => ({ message: 'From A.' }), file);
+    const b = historySession(async () => ({ message: 'From B.' }), file);
+    await a.idle(1);
+    await b.idle(1);
+    a.send('Asked in A\n');
+    await a.idle(2);
+    assert.deepStrictEqual(savedQuestions(file), ['Asked in A']);
+    const saved = fs.readFileSync(file);
+
+    // B started with no file, and A has saved one since: B keeps its hands off it, and says so once.
+    b.send('Asked in B\n');
+    await b.idle(2);
+    assert.deepStrictEqual(fs.readFileSync(file), saved);
+    assert.strictEqual(notices(b.out()), 1);
+    assert.match(b.out(), new RegExp(`From B\\.\\n\\n${CHANGED.replace(/[.*+?^${}()|[\]\\/]/g, '\\$&')}\\nYou: $`));
+    b.send('Asked in B again\n');
+    await b.idle(3);
+    assert.deepStrictEqual(fs.readFileSync(file), saved);
+    assert.strictEqual(notices(b.out()), 1, 'the notice is shown once');
+    assert.doesNotMatch(b.out(), /Could not save/);
+
+    // A, whose save is the file, keeps saving.
+    a.send('Asked in A again\n');
+    await a.idle(3);
+    assert.deepStrictEqual(savedQuestions(file), ['Asked in A', 'Asked in A again']);
+    assert.strictEqual(notices(a.out()), 0);
+
+    // B's own /clear starts it over: it deletes the file and saves again.
+    b.send('/clear\n');
+    await b.idle(4);
+    assert.strictEqual(fs.existsSync(file), false);
+    b.send('Fresh in B\n');
+    await b.idle(5);
+    assert.deepStrictEqual(savedQuestions(file), ['Fresh in B']);
+    assert.strictEqual(notices(b.out()), 1);
+
+    // Now A is the one whose file changed under it.
+    a.send('Third in A\n');
+    await a.idle(4);
+    assert.deepStrictEqual(savedQuestions(file), ['Fresh in B']);
+    assert.strictEqual(notices(a.out()), 1);
+    a.input.end();
+    b.input.end();
+    await Promise.all([a.chat.finished, b.chat.finished]);
+    assert.strictEqual(a.err() + b.err(), '');
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('a /clear in one linear chat is not undone by another that loaded the same conversation', async () => {
+  const { directory, file } = historyFixture();
+  try {
+    saveFullScreenConversation(file);
+    const a = historySession(async () => ({ message: 'From A.' }), file);
+    const b = historySession(async () => ({ message: 'From B.' }), file);
+    await a.idle(1);
+    await b.idle(1);
+    assert.match(b.out(), /Continuing your saved conversation \(1 question\)/);
+    a.send('/clear\n');
+    await a.idle(2);
+    assert.strictEqual(fs.existsSync(file), false);
+
+    b.send('Follow up in B\n');
+    await b.idle(2);
+    assert.strictEqual(fs.existsSync(file), false, "the cleared conversation stays deleted");
+    assert.strictEqual(notices(b.out()), 1);
+    // B still has its conversation in memory: its request kept the saved turn.
+    assert.deepStrictEqual(b.requests[0].messages.map((message) => message.content.split('\n')[0]),
+      ['Saved question', 'Answer 1 [1].', 'Follow up in B']);
+
+    // A started over, so its next reply writes a fresh file.
+    a.send('New start in A\n');
+    await a.idle(3);
+    assert.deepStrictEqual(savedQuestions(file), ['New start in A']);
+    assert.strictEqual(notices(a.out()), 0);
+    a.input.end();
+    b.input.end();
+    await Promise.all([a.chat.finished, b.chat.finished]);
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
 test('linear chat never reads or writes history when piped or with history off', async () => {
   const calls = [];
   const historyStore = {
