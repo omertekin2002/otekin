@@ -82,6 +82,7 @@ No API key is required. Ask a one-shot question or open the full-screen chat dir
 npx otekin chat "What happened today?"
 npx otekin chat
 npx otekin chat --linear
+npx otekin chat --status
 npx otekin chat "Explain this" --json
 npx otekin --select chat
 npx otekin chat -- "-5°C in °F?"
@@ -165,6 +166,7 @@ When the service has optional image generation enabled, ask for an image in the 
 - `--no-open`: print a selected URL instead of opening it in a browser.
 - `--no-history`: don't load or save the saved chat history (full-screen or linear) for this run. An existing history file is left untouched.
 - `--linear`: with `chat`, hold a line-based conversation that never redraws or animates and prints each reply once. See [Linear chat](#linear-chat).
+- `--status`: with `chat`, check once whether the chat service is up, without sending a question, and exit with code 0 when it is reachable or 1 otherwise. Add `--json` for a JSON object. It doesn't take a prompt or `--linear`. See [Checking the chat service](#checking-the-chat-service).
 - `--reduced-motion`: replace spinners and ticking timers with a static status in the full-screen workspace and one-shot chat. `OTEKIN_REDUCED_MOTION=1` does the same for every run. See [Reduced motion](#reduced-motion).
 - `--cv`, `--resume`: open the CV link directly.
 - `--select <website|linkedin|cv|chat|exit>`: choose an option directly.
@@ -213,6 +215,29 @@ npx otekin chat "Hello"
 ```
 
 CORS restrictions do not affect this Node.js CLI. The override must use an HTTP or HTTPS URL.
+
+### Checking the chat service
+
+`npx otekin chat --status` asks whether the chat service is up right now, without sending a question. It makes exactly one `GET` request to the same readiness route the chat uses before each question (`https://signloop-chat-api.vercel.app/healthz` by default, or the `OTEKIN_CHAT_API_URL` / `OTEKIN_CHAT_HEALTH_URL` overrides above). It sends no conversation content, does not invoke research or model providers, never retries, gives up after 10 seconds, and never reads or writes saved chat history or opens a chat. It prints one line and reports one of three states:
+
+- **reachable**: the route answered with `{"ok": true}`. `Chat service: reachable (signloop-chat-api.vercel.app, 0.4 s)`. Exit code 0.
+- **waking**: HTTP 502, 503 or 504. The service may be waking up, or it may be failing, so the check doesn't promise it will come up: `Chat service: waking (signloop-chat-api.vercel.app, 1.2 s). Chat service is not ready yet (HTTP 503); it may be waking up.` Exit code 1.
+- **unavailable**: anything else: no connection, no answer within 10 seconds, another HTTP status, a redirect, an invalid or oversized response, or an invalid URL override. The line ends with what went wrong, such as `Unable to reach chat service.` Exit code 1.
+
+The line includes the gateway's request ID, when it sent a well-formed one, as `Request ID: …` inside the parentheses. With `--json`, it prints one object instead, with the same exit codes:
+
+```json
+{
+  "status": "reachable",
+  "endpoint": "https://signloop-chat-api.vercel.app/healthz",
+  "httpStatus": 200,
+  "requestId": null,
+  "elapsedMs": 412,
+  "message": "Chat service is reachable."
+}
+```
+
+`endpoint` is the health URL's origin and path only, without credentials, query or fragment, and `null` when the URL override is invalid. `httpStatus` is `null` when there was no response, and `requestId` is `null` unless the gateway sent a well-formed one. Ctrl+C cancels the check and exits with code 130 without printing anything.
 
 ### Saved chat history
 

@@ -11,6 +11,7 @@ const {
   ensureChatServiceAwake,
   omittedTurns,
   prepareRequestMessages,
+  probeChatService,
   requestChat
 } = require('../lib/chat-client');
 
@@ -139,6 +140,161 @@ test('checkChatService bounds wake-up time and response size', async () => {
       checkChatService({ endpoint, maxResponseBytes: 32 }),
       /health response was too large/i
     );
+  });
+});
+
+// A health server that answers every request with `reply` and records each request as "METHOD /path".
+async function probeWith(reply, options) {
+  const requests = [];
+  let result;
+  await withServer((request, response) => {
+    requests.push(`${request.method} ${request.url}`);
+    request.resume();
+    reply(response);
+  }, async (endpoint) => {
+    result = await probeChatService(Object.assign({ endpoint }, options));
+  });
+  return { result, requests };
+}
+
+function jsonReply(statusCode, body, headers) {
+  return (response) => {
+    response.writeHead(statusCode, Object.assign({ 'Content-Type': 'application/json' }, headers));
+    response.end(typeof body === 'string' ? body : JSON.stringify(body));
+  };
+}
+
+test('probeChatService reports a reachable service from one GET of the health route', async () => {
+  const { result, requests } = await probeWith(jsonReply(200, { ok: true, service: 'fixture' }, {
+    'X-Request-ID': 'health-1'
+  }));
+  assert.deepStrictEqual(requests, ['GET /healthz']);
+  assert.strictEqual(result.status, 'reachable');
+  assert.match(result.endpoint, /^http:\/\/127\.0\.0\.1:\d+\/healthz$/);
+  assert.strictEqual(result.httpStatus, 200);
+  assert.strictEqual(result.requestId, 'health-1');
+  assert.strictEqual(result.message, 'Chat service is reachable.');
+  assert.strictEqual(typeof result.elapsedMs, 'number');
+  assert.ok(result.elapsedMs >= 0);
+  assert.deepStrictEqual(Object.keys(result).sort(),
+    ['elapsedMs', 'endpoint', 'httpStatus', 'message', 'requestId', 'status']);
+});
+
+test('probeChatService reports 502, 503 and 504 as waking without retrying or promising recovery', async () => {
+  for (const statusCode of [502, 503, 504]) {
+    const { result, requests } = await probeWith(jsonReply(statusCode, { error: 'starting' }));
+    assert.deepStrictEqual(requests, ['GET /healthz'], String(statusCode));
+    assert.strictEqual(result.status, 'waking');
+    assert.strictEqual(result.httpStatus, statusCode);
+    assert.strictEqual(result.requestId, null);
+    assert.strictEqual(result.message, `Chat service is not ready yet (HTTP ${statusCode}); it may be waking up.`);
+  }
+});
+
+test('probeChatService reports every other outcome as unavailable after one request', async () => {
+  /** @type {Array<[(response: http.ServerResponse) => void, number, RegExp]>} */
+  const cases = [
+    [jsonReply(500, { error: 'down' }), 500, /health check failed \(HTTP 500\)/],
+    [jsonReply(404, 'not found'), 404, /health check failed \(HTTP 404\)/],
+    [(response) => {
+      response.writeHead(302, { Location: 'http://127.0.0.1:1/healthz' });
+      response.end();
+    }, 302, /unexpected redirect/],
+    [jsonReply(200, '{not json'), 200, /invalid health response/],
+    [jsonReply(200, { ok: 'yes' }), 200, /invalid health response/],
+    [jsonReply(200, [true]), 200, /invalid health response/],
+    [jsonReply(200, { ok: true, padding: 'x'.repeat(17 * 1024) }), 200, /health response was too large/]
+  ];
+  for (const [reply, httpStatus, message] of cases) {
+    const { result, requests } = await probeWith(reply);
+    assert.deepStrictEqual(requests, ['GET /healthz'], String(message));
+    assert.strictEqual(result.status, 'unavailable', String(message));
+    assert.strictEqual(result.httpStatus, httpStatus, String(message));
+    assert.match(result.message, message);
+  }
+});
+
+test('probeChatService reports a refused connection as unavailable', async () => {
+  const result = await probeChatService({ healthEndpoint: 'http://user:secret@127.0.0.1:1/healthz?token=x#frag' });
+  assert.strictEqual(result.status, 'unavailable');
+  assert.strictEqual(result.endpoint, 'http://127.0.0.1:1/healthz');
+  assert.strictEqual(result.httpStatus, null);
+  assert.strictEqual(result.requestId, null);
+  assert.strictEqual(result.message, 'Unable to reach chat service.');
+});
+
+test('probeChatService finishes within its timeout against a server that never responds', async () => {
+  const requests = [];
+  await withServer((request) => {
+    requests.push(request.method);
+    request.resume();
+  }, async (endpoint) => {
+    const started = Date.now();
+    const result = await probeChatService({ endpoint, timeoutMs: 100 });
+    assert.ok(Date.now() - started < 2000);
+    assert.strictEqual(result.status, 'unavailable');
+    assert.strictEqual(result.httpStatus, null);
+    assert.strictEqual(result.message, 'Chat service did not respond within 0.1 s.');
+    assert.ok(result.elapsedMs >= 90);
+  });
+  assert.deepStrictEqual(requests, ['GET']);
+});
+
+test('probeChatService reports invalid URL overrides as unavailable without a request', async () => {
+  const saved = { api: process.env.OTEKIN_CHAT_API_URL, health: process.env.OTEKIN_CHAT_HEALTH_URL };
+  try {
+    delete process.env.OTEKIN_CHAT_HEALTH_URL;
+    process.env.OTEKIN_CHAT_API_URL = 'not a url';
+    let result = await probeChatService();
+    assert.strictEqual(result.status, 'unavailable');
+    assert.strictEqual(result.endpoint, null);
+    assert.strictEqual(result.message, 'Chat service URL is invalid.');
+
+    process.env.OTEKIN_CHAT_HEALTH_URL = 'ftp://127.0.0.1/healthz';
+    result = await probeChatService();
+    assert.strictEqual(result.status, 'unavailable');
+    assert.strictEqual(result.message, 'Chat service health URL must use HTTP or HTTPS.');
+  } finally {
+    for (const [key, value] of [['OTEKIN_CHAT_API_URL', saved.api], ['OTEKIN_CHAT_HEALTH_URL', saved.health]]) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
+});
+
+test('probeChatService honours OTEKIN_CHAT_API_URL and OTEKIN_CHAT_HEALTH_URL', async () => {
+  const saved = { api: process.env.OTEKIN_CHAT_API_URL, health: process.env.OTEKIN_CHAT_HEALTH_URL };
+  const urls = [];
+  try {
+    await withServer((request, response) => {
+      urls.push(request.url);
+      jsonReply(200, { ok: true })(response);
+    }, async (endpoint) => {
+      delete process.env.OTEKIN_CHAT_HEALTH_URL;
+      process.env.OTEKIN_CHAT_API_URL = endpoint;
+      assert.strictEqual((await probeChatService()).status, 'reachable');
+      process.env.OTEKIN_CHAT_HEALTH_URL = endpoint.replace('/v1/chat', '/ready');
+      const result = await probeChatService();
+      assert.strictEqual(result.status, 'reachable');
+      assert.match(result.endpoint, /\/ready$/);
+    });
+  } finally {
+    for (const [key, value] of [['OTEKIN_CHAT_API_URL', saved.api], ['OTEKIN_CHAT_HEALTH_URL', saved.health]]) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
+  assert.deepStrictEqual(urls, ['/healthz', '/ready']);
+});
+
+test('probeChatService rejects only when cancelled', async () => {
+  await withServer((request) => {
+    request.resume();
+  }, async (endpoint) => {
+    const controller = new AbortController();
+    const probe = probeChatService({ endpoint, signal: controller.signal });
+    setTimeout(() => controller.abort(), 20);
+    await assert.rejects(probe, /cancelled/i);
   });
 });
 
