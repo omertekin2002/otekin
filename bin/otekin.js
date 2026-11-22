@@ -102,11 +102,12 @@ and TERM=dumb output print only the final answer.
 
 Linear chat (otekin chat --linear) reads one question per line, from the keyboard
 or piped input, and prints each finished reply once, with numbered sources and
-their URLs. It never redraws or animates. /retry sends the last message again,
-/save writes the conversation to a Markdown file, and /copy copies the latest
-reply (or saves it to a file when no clipboard works). /clear forgets the
-conversation. Ctrl+C cancels a reply; Ctrl+C or Ctrl+D when idle, /exit or /quit
-ends it. A promptless "otekin chat" on a TERM=dumb terminal opens it automatically.
+their URLs. It never redraws or animates. /last prints the latest reply again,
+without the network. /retry sends the last message again, /save writes the
+conversation to a Markdown file, and /copy copies the latest reply (or saves it
+to a file when no clipboard works). /clear forgets the conversation. Ctrl+C
+cancels a reply; Ctrl+C or Ctrl+D when idle, /exit or /quit ends it. A
+promptless "otekin chat" on a TERM=dumb terminal opens it automatically.
 
 Reduced motion (--reduced-motion or OTEKIN_REDUCED_MOTION=1) keeps the full-screen
 workspace and one-shot chat still: the status shows "… <what is happening>" with

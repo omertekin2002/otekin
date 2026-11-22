@@ -12,6 +12,7 @@ const {pathToFileURL} = require('url');
 const client = require('../lib/chat-client');
 const chatExport = require('../lib/chat-export');
 const chatHistory = require('../lib/chat-history');
+const {withDownGateway} = require('./down-gateway');
 
 const LINKS = {
   website: 'https://example.com/website',
@@ -2797,5 +2798,87 @@ test('Esc, Ctrl+C or /clear during a request leaves the composer empty', async (
     } finally {
       await ui.close();
     }
+  }
+});
+
+test('a restored conversation scrolls and shows /sources, /save and /copy with the gateway down, never contacting it', async () => {
+  const {directory, file} = historyDirectory();
+  const saveDirectory = path.join(directory, 'saved');
+  fs.mkdirSync(saveDirectory);
+  const answer = Array.from({length: 50}, (_,index) => `Saved line ${index + 1}`).join('\n') + ' [1][2]';
+  try {
+    fs.mkdirSync(path.dirname(file), {recursive: true});
+    fs.writeFileSync(file, JSON.stringify({version: 1, history: [], prompts: ['First saved question', 'Second saved question'], messages: [
+      {role: 'user', content: 'First saved question'},
+      {role: 'assistant', model: 'saved-model', content: 'Short saved answer.', answeredAt: '2026-10-30T12:00:00.000Z'},
+      {role: 'user', content: 'Second saved question'},
+      {role: 'assistant', model: 'saved-model', content: answer, answer, answeredAt: '2026-10-30T12:15:00.000Z', sources: [
+        {number: 1, title: LONG_TITLE, url: LONG_URL},
+        {number: 2, title: 'Second saved source', url: 'https://example.com/second'}
+      ]}
+    ]}));
+    // /save and /copy write the source row's labels, which shorten long titles.
+    const reply = `${answer}\n\nSources: [\\[1\\] A remarkably long source title that keeps going…](${LONG_URL}) · [\\[2\\] Second saved source](https://example.com/second)\n`;
+    await withDownGateway(async gateway => {
+      let clipboardWorks = true;
+      const copied = [];
+      const clipboard = {async copy(text) {
+        copied.push(text);
+        return clipboardWorks;
+      }};
+      // The real chat client, which reads the gateway's address from the environment.
+      const ui = await terminalApp({columns: 80, historyFile: file, saveDirectory, clipboard});
+      const viewport = () => ui.screen().split('\n').slice(2, 25).join('\n');
+      try {
+        // The restored conversation is shown at once, with nothing waiting on the wake-up check.
+        assert.match(ui.screen(), /Restored your last conversation/);
+        assert.match(ui.screen(), /Saved line 50 \[1\]\[2\]/);
+        assert.doesNotMatch(ui.screen(), /Waking|Thinking|Researching/);
+
+        await ui.type('\u001b[5~');
+        await ui.expectScreen(/↑ \d+ lines/);
+        assert.doesNotMatch(viewport(), /Saved line 50/);
+        await ui.type('\u001b[1;5H');
+        await ui.waitUntil(() => viewport().includes('First saved question'), 'Ctrl+Home did not reach the start');
+        assert.match(viewport(), /Short saved answer\./);
+        await ui.type('\u001b[1;5F');
+        await ui.waitUntil(() => viewport().includes('Saved line 50'), 'Ctrl+End did not return to the end');
+
+        await ui.type('/sources\r');
+        await waitFor(() => ui.screen().includes('Sources · reply 1 of 1'));
+        assert.match(ui.screen(), /Sources · reply 1 of 1 · saved-model · (\d+ \w{3}( \d{4})? )?\d{2}:\d{2}/);
+        assert(ui.screen().replace(/\s+/g, '').includes(`[1]${LONG_TITLE.replace(/\s+/g, '')}${LONG_URL}`), ui.screen());
+        assert.match(ui.screen(), / {2}\[2\] Second saved source\n\s*https:\/\/example\.com\/second/);
+        await ui.type('\u001b');
+        await ui.waitUntil(() => !ui.screen().includes('Sources · reply'), 'Esc did not close the sources');
+
+        await ui.type('/save\r');
+        await waitFor(() => fs.readdirSync(saveDirectory).some(name => name.startsWith('otekin-chat-')));
+        const [saved] = fs.readdirSync(saveDirectory).filter(name => name.startsWith('otekin-chat-'));
+        const markdown = fs.readFileSync(path.join(saveDirectory, saved), 'utf8');
+        assert.match(markdown, /^# otekin chat · [^\n]+\n\n## You\n\nFirst saved question\n\n## saved-model · 2026-10-30 \d{2}:\d{2}\n\nShort saved answer\.\n\n## You\n\nSecond saved question\n\n## saved-model · 2026-10-30 \d{2}:\d{2}\n\nSaved line 1\n/);
+        assert(markdown.endsWith(reply), markdown);
+
+        await ui.type('/copy\r');
+        await waitFor(() => shows(ui, 'Copied the latest reply (with 2 sources) to the clipboard'));
+        clipboardWorks = false;
+        await ui.type('/copy\r');
+        await waitFor(() => shows(ui, 'No clipboard available; saved the latest reply (with 2 sources) to'));
+        const [replyFile] = fs.readdirSync(saveDirectory).filter(name => name.startsWith('otekin-reply-'));
+        assert.strictEqual(fs.readFileSync(path.join(saveDirectory, replyFile), 'utf8'), reply);
+        assert.deepStrictEqual(copied, [reply, reply]);
+        assert.strictEqual(gateway.connections(), 0, 'nothing contacted the gateway');
+
+        // Asking proves the gateway is reachable from this test: the readiness check fails and sends nothing.
+        await ui.type('A new question\r');
+        await waitFor(() => shows(ui, 'Your question was not sent.'));
+        assert(gateway.connections() > 0);
+        assert(gateway.requests().every(request => request === 'GET /healthz'), gateway.requests().join(', '));
+      } finally {
+        await ui.close();
+      }
+    });
+  } finally {
+    fs.rmSync(directory, {recursive: true, force: true});
   }
 });
