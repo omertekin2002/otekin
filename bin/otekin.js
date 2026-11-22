@@ -16,7 +16,7 @@ const { browserCommand } = require('../lib/browser');
 const chatHistory = require('../lib/chat-history');
 const { historyFileFor } = chatHistory;
 const {
-  cleanText, chatErrorMessage, safeRequestId, createTheme, startProgress, createActivityDisplay, reducedMotionFor,
+  cleanText, chatErrorMessage, chatFailureStage, safeRequestId, createTheme, startProgress, createActivityDisplay, reducedMotionFor,
   stringifyJsonForOutput
 } = require('../lib/terminal');
 const { createStreamPreview } = require('../lib/stream-preview');
@@ -379,7 +379,7 @@ async function runOneShotChat(prompt, opts) {
       process.exitCode = 130;
       return;
     }
-    process.stderr.write(`Chat error: ${chatErrorMessage(error, 'request')}\n`);
+    process.stderr.write(`Chat error: ${chatErrorMessage(error, chatFailureStage(error, 'request'))}\n`);
     process.exitCode = 1;
   } finally {
     if (preview) process.removeListener('SIGINT', onInterrupt);

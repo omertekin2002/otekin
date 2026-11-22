@@ -218,3 +218,19 @@ test('chatErrorMessage shows a cleaned category, a well-formed request ID and wh
   assert.strictEqual(chatErrorMessage(busy, 'request', { retryHint: false }),
     'Chat service is busy. (Request ID: req-42) The chat service may have received your question.');
 });
+
+test('chatFailureStage reads a chat request that never connected as not sent', () => {
+  const { chatErrorMessage, chatFailureStage } = require('../lib/terminal');
+  const notSent = Object.assign(new Error('Unable to reach chat service.'), { notSent: true });
+  assert.strictEqual(chatFailureStage(notSent, 'request'), 'readiness');
+  assert.strictEqual(chatErrorMessage(notSent, chatFailureStage(notSent, 'request'), { retryHint: true }),
+    'Unable to reach chat service. Your question was not sent. Type /retry to send it again.');
+  // Anything else that failed at the request stage may have reached the gateway.
+  for (const error of [new Error('Unable to reach chat service.'), { notSent: false }, { notSent: 'true' }, null, undefined]) {
+    assert.strictEqual(chatFailureStage(error, 'request'), 'request');
+  }
+  // Other stages are unchanged.
+  assert.strictEqual(chatFailureStage(notSent, 'readiness'), 'readiness');
+  assert.strictEqual(chatFailureStage(notSent, null), null);
+  assert.strictEqual(chatFailureStage(new Error('x'), 'readiness'), 'readiness');
+});

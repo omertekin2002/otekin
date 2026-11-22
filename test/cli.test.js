@@ -894,6 +894,75 @@ test('CLI linear chat sends a prompt argument that looks like a command as a que
   });
 });
 
+// A raw TCP listener for the chat URL: `onConnection` decides what happens to each accepted socket.
+async function withTcpServer(onConnection, run) {
+  const server = net.createServer(onConnection);
+  await new Promise((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', () => resolve(undefined));
+  });
+  const { port } = /** @type {import('net').AddressInfo} */ (server.address());
+  try {
+    await run(port);
+  } finally {
+    await new Promise((resolve) => server.close(() => resolve(undefined)));
+  }
+}
+
+test('CLI chat says a chat request that never connected was not sent, in one-shot and linear chat', async () => {
+  let refused = 0;
+  await withTcpServer(() => {}, async (port) => { refused = port; });
+  // The readiness route answers, but the chat URL is refused or isn't HTTP, so the question never left.
+  await withServer(() => {
+    throw new Error('the chat route must not be reached');
+  }, async (endpoint, fixture) => {
+    const health = new URL('/healthz', endpoint).href;
+    for (const [chat, category] of [
+      [`http://127.0.0.1:${refused}/v1/chat`, 'Unable to reach chat service.'],
+      ['ftp://127.0.0.1/chat', 'Chat service URL must use HTTP or HTTPS.']
+    ]) {
+      const env = { OTEKIN_CHAT_HEALTH_URL: health, OTEKIN_CHAT_API_URL: chat };
+      const oneShot = await runCli(['chat', 'hello'], env);
+      assert.strictEqual(oneShot.code, 1);
+      assert.strictEqual(oneShot.stdout, '');
+      assert.strictEqual(oneShot.stderr, `Chat error: ${category} Your question was not sent.\n`);
+      const json = await runCli(['--json', 'chat', 'hello'], env);
+      assert.strictEqual(json.stderr, oneShot.stderr);
+      // The same retry hints as a failed readiness check: none for piped lines, /retry at a terminal.
+      const piped = await runCli(['chat', '--linear'], env, [], 'Q1\n');
+      assert.strictEqual(piped.stderr, `Chat error: ${category} Your question was not sent.\n`);
+      const typed = await runCli(['chat', '--linear'], env, TTY_STDIN, 'Q1\n');
+      assert.strictEqual(typed.stderr, `Chat error: ${category} Your question was not sent. Type /retry to send it again.\n`);
+    }
+    assert(fixture.getRequests().every((request) => request.method === 'GET' && request.url === '/healthz'));
+  });
+});
+
+test('CLI chat says a chat request that connected may have been received, even with no reply', async () => {
+  const received = [];
+  // The chat server reads the question, then drops the connection without answering.
+  await withTcpServer((socket) => {
+    socket.on('error', () => {});
+    socket.once('data', (chunk) => {
+      received.push(chunk.toString('utf8').split('\r\n')[0]);
+      socket.destroy();
+    });
+  }, async (port) => {
+    await withServer(() => {
+      throw new Error('the chat route must not be reached');
+    }, async (endpoint) => {
+      const env = { OTEKIN_CHAT_HEALTH_URL: new URL('/healthz', endpoint).href, OTEKIN_CHAT_API_URL: `http://127.0.0.1:${port}/v1/chat` };
+      const oneShot = await runCli(['chat', 'hello'], env);
+      assert.strictEqual(oneShot.code, 1);
+      assert.strictEqual(oneShot.stderr, 'Chat error: Unable to reach chat service. The chat service may have received your question.\n');
+      const typed = await runCli(['chat', '--linear'], env, TTY_STDIN, 'Q1\n');
+      assert.strictEqual(typed.stderr, 'Chat error: Unable to reach chat service. ' +
+        'The chat service may have received your question. Type /retry to send it again.\n');
+    });
+  });
+  assert.deepStrictEqual(received, ['POST /v1/chat HTTP/1.1', 'POST /v1/chat HTTP/1.1']);
+});
+
 test('CLI linear chat says a question was not sent when the health check fails, and sends nothing', async () => {
   const bodies = [];
   await withServer(linearGateway(bodies, (_body, number) => sourcedReply(number)), async (endpoint, fixture) => {
