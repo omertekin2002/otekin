@@ -259,6 +259,35 @@ test('linear chat never claims a failed chat request was not sent, and /retry re
   }
 });
 
+test('linear chat says a chat request that never connected was not sent, and /retry sends it', async () => {
+  const s = session(async (_messages, _opts, number) => {
+    if (number === 2) throw new chatClient.ChatApiError('Unable to reach chat service.', { notSent: true });
+    return cited(number);
+  }, { start: { interactive: true } });
+  s.send('Q1\n');
+  await s.idle(2);
+  s.send('Q2\n');
+  await s.idle(3);
+  assert.strictEqual(s.err(), 'Chat error: Unable to reach chat service. Your question was not sent. Type /retry to send it again.\n');
+  s.send('/retry\n');
+  await s.idle(4);
+  s.input.end();
+  await s.chat.finished;
+  assert.strictEqual(s.requests.length, 3);
+  assert.deepStrictEqual(s.requests[2].messages, s.requests[1].messages);
+  assert.match(s.out(), /Answer 3 \[1\]\./);
+});
+
+test('linear chat piped input says a chat request that never connected was not sent, without a /retry hint', async () => {
+  const s = session(async () => {
+    throw new chatClient.ChatApiError('Chat service took too long.', { notSent: true });
+  });
+  s.send('Q1\n');
+  s.input.end();
+  await s.chat.finished;
+  assert.strictEqual(s.err(), 'Chat error: Chat service took too long. Your question was not sent.\n');
+});
+
 test('linear chat piped input reports a wake-up failure without a /retry hint', async () => {
   const s = session(async () => ({ message: 'Unused.' }), {
     ensureChatServiceAwake: async () => { throw new Error('Unable to wake chat service.'); }

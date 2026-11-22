@@ -1,7 +1,9 @@
 'use strict';
 
 const assert = require('assert');
+const dns = require('dns');
 const http = require('http');
+const net = require('net');
 const {
   MAX_MESSAGE_CHARACTERS,
   MAX_MESSAGES,
@@ -473,6 +475,187 @@ test('requestChat enforces total request time and response size', async () => {
 
 test('requestChat rejects unsupported endpoint protocols', async () => {
   await assert.rejects(requestChat([], { endpoint: 'file:///tmp/chat' }), /HTTP or HTTPS/i);
+});
+
+// A raw TCP listener: `onConnection` decides what happens to each accepted socket.
+async function withTcpServer(onConnection, run) {
+  const server = net.createServer(onConnection);
+  await new Promise((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', () => resolve(undefined));
+  });
+  const { port } = /** @type {import('net').AddressInfo} */ (server.address());
+  try {
+    await run(port);
+  } finally {
+    await new Promise((resolve) => server.close(() => resolve(undefined)));
+  }
+}
+
+// A free local port that nothing listens on, so connecting to it is refused.
+async function closedPort() {
+  let port = 0;
+  await withTcpServer(() => {}, async (free) => { port = free; });
+  return port;
+}
+
+/** Resolves to the ChatApiError that `promise` rejects with. */
+async function rejection(promise) {
+  try {
+    await promise;
+  } catch (error) {
+    assert.ok(error instanceof ChatApiError, String(error));
+    return error;
+  }
+  throw new assert.AssertionError({ message: 'expected the request to fail' });
+}
+
+test('requestChat marks a request that never connected as not sent', async () => {
+  const refused = await rejection(requestChat([], { endpoint: `http://127.0.0.1:${await closedPort()}/v1/chat` }));
+  assert.strictEqual(refused.message, 'Unable to reach chat service.');
+  assert.strictEqual(refused.notSent, true);
+
+  // A name that does not resolve (RFC 6761 reserves .invalid). The lookup fails at once, as a
+  // resolver would, so the test doesn't wait on this machine's DNS.
+  const lookup = dns.lookup;
+  /** @type {any} */ (dns).lookup = (hostname, options, callback) => {
+    const done = typeof options === 'function' ? options : callback;
+    process.nextTick(done, Object.assign(new Error(`getaddrinfo ENOTFOUND ${hostname}`), { code: 'ENOTFOUND' }));
+  };
+  let unresolved;
+  try {
+    unresolved = await rejection(requestChat([], { endpoint: 'http://otekin-chat.invalid/v1/chat' }));
+  } finally {
+    dns.lookup = lookup;
+  }
+  assert.strictEqual(unresolved.message, 'Unable to reach chat service.');
+  assert.strictEqual(unresolved.notSent, true);
+
+  for (const [endpoint, message] of [
+    ['ftp://127.0.0.1/chat', 'Chat service URL must use HTTP or HTTPS.'],
+    ['file:///tmp/chat', 'Chat service URL must use HTTP or HTTPS.'],
+    ['not a url', 'Chat service URL is invalid.']
+  ]) {
+    const error = await rejection(requestChat([], { endpoint }));
+    assert.strictEqual(error.message, message);
+    assert.strictEqual(error.notSent, true, endpoint);
+  }
+});
+
+test('requestChat marks an HTTPS request whose TLS handshake failed or never finished as not sent', async () => {
+  // The listener accepts TCP but never speaks TLS: no request byte can be written before the handshake.
+  let accepted = 0;
+  await withTcpServer((socket) => {
+    accepted += 1;
+    socket.once('data', () => socket.destroy());
+  }, async (port) => {
+    const error = await rejection(requestChat([], { endpoint: `https://127.0.0.1:${port}/v1/chat` }));
+    assert.strictEqual(error.message, 'Unable to reach chat service.');
+    assert.strictEqual(error.notSent, true);
+  });
+  assert.strictEqual(accepted, 1);
+
+  const sockets = [];
+  await withTcpServer((socket) => {
+    sockets.push(socket);
+    socket.on('error', () => {});
+  }, async (port) => {
+    const error = await rejection(requestChat([], { endpoint: `https://127.0.0.1:${port}/v1/chat`, timeoutMs: 100 }));
+    assert.strictEqual(error.message, 'Chat service took too long.');
+    assert.strictEqual(error.notSent, true);
+    sockets.forEach((socket) => socket.destroy());
+  });
+});
+
+test('requestChat never marks a request that connected as not sent', async () => {
+  // The server reads the request, then drops the connection without a reply.
+  let received = '';
+  await withTcpServer((socket) => {
+    socket.on('error', () => {});
+    socket.once('data', (chunk) => {
+      received += chunk.toString('utf8');
+      socket.destroy();
+    });
+  }, async (port) => {
+    const error = await rejection(requestChat([], { endpoint: `http://127.0.0.1:${port}/v1/chat` }));
+    assert.strictEqual(error.message, 'Unable to reach chat service.');
+    assert.strictEqual(error.notSent, false);
+  });
+  assert.match(received, /^POST \/v1\/chat HTTP\/1\.1\r\n/);
+
+  // Connected, then the reply stalls past the deadline.
+  await withServer((request) => {
+    request.resume();
+  }, async (endpoint) => {
+    const error = await rejection(requestChat([], { endpoint, timeoutMs: 100 }));
+    assert.strictEqual(error.message, 'Chat service took too long.');
+    assert.strictEqual(error.notSent, false);
+  });
+
+  // A 5xx, invalid JSON and an error event in a stream all come after the request was sent.
+  const replies = [
+    { status: 503, type: 'application/json', body: '{"error":"down"}', message: /HTTP 503/ },
+    { status: 200, type: 'application/json', body: 'not json', message: /invalid JSON/ },
+    {
+      status: 200,
+      type: 'application/x-ndjson',
+      body: '{"type":"error","code":"generation_unavailable"}\n',
+      message: /temporarily unavailable/
+    }
+  ];
+  for (const { status, type, body, message } of replies) {
+    await withServer((request, response) => {
+      request.resume();
+      response.writeHead(status, { 'Content-Type': type });
+      response.end(body);
+    }, async (endpoint) => {
+      const error = await rejection(requestChat([], { endpoint, onDelta: () => {} }));
+      assert.match(error.message, message);
+      assert.strictEqual(error.notSent, false, String(message));
+    });
+  }
+});
+
+test('requestChat counts a reused keep-alive connection as connected', async () => {
+  const agent = new http.Agent({ keepAlive: true, maxSockets: 1 });
+  const original = http.globalAgent;
+  http.globalAgent = agent;
+  let requests = 0;
+  try {
+    await withServer((request, response) => {
+      requests += 1;
+      request.resume();
+      if (requests === 1) {
+        response.writeHead(200, { 'Content-Type': 'application/json' });
+        response.end(JSON.stringify({ message: 'First.' }));
+        return;
+      }
+      // The second request arrives on the same socket, which the server then drops.
+      request.socket.destroy();
+    }, async (endpoint) => {
+      await requestChat([], { endpoint });
+      const error = await rejection(requestChat([], { endpoint }));
+      assert.strictEqual(error.message, 'Unable to reach chat service.');
+      assert.strictEqual(error.notSent, false);
+    });
+  } finally {
+    http.globalAgent = original;
+    agent.destroy();
+  }
+  assert.strictEqual(requests, 2);
+});
+
+test('requestChat does not mark a cancelled request as not sent', async () => {
+  await withServer((request) => {
+    request.resume();
+  }, async (endpoint) => {
+    const controller = new AbortController();
+    const pending = requestChat([], { endpoint, signal: controller.signal });
+    controller.abort();
+    const error = await rejection(pending);
+    assert.strictEqual(error.message, 'Chat request was cancelled.');
+    assert.strictEqual(error.notSent, false);
+  });
 });
 
 test('requestChat reports redirects without following them', async () => {

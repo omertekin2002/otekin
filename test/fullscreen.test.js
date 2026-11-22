@@ -2849,6 +2849,31 @@ test('a failed chat request goes back into an empty composer without saying it w
   }
 });
 
+test('a chat request that never connected says it was not sent, in the error and the status row', async () => {
+  const resend = await failThenResend('request',
+    new client.ChatApiError('Unable to reach chat service.', {notSent: true}));
+  try {
+    assert.match(resend.failed, /Unable to reach chat service\. Your question was not sent\. Your question is back in the composer\. Press Enter to send it again\./);
+    assert.match(resend.failed, /Not sent · press Enter to send it again/);
+    assert.doesNotMatch(resend.failed, /may have received/);
+    assert.strictEqual(resend.postsAtFailure, 2);
+    assert.deepStrictEqual(requestContents(resend.requests[2]), ['First question', 'First answer.', 'Second question']);
+  } finally {
+    await resend.ui.close();
+  }
+
+  const retry = await failThenRetry('request',
+    new client.ChatApiError('Chat service took too long.', {notSent: true}));
+  try {
+    assert.match(retry.failed, /Chat service took too long\. Your question was not sent\. Type \/retry to send it again\./);
+    assert.match(retry.failed, /Not sent · \/retry sends it again/);
+    assert.doesNotMatch(retry.failed, /may have received/);
+    assert.deepStrictEqual(retry.requests[2], retry.requests[1]);
+  } finally {
+    await retry.ui.close();
+  }
+});
+
 // Every request waits until the test answers or fails it, in the order they were sent.
 function heldRequests() {
   const requests = [];
