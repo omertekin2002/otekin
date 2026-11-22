@@ -9,6 +9,7 @@ const path = require('path');
 const { Terminal } = require('@xterm/headless');
 const pkg = require('../package.json');
 const chatHistory = require('../lib/chat-history');
+const { startDownGateway } = require('./down-gateway');
 
 const ROOT = path.resolve(__dirname, '..');
 const CLI = path.join(ROOT, 'bin', 'otekin.js');
@@ -1037,7 +1038,7 @@ test('CLI linear chat at a terminal saves history and continues it in the next r
 
       const second = await runCli(['chat', '--linear'], env, TTY_STDIN, 'Q2\n');
       assert.strictEqual(second.code, 0);
-      assert.strictEqual(second.stdout.split('Continuing your saved conversation (1 question). /clear forgets it; --no-history skips it.\n').length - 1, 1);
+      assert.strictEqual(second.stdout.split('Continuing your saved conversation (1 question). /last shows the latest reply; /clear forgets it; --no-history skips it.\n').length - 1, 1);
       assert.strictEqual(second.stdout.split('Answer 1 [1].').length - 1, 0);
       assert.deepStrictEqual(bodies[1].messages.map((message) => message.content.split('\n')[0]), ['Q1', 'Answer 1 [1].', 'Q2']);
       assert.deepStrictEqual(chatHistory.loadHistory(file).prompts, ['Q1', 'Q2']);
@@ -1063,6 +1064,57 @@ test('CLI linear chat at a terminal saves history and continues it in the next r
   }
 });
 
+test('CLI linear chat reads, saves and copies a saved conversation with the gateway down', async () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'otekin-linear-offline-'));
+  const file = path.join(directory, 'state', 'history.json');
+  const gateway = await startDownGateway();
+  try {
+    chatHistory.saveHistory(file, {
+      history: [],
+      messages: [
+        { role: 'user', content: 'Saved question' },
+        { role: 'assistant', model: 'saved-model', answeredAt: '2026-11-15T09:30:00.000Z', content: 'Saved answer [1].',
+          answer: 'Saved answer [1].', sources: [{ number: 1, title: 'Saved source', url: 'https://example.com/saved' }] }
+      ],
+      prompts: ['Saved question']
+    });
+    const before = fs.readFileSync(file);
+    // No clipboard tool on Linux, so /copy falls back to a file there; macOS and Windows have one.
+    const env = { ...gateway.env, OTEKIN_HISTORY_FILE: file, WAYLAND_DISPLAY: undefined, DISPLAY: undefined };
+    const offline = async () => {
+      const result = await runCli(['chat', '--linear'], env, TTY_STDIN, '/last\n/save\n/copy\n', directory);
+      assert.strictEqual(result.code, 0);
+      assert.strictEqual(result.stderr, '');
+      assert.match(result.stdout, /\nContinuing your saved conversation \(1 question\)\. \/last shows the latest reply; \/clear forgets it; --no-history skips it\.\n/);
+      // A terminal echoes typed lines itself, so the CLI repeats a line only when it arrived before its prompt.
+      assert.match(result.stdout, /You: (?:\/last\n)?saved-model · [^\n]*\d{2}:\d{2}:\nSaved answer \[1\]\.\n\nSources:\n1\. Saved source https:\/\/example\.com\/saved\n\n/);
+      const saved = result.stdout.match(/^Saved the conversation to (.+)$/m);
+      assert(saved, result.stdout);
+      assert.match(fs.readFileSync(saved[1], 'utf8'), /## You\n\nSaved question\n\n## saved-model · 2026-11-15 \d{2}:\d{2}\n\nSaved answer \[1\]\.\n\nSources: \[\\\[1\\\] Saved source\]\(https:\/\/example\.com\/saved\)\n$/);
+      assert.match(result.stdout, /You: (?:\/copy\n)?(Copied the latest reply \(with 1 source\) to the clipboard|No clipboard available; saved the latest reply \(with 1 source\) to .+)\n/);
+      assert.doesNotMatch(result.stdout, SGR);
+      assert.doesNotMatch(result.stdout, REDRAW);
+    };
+    await offline();
+    assert.strictEqual(gateway.connections(), 0, 'nothing contacted the gateway');
+
+    const asked = await runCli(['chat', '--linear'], env, TTY_STDIN, 'A new question\n', directory);
+    assert.strictEqual(asked.code, 0);
+    assert.strictEqual(asked.stderr, 'Chat error: Chat service health check failed (HTTP 500). ' +
+      'Your question was not sent. Type /retry to send it again.\n');
+    assert(gateway.connections() > 0);
+    assert(gateway.requests().every((request) => request === 'GET /healthz'), gateway.requests().join(', '));
+    assert.deepStrictEqual(fs.readFileSync(file), before, 'a failed question is never saved');
+
+    const connections = gateway.connections();
+    await offline();
+    assert.strictEqual(gateway.connections(), connections);
+  } finally {
+    await gateway.close();
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
 test('CLI help documents linear chat and its TERM=dumb behavior', async () => {
   const help = await runCli(['--help']);
   assert.match(help.stdout, /npx otekin chat --linear/);
@@ -1072,6 +1124,7 @@ test('CLI help documents linear chat and its TERM=dumb behavior', async () => {
   assert.match(help.stdout, /full-screen and linear chats save their conversation/);
   assert.match(help.stdout, /piped linear chat\) never read or\s+write it/);
   assert.match(help.stdout, /\/clear forgets the\s+conversation/);
+  assert.match(help.stdout, /\/last prints the latest reply again,\s+without the network/);
   assert.doesNotMatch(help.stdout, /does not use saved history yet/);
 });
 
