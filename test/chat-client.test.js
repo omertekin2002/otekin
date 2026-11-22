@@ -240,6 +240,22 @@ test('probeChatService finishes within its timeout against a server that never r
   assert.deepStrictEqual(requests, ['GET']);
 });
 
+test('probeChatService keeps the status and request ID when a response body stalls past the timeout', async () => {
+  for (const [statusCode, state] of [[503, 'waking'], [200, 'unavailable']]) {
+    await withServer((request, response) => {
+      request.resume();
+      response.writeHead(statusCode, { 'Content-Type': 'application/json', 'X-Request-ID': 'stalled-1' });
+      response.flushHeaders();
+    }, async (endpoint) => {
+      const result = await probeChatService({ endpoint, timeoutMs: 100 });
+      assert.strictEqual(result.status, state, String(statusCode));
+      assert.strictEqual(result.httpStatus, statusCode);
+      assert.strictEqual(result.requestId, 'stalled-1');
+      if (state === 'unavailable') assert.strictEqual(result.message, 'Chat service did not respond within 0.1 s.');
+    });
+  }
+});
+
 test('probeChatService reports invalid URL overrides as unavailable without a request', async () => {
   const saved = { api: process.env.OTEKIN_CHAT_API_URL, health: process.env.OTEKIN_CHAT_HEALTH_URL };
   try {
