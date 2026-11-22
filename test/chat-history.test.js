@@ -211,8 +211,7 @@ test('chat history drops malformed reply sources and keeps the reply as plain te
     { sources: [null] },
     { sources: [[1, 'First', 'https://example.com/first']] },
     { answer: 7 },
-    { answer: undefined },
-    { sources: undefined }
+    { answer: undefined }
   ];
   for (const extra of cases) {
     const restored = store.parseHistory(JSON.stringify({
@@ -237,6 +236,90 @@ test('chat history drops malformed reply sources and keeps the reply as plain te
     version: 1, history: [], messages: [sourcedReply({ answer: 'Safe\u001b]0;x\u0007 answer\u001b[2J' })], prompts: []
   }));
   assert.strictEqual(escaped.messages[0].answer, 'Safe answer');
+});
+
+// A full-screen reply without sources: its content is styled, so cleaning it loses the Markdown.
+const MARKDOWN = '# Title\n\nSome **bold** and `code` here.\n\n- item';
+function markdownReply(extra) {
+  const { formatResolvedResponse } = require('../lib/chat-format');
+  const reply = { answer: MARKDOWN, sources: [] };
+  return {
+    role: 'assistant',
+    model: 'fixture-model',
+    content: formatResolvedResponse(reply, { hyperlinks: true, color: true }),
+    markdown: formatResolvedResponse(reply, { hyperlinks: true }),
+    ...extra
+  };
+}
+
+test('chat history keeps the Markdown of a reply without sources', () => {
+  // As the full-screen chat had it before replies kept their answer: only content and markdown.
+  for (const message of [markdownReply(), markdownReply({ answer: MARKDOWN })]) {
+    const text = store.serializeHistory({ history: [], messages: [message], prompts: [] });
+    const saved = JSON.parse(text);
+    // The shape an older version checks is unchanged: version 1, string content, no sources.
+    assert.strictEqual(saved.version, 1);
+    assert.deepStrictEqual(saved.messages[0], {
+      role: 'assistant',
+      content: 'Title\n\nSome bold and code here.\n\n- item',
+      model: 'fixture-model',
+      answer: MARKDOWN
+    });
+    assert.deepStrictEqual(store.parseHistory(text).messages[0], {
+      role: 'assistant', model: 'fixture-model', content: 'Title\n\nSome bold and code here.\n\n- item', answer: MARKDOWN
+    });
+  }
+  // A file from before this change has no answer: the reply loads as its plain content.
+  assert.deepStrictEqual(store.parseHistory(JSON.stringify({
+    version: 1, history: [], messages: [{ role: 'assistant', model: 'fixture-model', content: 'Title\n\nPlain' }], prompts: []
+  })).messages, [{ role: 'assistant', model: 'fixture-model', content: 'Title\n\nPlain' }]);
+});
+
+test('chat history drops an unusable saved Markdown alone and keeps the reply as plain text', () => {
+  const plain = { role: 'assistant', model: 'fixture-model', content: 'Plain reply' };
+  const parse = (extra) => store.parseHistory(JSON.stringify({
+    version: 1, history: [], messages: [{ role: 'user', content: 'Ask' }, { ...plain, ...extra }], prompts: ['Ask']
+  }));
+  for (const answer of [7, null, true, {}, [MARKDOWN], 'x'.repeat(store.MAX_ANSWER_CHARACTERS + 1)]) {
+    const restored = parse({ answer });
+    assert(restored, JSON.stringify(answer).slice(0, 80));
+    assert.deepStrictEqual(restored.messages, [{ role: 'user', content: 'Ask' }, plain], JSON.stringify(answer).slice(0, 80));
+    assert.deepStrictEqual(restored.prompts, ['Ask']);
+  }
+  // At the limit it is kept.
+  const longest = 'x'.repeat(store.MAX_ANSWER_CHARACTERS);
+  assert.strictEqual(parse({ answer: longest }).messages[1].answer, longest);
+  // Terminal escapes and invisible formatting in it are removed.
+  assert.strictEqual(parse({ answer: '# Safe\u001b]0;pwned\u0007 **title**\u001b[2J‮' }).messages[1].answer, '# Safe **title**');
+  // Saved on any other role, it is ignored.
+  assert.deepStrictEqual(store.parseHistory(JSON.stringify({
+    version: 1, history: [], messages: [{ role: 'notice', content: 'Note', answer: MARKDOWN }], prompts: []
+  })).messages, [{ role: 'notice', content: 'Note' }]);
+  // A reply whose Markdown is too long is saved without it, as plain text.
+  const long = markdownReply({ answer: `# ${'x'.repeat(store.MAX_ANSWER_CHARACTERS)}` });
+  const saved = JSON.parse(store.serializeHistory({ history: [], messages: [long], prompts: [] }));
+  assert.strictEqual(saved.messages[0].answer, undefined);
+  assert.strictEqual(saved.messages[0].content, 'Title\n\nSome bold and code here.\n\n- item');
+});
+
+test('chat history stays under its size cap with long Markdown replies', () => {
+  const { directory, file } = tempFile();
+  try {
+    // Each reply saves about 2 × 60 KB (content and Markdown), so 100 of them can't all fit.
+    const long = (index) => `# Reply ${index}\n\n${'**bold** and `code` '.repeat(3000)}`;
+    const messages = Array.from({ length: 100 }, (_, index) => markdownReply({ answer: long(index) }));
+    store.saveHistory(file, { history: [], messages, prompts: ['Last prompt'] });
+    assert(fs.statSync(file).size <= store.MAX_FILE_BYTES);
+    const restored = store.loadHistory(file);
+    assert(restored.messages.length > 0 && restored.messages.length < 100);
+    // The oldest replies were dropped; the newest kept their Markdown.
+    assert.strictEqual(restored.messages[restored.messages.length - 1].answer, long(99));
+    assert(restored.messages.every((message, index) =>
+      message.answer === long(100 - restored.messages.length + index)));
+    assert.deepStrictEqual(restored.prompts, ['Last prompt']);
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
 });
 
 test('chat history drops only the unusable sources of a reply and keeps the rest', () => {

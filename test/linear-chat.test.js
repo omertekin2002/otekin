@@ -1539,6 +1539,52 @@ function saveCitedConversation(file) {
   });
 }
 
+test('linear chat /last, /save and /copy keep the Markdown of a restored reply without sources', async () => {
+  const { formatResolvedResponse } = require('../lib/chat-format');
+  const markdown = '# Title\n\nSome **bold** and `code` here.\n\n- item';
+  const reply = { answer: markdown, sources: [] };
+  const answeredAt = '2026-11-15T09:30:00.000Z';
+  const answered = chatExport.answerTimeLabel(answeredAt, FIXED_NOW);
+  const run = async (saved) => {
+    const { directory, file } = historyFixture();
+    const saveDirectory = path.join(directory, 'saved');
+    fs.mkdirSync(saveDirectory);
+    /** @type {string[]} */
+    const copied = [];
+    try {
+      chatHistory.saveHistory(file, { history: [], messages: [{ role: 'user', content: 'Format it' }, saved], prompts: ['Format it'] });
+      const s = session(async () => assert.fail('nothing is sent'), {
+        start: { interactive: true, historyFile: file, saveDirectory, now: () => FIXED_NOW, copy: async (text) => { copied.push(text); return 'pbcopy'; } }
+      });
+      s.send('/last\n/save\n/copy\n');
+      await s.idle(4);
+      s.input.end();
+      await s.chat.finished;
+      const [name] = filesIn(saveDirectory);
+      return { out: s.out(), copied, saved: fs.readFileSync(path.join(saveDirectory, name), 'utf8') };
+    } finally {
+      fs.rmSync(directory, { recursive: true, force: true });
+    }
+  };
+
+  // Saved by the full-screen chat: its content is styled, so only the saved Markdown has the headings.
+  const fullScreen = await run({
+    role: 'assistant', model: 'screen-model', answeredAt,
+    content: formatResolvedResponse(reply, { hyperlinks: true, color: true }),
+    markdown: formatResolvedResponse(reply, { hyperlinks: true }),
+    answer: markdown
+  });
+  assert(fullScreen.out.includes(`You: /last\nscreen-model · ${answered}:\n${markdown}\n\nYou: `), fullScreen.out);
+  assert.deepStrictEqual(fullScreen.copied, [`${markdown}\n`]);
+  assert.match(fullScreen.saved, /\n## screen-model · 2026-11-15 \d{2}:\d{2}\n\n# Title\n/);
+  assert(fullScreen.saved.endsWith(`\n\n${markdown}\n`), fullScreen.saved);
+
+  // Saved before replies kept their Markdown: the plain content, as before.
+  const older = await run({ role: 'assistant', model: 'screen-model', answeredAt, content: 'Title\n\nSome bold and code here.' });
+  assert(older.out.includes(`You: /last\nscreen-model · ${answered}:\nTitle\n\nSome bold and code here.\n\nYou: `), older.out);
+  assert.deepStrictEqual(older.copied, ['Title\n\nSome bold and code here.\n']);
+});
+
 test('linear chat restores, shows /last, /save and /copy with the gateway down, and never contacts it until asked', async () => {
   const { directory, file } = historyFixture();
   const saveDirectory = path.join(directory, 'saved');
