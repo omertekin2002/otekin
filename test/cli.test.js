@@ -1086,11 +1086,12 @@ test('CLI linear chat reads, saves and copies a saved conversation with the gate
       assert.strictEqual(result.code, 0);
       assert.strictEqual(result.stderr, '');
       assert.match(result.stdout, /\nContinuing your saved conversation \(1 question\)\. \/last shows the latest reply; \/clear forgets it; --no-history skips it\.\n/);
-      assert.match(result.stdout, /You: \/last\nsaved-model · [^\n]*\d{2}:\d{2}:\nSaved answer \[1\]\.\n\nSources:\n1\. Saved source https:\/\/example\.com\/saved\n\n/);
+      // A terminal echoes typed lines itself, so the CLI repeats a line only when it arrived before its prompt.
+      assert.match(result.stdout, /You: (?:\/last\n)?saved-model · [^\n]*\d{2}:\d{2}:\nSaved answer \[1\]\.\n\nSources:\n1\. Saved source https:\/\/example\.com\/saved\n\n/);
       const saved = result.stdout.match(/^Saved the conversation to (.+)$/m);
       assert(saved, result.stdout);
       assert.match(fs.readFileSync(saved[1], 'utf8'), /## You\n\nSaved question\n\n## saved-model · 2026-11-15 \d{2}:\d{2}\n\nSaved answer \[1\]\.\n\nSources: \[\\\[1\\\] Saved source\]\(https:\/\/example\.com\/saved\)\n$/);
-      assert.match(result.stdout, /You: \/copy\n(Copied the latest reply \(with 1 source\) to the clipboard|No clipboard available; saved the latest reply \(with 1 source\) to .+)\n/);
+      assert.match(result.stdout, /You: (?:\/copy\n)?(Copied the latest reply \(with 1 source\) to the clipboard|No clipboard available; saved the latest reply \(with 1 source\) to .+)\n/);
       assert.doesNotMatch(result.stdout, SGR);
       assert.doesNotMatch(result.stdout, REDRAW);
     };
