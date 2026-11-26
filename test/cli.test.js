@@ -1373,7 +1373,7 @@ test('CLI linear chat at a terminal saves history and continues it in the next r
   }
 });
 
-test('CLI linear chat reads, saves and copies a saved conversation with the gateway down', async () => {
+test('CLI linear chat reads and saves a saved conversation with the gateway down', async () => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'otekin-linear-offline-'));
   const file = path.join(directory, 'state', 'history.json');
   const gateway = await startDownGateway();
@@ -1388,10 +1388,10 @@ test('CLI linear chat reads, saves and copies a saved conversation with the gate
       prompts: ['Saved question']
     });
     const before = fs.readFileSync(file);
-    // No clipboard tool on Linux, so /copy falls back to a file there; macOS and Windows have one.
-    const env = { ...gateway.env, OTEKIN_HISTORY_FILE: file, WAYLAND_DISPLAY: undefined, DISPLAY: undefined };
+    // Offline /copy is covered in-process with an injected clipboard so tests never touch the OS clipboard.
+    const env = { ...gateway.env, OTEKIN_HISTORY_FILE: file };
     const offline = async () => {
-      const result = await runCli(['chat', '--linear'], env, TTY_STDIN, '/last\n/save\n/copy\n', directory);
+      const result = await runCli(['chat', '--linear'], env, TTY_STDIN, '/last\n/save\n', directory);
       assert.strictEqual(result.code, 0);
       assert.strictEqual(result.stderr, '');
       assert.match(result.stdout, /\nContinuing your saved conversation \(1 question\)\. \/last shows the latest reply; \/clear forgets it; --no-history skips it\.\n/);
@@ -1400,7 +1400,6 @@ test('CLI linear chat reads, saves and copies a saved conversation with the gate
       const saved = result.stdout.match(/^Saved the conversation to (.+)$/m);
       assert(saved, result.stdout);
       assert.match(fs.readFileSync(saved[1], 'utf8'), /## You\n\nSaved question\n\n## saved-model · 2026-11-15 \d{2}:\d{2}\n\nSaved answer \[1\]\.\n\nSources: \[\\\[1\\\] Saved source\]\(https:\/\/example\.com\/saved\)\n$/);
-      assert.match(result.stdout, /You: (?:\/copy\n)?(Copied the latest reply \(with 1 source\) to the clipboard|No clipboard available; saved the latest reply \(with 1 source\) to .+)\n/);
       assert.doesNotMatch(result.stdout, SGR);
       assert.doesNotMatch(result.stdout, REDRAW);
     };

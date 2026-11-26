@@ -3029,6 +3029,33 @@ test('a failed //question comes back as typed, and a failed /retry of it comes b
   }
 });
 
+test('a failed literal / question restores without reopening the command palette, so Enter resends it', async () => {
+  const requests = [];
+  const services = {
+    ...client, ensureChatServiceAwake: async () => {},
+    async requestChat(messages) {
+      requests.push(messages);
+      if (requests.length === 1) throw new client.ChatApiError('Chat service is busy.');
+      return {message: 'Slash answer.'};
+    }
+  };
+  const ui = await terminalApp({services});
+  try {
+    await ui.type('/');
+    await ui.type('\u001b');
+    await ui.type('\r');
+    await waitFor(() => requests.length === 1);
+    await ui.expectScreen(/│ › \/\s/);
+    await ui.type('\r');
+    await ui.expectScreen(/Slash answer\./);
+    assert.strictEqual(requests.length, 2);
+    assert.deepStrictEqual(requestContents(requests[0]), ['/']);
+    assert.deepStrictEqual(requestContents(requests[1]), ['/']);
+  } finally {
+    await ui.close();
+  }
+});
+
 test('Esc, Ctrl+C or /clear during a request leaves the composer empty', async () => {
   for (const [key, notice] of [
     ['\u001b', /Cancelled\. Ready for your next message\./],
