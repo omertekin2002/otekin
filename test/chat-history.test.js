@@ -211,8 +211,7 @@ test('chat history drops malformed reply sources and keeps the reply as plain te
     { sources: [null] },
     { sources: [[1, 'First', 'https://example.com/first']] },
     { answer: 7 },
-    { answer: undefined },
-    { sources: undefined }
+    { answer: undefined }
   ];
   for (const extra of cases) {
     const restored = store.parseHistory(JSON.stringify({
@@ -237,6 +236,90 @@ test('chat history drops malformed reply sources and keeps the reply as plain te
     version: 1, history: [], messages: [sourcedReply({ answer: 'Safe\u001b]0;x\u0007 answer\u001b[2J' })], prompts: []
   }));
   assert.strictEqual(escaped.messages[0].answer, 'Safe answer');
+});
+
+// A full-screen reply without sources: its content is styled, so cleaning it loses the Markdown.
+const MARKDOWN = '# Title\n\nSome **bold** and `code` here.\n\n- item';
+function markdownReply(extra) {
+  const { formatResolvedResponse } = require('../lib/chat-format');
+  const reply = { answer: MARKDOWN, sources: [] };
+  return {
+    role: 'assistant',
+    model: 'fixture-model',
+    content: formatResolvedResponse(reply, { hyperlinks: true, color: true }),
+    markdown: formatResolvedResponse(reply, { hyperlinks: true }),
+    ...extra
+  };
+}
+
+test('chat history keeps the Markdown of a reply without sources', () => {
+  // As the full-screen chat had it before replies kept their answer: only content and markdown.
+  for (const message of [markdownReply(), markdownReply({ answer: MARKDOWN })]) {
+    const text = store.serializeHistory({ history: [], messages: [message], prompts: [] });
+    const saved = JSON.parse(text);
+    // The shape an older version checks is unchanged: version 1, string content, no sources.
+    assert.strictEqual(saved.version, 1);
+    assert.deepStrictEqual(saved.messages[0], {
+      role: 'assistant',
+      content: 'Title\n\nSome bold and code here.\n\n- item',
+      model: 'fixture-model',
+      answer: MARKDOWN
+    });
+    assert.deepStrictEqual(store.parseHistory(text).messages[0], {
+      role: 'assistant', model: 'fixture-model', content: 'Title\n\nSome bold and code here.\n\n- item', answer: MARKDOWN
+    });
+  }
+  // A file from before this change has no answer: the reply loads as its plain content.
+  assert.deepStrictEqual(store.parseHistory(JSON.stringify({
+    version: 1, history: [], messages: [{ role: 'assistant', model: 'fixture-model', content: 'Title\n\nPlain' }], prompts: []
+  })).messages, [{ role: 'assistant', model: 'fixture-model', content: 'Title\n\nPlain' }]);
+});
+
+test('chat history drops an unusable saved Markdown alone and keeps the reply as plain text', () => {
+  const plain = { role: 'assistant', model: 'fixture-model', content: 'Plain reply' };
+  const parse = (extra) => store.parseHistory(JSON.stringify({
+    version: 1, history: [], messages: [{ role: 'user', content: 'Ask' }, { ...plain, ...extra }], prompts: ['Ask']
+  }));
+  for (const answer of [7, null, true, {}, [MARKDOWN], 'x'.repeat(store.MAX_ANSWER_CHARACTERS + 1)]) {
+    const restored = parse({ answer });
+    assert(restored, JSON.stringify(answer).slice(0, 80));
+    assert.deepStrictEqual(restored.messages, [{ role: 'user', content: 'Ask' }, plain], JSON.stringify(answer).slice(0, 80));
+    assert.deepStrictEqual(restored.prompts, ['Ask']);
+  }
+  // At the limit it is kept.
+  const longest = 'x'.repeat(store.MAX_ANSWER_CHARACTERS);
+  assert.strictEqual(parse({ answer: longest }).messages[1].answer, longest);
+  // Terminal escapes and invisible formatting in it are removed.
+  assert.strictEqual(parse({ answer: '# Safe\u001b]0;pwned\u0007 **title**\u001b[2J‮' }).messages[1].answer, '# Safe **title**');
+  // Saved on any other role, it is ignored.
+  assert.deepStrictEqual(store.parseHistory(JSON.stringify({
+    version: 1, history: [], messages: [{ role: 'notice', content: 'Note', answer: MARKDOWN }], prompts: []
+  })).messages, [{ role: 'notice', content: 'Note' }]);
+  // A reply whose Markdown is too long is saved without it, as plain text.
+  const long = markdownReply({ answer: `# ${'x'.repeat(store.MAX_ANSWER_CHARACTERS)}` });
+  const saved = JSON.parse(store.serializeHistory({ history: [], messages: [long], prompts: [] }));
+  assert.strictEqual(saved.messages[0].answer, undefined);
+  assert.strictEqual(saved.messages[0].content, 'Title\n\nSome bold and code here.\n\n- item');
+});
+
+test('chat history stays under its size cap with long Markdown replies', () => {
+  const { directory, file } = tempFile();
+  try {
+    // Each reply saves about 2 × 60 KB (content and Markdown), so 100 of them can't all fit.
+    const long = (index) => `# Reply ${index}\n\n${'**bold** and `code` '.repeat(3000)}`;
+    const messages = Array.from({ length: 100 }, (_, index) => markdownReply({ answer: long(index) }));
+    store.saveHistory(file, { history: [], messages, prompts: ['Last prompt'] });
+    assert(fs.statSync(file).size <= store.MAX_FILE_BYTES);
+    const restored = store.loadHistory(file);
+    assert(restored.messages.length > 0 && restored.messages.length < 100);
+    // The oldest replies were dropped; the newest kept their Markdown.
+    assert.strictEqual(restored.messages[restored.messages.length - 1].answer, long(99));
+    assert(restored.messages.every((message, index) =>
+      message.answer === long(100 - restored.messages.length + index)));
+    assert.deepStrictEqual(restored.prompts, ['Last prompt']);
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
 });
 
 test('chat history drops only the unusable sources of a reply and keeps the rest', () => {
@@ -428,3 +511,87 @@ if (process.platform !== 'win32') {
     }
   });
 }
+
+test('a save with a snapshot writes only over the file this session last saw', () => {
+  const { directory, file } = tempFile();
+  const other = { history: [], messages: [{ role: 'notice', content: 'Other session' }], prompts: [] };
+  const mine = { history: [], messages: [{ role: 'notice', content: 'This session' }], prompts: [] };
+  try {
+    // Unchanged since an empty start: saves, and saves again after its own save.
+    const session = {};
+    assert.strictEqual(store.loadHistory(file, session), null);
+    assert.strictEqual(session.fingerprint, 'absent');
+    assert.strictEqual(store.saveHistory(file, mine, session), true);
+    assert.match(session.fingerprint, /^sha256:[0-9a-f]{64}$/);
+    assert.strictEqual(store.readHistoryFile(file).fingerprint, session.fingerprint);
+    mine.prompts = ['Again'];
+    assert.strictEqual(store.saveHistory(file, mine, session), true);
+    assert.deepStrictEqual(store.loadHistory(file).prompts, ['Again']);
+
+    // Rewritten by another writer: refuses, and leaves the file as the other writer left it.
+    const loaded = {};
+    assert(store.loadHistory(file, loaded));
+    store.saveHistory(file, other);
+    const before = fs.readFileSync(file);
+    assert.strictEqual(store.saveHistory(file, mine, loaded), false);
+    assert.deepStrictEqual(fs.readFileSync(file), before);
+    // The same bytes written again by someone else still count as unchanged.
+    const same = {};
+    store.loadHistory(file, same);
+    fs.writeFileSync(file, before);
+    assert.strictEqual(store.saveHistory(file, mine, same), true);
+
+    // Deleted after loading, as another chat's /clear does: refuses, and the file stays deleted.
+    const cleared = {};
+    assert(store.loadHistory(file, cleared));
+    store.clearHistory(file);
+    assert.strictEqual(store.saveHistory(file, mine, cleared), false);
+    assert.strictEqual(fs.existsSync(file), false);
+
+    // Created after an empty start: refuses.
+    const empty = {};
+    assert.strictEqual(store.loadHistory(file, empty), null);
+    store.saveHistory(file, other);
+    assert.strictEqual(store.saveHistory(file, mine, empty), false);
+    assert.deepStrictEqual(store.loadHistory(file).messages, other.messages);
+
+    // A session's own /clear forgets what it saw, so it saves a fresh file next.
+    store.clearHistory(file, empty);
+    assert.strictEqual(empty.fingerprint, 'absent');
+    assert.strictEqual(store.saveHistory(file, mine, empty), true);
+    assert.deepStrictEqual(store.loadHistory(file).messages, mine.messages);
+
+    // Without a snapshot a save writes as it always has.
+    assert.strictEqual(store.saveHistory(file, other), true);
+    assert.deepStrictEqual(store.loadHistory(file).messages, other.messages);
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('a snapshot also covers history files the chat cannot load', () => {
+  const { directory, file } = tempFile();
+  try {
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    // A damaged file loads as nothing, but saving over it unchanged still works, as it did before.
+    fs.writeFileSync(file, '{"version": 1, broken');
+    const damaged = {};
+    assert.strictEqual(store.loadHistory(file, damaged), null);
+    assert.match(damaged.fingerprint, /^sha256:/);
+    assert.strictEqual(store.saveHistory(file, conversation(), damaged), true);
+    assert(store.loadHistory(file));
+
+    // A file over the size limit is described without being read; a rewrite changes that description.
+    const large = {};
+    fs.writeFileSync(file, Buffer.alloc(store.MAX_FILE_BYTES + 1, 0x20));
+    assert.strictEqual(store.loadHistory(file, large), null);
+    assert.match(large.fingerprint, /^other:file:/);
+    assert.strictEqual(store.readHistoryFile(file).fingerprint, large.fingerprint);
+    fs.writeFileSync(file, Buffer.alloc(store.MAX_FILE_BYTES + 2, 0x20));
+    assert.notStrictEqual(store.readHistoryFile(file).fingerprint, large.fingerprint);
+    assert.strictEqual(store.saveHistory(file, conversation(), large), false);
+    assert.strictEqual(fs.statSync(file).size, store.MAX_FILE_BYTES + 2);
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});

@@ -82,6 +82,7 @@ No API key is required. Ask a one-shot question or open the full-screen chat dir
 npx otekin chat "What happened today?"
 npx otekin chat
 npx otekin chat --linear
+npx otekin chat --status
 npx otekin chat "Explain this" --json
 npx otekin --select chat
 npx otekin chat -- "-5°C in °F?"
@@ -134,12 +135,13 @@ For each question, linear chat prints one `Researching…` line, at most one `Wa
 
 - Ctrl+C cancels a reply in progress and prints `Cancelled.`; a reply that arrives afterwards is never shown. Ctrl+C or Ctrl+D while waiting for a question ends the session.
 - `/help` lists the commands, and `/exit` or `/quit` ends the session. Other single slash words print `Unknown command`; start a message with `//` to send it with one leading `/`. Blank lines are ignored.
+- `/last` prints the latest completed reply again, as it was printed when it arrived: the model that answered, followed by its answer time when it has one (`gpt-5 · 14:15:`), the answer, and its sources as a numbered list with their full URLs. It works for a reply restored from saved history too, and never contacts the chat service. With no reply yet, it prints `No reply yet. Ask a question first.`
 - `/retry` sends your last message again, like in the full-screen chat. At a terminal it first names the question in one line, `Sending again: <question>`, with its first line cut to 60 characters and `…` when it was cut or has more lines; piped input prints no such line. After a failed or cancelled reply, it sends the same question. After a reply arrived, the new reply replaces it, in `/save` and in what is sent on later turns; if the retry fails or is cancelled, the earlier reply stays. While a reply is on the way, it only says so: press Ctrl+C first.
 - `/save` writes the conversation to a new Markdown file in the current directory, such as `otekin-chat-20261116-141500.md`, and prints its path. It holds your messages and the replies, each headed by the model that answered and its answer time, with numbered sources as Markdown links. Notices, errors, tool lines and `Cancelled.` are left out. Like the full-screen chat, it keeps the newest 100 messages and replies.
 - `/copy` copies the latest completed reply to the clipboard as Markdown, the answer followed by its numbered source links, and says how many sources it holds. When no clipboard tool works, it writes the reply to a new `otekin-reply-*.md` file in the current directory and prints its path. Files from `/save` and `/copy` are readable only by you on macOS and Linux and never replace an existing file.
-- At a terminal, linear chat shares [saved chat history](#saved-chat-history) with the full-screen chat: the same file, so either one continues a conversation the other started. When there is one, a single line says so, `Continuing your saved conversation (3 questions). /clear forgets it; --no-history skips it.`, without printing the old replies again. Follow-ups use the earlier turns as context, `/retry` can replace the last saved reply, and `/save` and `/copy` include saved replies with their source links and answer times. The conversation is saved after each completed reply, never after a failed or cancelled one; if saving fails, one line says `Could not save chat history (CODE). The chat still works.` Piped input never reads or writes saved history, so scripts stay reproducible.
+- At a terminal, linear chat shares [saved chat history](#saved-chat-history) with the full-screen chat: the same file, so either one continues a conversation the other started. When there is one, a single line says so, `Continuing your saved conversation (3 questions). /last shows the latest reply; /clear forgets it; --no-history skips it.`, without printing the old replies again; `/last` prints the latest one. Follow-ups use the earlier turns as context, `/retry` can replace the last saved reply, and `/save` and `/copy` include saved replies with their source links and answer times. The conversation is saved after each completed reply, never after a failed or cancelled one; if saving fails, one line says `Could not save chat history (CODE). The chat still works.` Piped input never reads or writes saved history, so scripts stay reproducible.
 - `/clear` forgets the conversation, including a question still waiting for a reply, and deletes the saved history file; it prints `Conversation cleared`. While a reply is on the way, it cancels it first.
-- At a terminal, `/help`, `/retry`, `/save`, `/copy` and `/clear` answer at once even while a reply is on the way; `/copy` then copies the previous completed reply and says so. The reply is still printed whole when it arrives. Piped lines always run in order, each after the previous reply.
+- At a terminal, `/help`, `/last`, `/retry`, `/save`, `/copy` and `/clear` answer at once even while a reply is on the way; `/last` then prints the previous completed reply and `/copy` copies it, and both say so. The reply is still printed whole when it arrives. Piped lines always run in order, each after the previous reply.
 - On a terminal with `TERM=dumb`, `npx otekin chat` without a prompt opens linear chat automatically instead of the full-screen workspace.
 - Color is used only for the header and model name, and only on a color terminal without `NO_COLOR`.
 - `--json` is not supported with linear chat.
@@ -164,6 +166,7 @@ When the service has optional image generation enabled, ask for an image in the 
 - `--no-open`: print a selected URL instead of opening it in a browser.
 - `--no-history`: don't load or save the saved chat history (full-screen or linear) for this run. An existing history file is left untouched.
 - `--linear`: with `chat`, hold a line-based conversation that never redraws or animates and prints each reply once. See [Linear chat](#linear-chat).
+- `--status`: with `chat`, check once whether the chat service is up, without sending a question, and exit with code 0 when it is reachable or 1 otherwise. Add `--json` for a JSON object. It doesn't take a prompt or `--linear`. See [Checking the chat service](#checking-the-chat-service).
 - `--reduced-motion`: replace spinners and ticking timers with a static status in the full-screen workspace and one-shot chat. `OTEKIN_REDUCED_MOTION=1` does the same for every run. See [Reduced motion](#reduced-motion).
 - `--cv`, `--resume`: open the CV link directly.
 - `--select <website|linkedin|cv|chat|exit>`: choose an option directly.
@@ -195,7 +198,7 @@ Conversation content is transmitted to SLgateway and its configured model provid
 
 When the gateway returns a safe structured failure, the CLI shows a specific category and its request ID. The request ID can be used to correlate server logs without exposing provider responses or credentials.
 
-A failed question also says how far it got. When the `GET /healthz` readiness check fails, nothing of the conversation has been sent, so the error ends with `Your question was not sent.`, for example `Chat error: Chat service did not wake up in time. Your question was not sent.` When the chat request itself fails, the gateway may already have started on it, so the error says `The chat service may have received your question.` after the category and request ID. The CLI never resends a chat request on its own. In linear chat at a terminal, both errors end with `Type /retry to send it again.`, and `/retry` sends the same question with the same earlier turns as context. In the full-screen chat, a failed question goes back into the composer when it is empty: the error then ends with `Your question is back in the composer. Press Enter to send it again.`, and the status line says `Not sent · press Enter to send it again` or `Press Enter to send it again`. When you typed a draft while the reply was on the way, the draft stays, the error ends with `Type /retry to send it again.`, and the status line says `/retry sends it again`. Either way, `/retry` sends the same question with the same earlier turns as context. One-shot `otekin chat "…"` and piped linear chat print the same message without the `/retry` hint, since there is nowhere to type it. Cancelling with Esc or Ctrl+C prints no error.
+A failed question also says how far it got. When the `GET /healthz` readiness check fails, nothing of the conversation has been sent, so the error ends with `Your question was not sent.`, for example `Chat error: Chat service did not wake up in time. Your question was not sent.` The same goes for a chat request that never connected to the gateway: its URL isn't HTTP or HTTPS, the connection is refused, the name doesn't resolve, the TLS handshake fails, or the time runs out before it connects. Once the chat request has connected, the gateway may already have started on it, so any later failure says `The chat service may have received your question.` after the category and request ID. The CLI never resends a chat request on its own. In linear chat at a terminal, both errors end with `Type /retry to send it again.`, and `/retry` sends the same question with the same earlier turns as context. In the full-screen chat, a failed question goes back into the composer when it is empty: the error then ends with `Your question is back in the composer. Press Enter to send it again.`, and the status line says `Not sent · press Enter to send it again` or `Press Enter to send it again`. When you typed a draft while the reply was on the way, the draft stays, the error ends with `Type /retry to send it again.`, and the status line says `/retry sends it again`. Either way, `/retry` sends the same question with the same earlier turns as context. One-shot `otekin chat "…"` and piped linear chat print the same message without the `/retry` hint, since there is nowhere to type it. Cancelling with Esc or Ctrl+C prints no error.
 
 For local development or testing, override the non-secret endpoint:
 
@@ -213,11 +216,34 @@ npx otekin chat "Hello"
 
 CORS restrictions do not affect this Node.js CLI. The override must use an HTTP or HTTPS URL.
 
+### Checking the chat service
+
+`npx otekin chat --status` asks whether the chat service is up right now, without sending a question. It makes exactly one `GET` request to the same readiness route the chat uses before each question (`https://signloop-chat-api.vercel.app/healthz` by default, or the `OTEKIN_CHAT_API_URL` / `OTEKIN_CHAT_HEALTH_URL` overrides above). It sends no conversation content, does not invoke research or model providers, never retries, gives up after 10 seconds, and never reads or writes saved chat history or opens a chat. It prints one line and reports one of three states:
+
+- **reachable**: the route answered with `{"ok": true}`. `Chat service: reachable (signloop-chat-api.vercel.app, 0.4 s)`. Exit code 0.
+- **waking**: HTTP 502, 503 or 504. The service may be waking up, or it may be failing, so the check doesn't promise it will come up: `Chat service: waking (signloop-chat-api.vercel.app, 1.2 s). Chat service is not ready yet (HTTP 503); it may be waking up.` Exit code 1.
+- **unavailable**: anything else: no connection, no answer within 10 seconds, another HTTP status, a redirect, an invalid or oversized response, or an invalid URL override. The line ends with what went wrong, such as `Unable to reach chat service.` Exit code 1.
+
+The line includes the gateway's request ID, when it sent a well-formed one, as `Request ID: …` inside the parentheses. With `--json`, it prints one object instead, with the same exit codes:
+
+```json
+{
+  "status": "reachable",
+  "endpoint": "https://signloop-chat-api.vercel.app/healthz",
+  "httpStatus": 200,
+  "requestId": null,
+  "elapsedMs": 412,
+  "message": "Chat service is reachable."
+}
+```
+
+`endpoint` is the health URL's origin and path only, without credentials, query or fragment, and `null` when the URL override is invalid. `httpStatus` is `null` when there was no response, and `requestId` is `null` unless the gateway sent a well-formed one. Ctrl+C cancels the check and exits with code 130 without printing anything.
+
 ### Saved chat history
 
 The full-screen chat and [linear chat](#linear-chat) at a terminal save the conversation after each completed reply, so it is still there the next time you open either of them. They share one file: a conversation started in one continues in the other. One-shot `chat "…"`, `--json` and piped runs, including piped linear chat, never read or write it.
 
-- **What is stored:** the bounded history sent back to the gateway (your messages, its replies, tool replay and the source catalog), the last 100 transcript entries as plain text, and your last 50 prompts. Each cited reply is also stored with its answer text and numbered sources (title and `http`/`https` link), so restored replies keep their styling and clickable source labels, and `/save` writes their sources as Markdown links. Each reply also stores when it was answered, as an ISO-8601 UTC time; the chat shows it in local time after the model label (`gpt-5 · 14:15` today, `gpt-5 · 30 Oct 14:15` on an earlier day, with the year when it differs), and a `/retry` replaces it with the new reply's time. Replies saved by older versions have no answer time and show none. Tool activity is restored as plain text. Generated images stay in their own files.
+- **What is stored:** the bounded history sent back to the gateway (your messages, its replies, tool replay and the source catalog), the last 100 transcript entries as plain text, and your last 50 prompts. Each cited reply is also stored with its answer text and numbered sources (title and `http`/`https` link), so restored replies keep their styling and clickable source labels, and `/save` writes their sources as Markdown links. A reply without sources is stored with its original Markdown (up to 100,000 characters), so after a restart it keeps its styling, and `/last`, `/save` and `/copy` keep its headings, emphasis and code; replies saved by older versions keep only their plain text. Each reply also stores when it was answered, as an ISO-8601 UTC time; the chat shows it in local time after the model label (`gpt-5 · 14:15` today, `gpt-5 · 30 Oct 14:15` on an earlier day, with the year when it differs), and a `/retry` replaces it with the new reply's time. Replies saved by older versions have no answer time and show none. Tool activity is restored as plain text. Generated images stay in their own files.
 - **Where:** one JSON file, `history.json`, in:
   - Linux and others: `$XDG_STATE_HOME/otekin/`, or `~/.local/state/otekin/` when `XDG_STATE_HOME` isn't set
   - macOS: `~/Library/Application Support/otekin/`
@@ -225,7 +251,9 @@ The full-screen chat and [linear chat](#linear-chat) at a terminal save the conv
 
   Set `OTEKIN_HISTORY_FILE=/path/to/history.json` to use another file.
 - **Permissions:** on macOS and Linux the file is readable only by you (`0600`) and its directory is `0700`. It is written to a temporary file first and then renamed, so an interrupted save never leaves half a file. The file isn't encrypted.
+- **Offline:** the chats contact the chat service only when you send a question. A saved conversation can be read, scrolled, saved with `/save` and copied with `/copy` without a network connection, in either chat; `/sources` (full-screen) and `/last` (linear) show its sources too.
 - **Forgetting it:** `/clear`, in either chat, deletes the file. Deleting it yourself works too.
+- **Two chats at once:** when two chats are open at the same time, the first to save after a reply keeps the file. The other checks the file before saving, stops saving, and says so once, so a later save won't overwrite that conversation or bring back one that `/clear` deleted (there is no lock file, so another save or `/clear` can still race if it changes the file between the check and the rename); `/save` still exports it, and a `/clear` in it starts saving again.
 - **Turning it off:** `--no-history` skips loading and saving for one run and leaves any existing file untouched. Set `OTEKIN_NO_HISTORY=1` to turn it off for good. With history off, the conversation lasts only for the current session.
 
 The CLI treats the file as untrusted. A file that is damaged, from another version, or over 2 MiB is ignored and the chat starts empty; terminal control sequences in it are never displayed. A reply whose stored sources are malformed, too many or too long is restored as plain text, without links. An answer time that can't be read, is too long, is before 2020 or is more than a day in the future is dropped, and the reply is restored without it. If a save fails, the status line (or, in linear chat, one printed line) says so with only the error code, and the chat keeps working.

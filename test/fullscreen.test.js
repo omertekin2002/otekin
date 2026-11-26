@@ -12,6 +12,7 @@ const {pathToFileURL} = require('url');
 const client = require('../lib/chat-client');
 const chatExport = require('../lib/chat-export');
 const chatHistory = require('../lib/chat-history');
+const {withDownGateway} = require('./down-gateway');
 
 const LINKS = {
   website: 'https://example.com/website',
@@ -941,6 +942,59 @@ test('saved history restores the conversation, prompt recall and sources, and /c
   }
 });
 
+test('full-screen chat stops saving when another chat changes or clears the history file', async () => {
+  const {directory, file} = historyDirectory();
+  const services = {
+    ...client, ensureChatServiceAwake: async () => {},
+    requestChat: async messages => ({message: `Answer ${messages.length}.`, model: 'fixture-model'})
+  };
+  const questions = () => chatHistory.loadHistory(file)?.history.filter(message => message.role === 'user')
+    .map(message => message.content);
+  const conversation = content => ({history: [{role: 'user', content}, {role: 'assistant', content: 'Saved.'}],
+    messages: [{role: 'user', content}, {role: 'assistant', model: 'fixture-model', content: 'Saved.'}], prompts: [content]});
+  try {
+    chatHistory.saveHistory(file, conversation('Saved before'));
+    const ui = await terminalApp({columns: 80, services, historyFile: file});
+    try {
+      await ui.expectScreen(/Restored your last conversation/);
+      // Another chat saves its own conversation while this one is open.
+      chatHistory.saveHistory(file, conversation('Saved by another chat'));
+      const before = checksum(file);
+      await ui.type('Asked here\r');
+      await waitFor(() => ui.screen().includes('Answer 3.'));
+      // The whole notice fits the status line at 80 columns.
+      await ui.expectScreen(new RegExp(chatHistory.HISTORY_CHANGED_NOTICE.replace(/[.*+?^${}()|[\]\\/]/g, '\\$&')));
+      assert.strictEqual(checksum(file), before);
+      await ui.type('Asked again\r');
+      await waitFor(() => ui.screen().includes('Answer 5.'));
+      await ui.settle();
+      assert.strictEqual(checksum(file), before, 'later replies are not saved either');
+      assert.doesNotMatch(ui.screen(), /Could not save/);
+      // This chat's own /clear starts it over, and it saves again.
+      await ui.type('/clear\r');
+      await waitFor(() => ui.screen().includes("Hi, I'm Ömer"));
+      assert.strictEqual(fs.existsSync(file), false);
+      await ui.type('Fresh start\r');
+      await waitFor(() => ui.screen().includes('Answer 1.'));
+      await waitFor(() => fs.existsSync(file));
+      assert.deepStrictEqual(questions(), ['Fresh start']);
+      assert.doesNotMatch(ui.screen(), /Another chat changed/);
+
+      // Another chat's /clear deletes the file: this chat does not write the conversation back.
+      chatHistory.clearHistory(file);
+      await ui.type('After the other clear\r');
+      await waitFor(() => ui.screen().includes('Answer 3.'));
+      await ui.expectScreen(/Another chat changed saved history/);
+      await ui.settle();
+      assert.strictEqual(fs.existsSync(file), false);
+    } finally {
+      await ui.close();
+    }
+  } finally {
+    fs.rmSync(directory, {recursive: true, force: true});
+  }
+});
+
 // Every clickable label in the output, as "url label".
 const terminalLinks = raw => [...new Set([...raw.matchAll(/\u001b\]8;;(https?:[^\u0007]+)\u0007([^\u001b]*)\u001b\]8;;\u0007/g)]
   .map(([, url, label]) => `${url} ${label}`))].sort();
@@ -1094,6 +1148,71 @@ test('linear and full-screen chat continue each other’s saved conversation', a
     assert.match(markdown, /## screen-model · \d{4}-\d{2}-\d{2} \d{2}:\d{2}\n\nFull-screen answer \[2\]\.\n\nSources: \[\\\[2\\\] Screen source\]\(https:\/\/example\.com\/screen\)\n/);
     assert.match(markdown, /## You\n\nAsked in linear again\n\n## linear-model · .*\n\nLast answer\.\n$/);
     assert.deepStrictEqual(chatHistory.loadHistory(file).prompts, ['Asked in linear', 'Asked in full screen', 'Asked in linear again']);
+  } finally {
+    fs.rmSync(directory, {recursive: true, force: true});
+  }
+});
+
+test('a restored reply without sources keeps its Markdown in /save, /copy, its styling, and linear /last', async () => {
+  const {directory, file} = historyDirectory();
+  const saveDirectory = path.join(directory, 'saved');
+  fs.mkdirSync(saveDirectory);
+  const markdown = '# Title\n\nSome **bold** and `code` here.\n\n- item';
+  const services = {
+    ...client, ensureChatServiceAwake: async () => {},
+    requestChat: async () => ({message: markdown, model: 'fixture-model'})
+  };
+  const {copied, clipboard} = fakeClipboard();
+  const savedFiles = () => fs.readdirSync(saveDirectory).sort();
+  // The reply's section of a /save, from its heading to the end.
+  const replySection = name => fs.readFileSync(path.join(saveDirectory, name), 'utf8').split(/^## fixture-model/m)[1];
+  // The styled reply as the screen draws it: the bold title, and the bold and code spans.
+  const styled = raw => /\u001b\[1mTitle/.test(raw) && /\u001b\[1mbold/.test(raw) && /\u001b\[3\dmcode/.test(raw);
+  try {
+    let before;
+    await withInkColor(async () => {
+      const first = await terminalApp({columns: 80, services, historyFile: file, saveDirectory, clipboard});
+      try {
+        await first.type('Format something\r');
+        await waitFor(() => first.screen().includes('Some bold and code here.'));
+        assert(styled(first.raw()), 'the live reply is styled');
+        await waitFor(() => chatHistory.loadHistory(file)?.messages.length === 2);
+        await first.type('/save\r');
+        await waitFor(() => savedFiles().length === 1);
+        await first.type('/copy\r');
+        await waitFor(() => copied.length === 1);
+      } finally {
+        await first.close();
+      }
+      before = replySection(savedFiles()[0]);
+      assert(before.endsWith(`\n\n${markdown}\n`), before);
+      assert.strictEqual(copied[0], `${markdown}\n`);
+
+      const second = await terminalApp({columns: 80, services, historyFile: file, saveDirectory, clipboard});
+      try {
+        assert.match(second.screen(), /Restored your last conversation/);
+        assert.match(second.screen(), /fixture-model · [\w ]*\d{2}:\d{2}\n\s*Title\n\s*\n\s*Some bold and code here\.\n\s*\n\s*- item/);
+        assert(styled(second.raw()), 'the restored reply keeps its styling');
+        await second.type('/save\r');
+        await waitFor(() => savedFiles().length === 2);
+        await second.type('/copy\r');
+        await waitFor(() => copied.length === 2);
+      } finally {
+        await second.close();
+      }
+    });
+    assert.strictEqual(replySection(savedFiles()[1]), before);
+    assert.strictEqual(copied[1], copied[0]);
+
+    // Linear chat restores the same file with the same Markdown.
+    const linearCopied = [];
+    const out = await linearSession(['/last', '/save', '/copy'], {
+      services, historyFile: file, saveDirectory, copy: async text => { linearCopied.push(text); return 'pbcopy'; }
+    });
+    assert(out.includes(`You: /last\nfixture-model`) && out.includes(`:\n${markdown}\n\nYou: /save`), out);
+    assert.deepStrictEqual(linearCopied, [`${markdown}\n`]);
+    assert.strictEqual(savedFiles().length, 3);
+    assert.strictEqual(replySection(savedFiles()[2]), before);
   } finally {
     fs.rmSync(directory, {recursive: true, force: true});
   }
@@ -2730,6 +2849,148 @@ test('a failed chat request goes back into an empty composer without saying it w
   }
 });
 
+test('a chat request that never connected says it was not sent, in the error and the status row', async () => {
+  const resend = await failThenResend('request',
+    new client.ChatApiError('Unable to reach chat service.', {notSent: true}));
+  try {
+    assert.match(resend.failed, /Unable to reach chat service\. Your question was not sent\. Your question is back in the composer\. Press Enter to send it again\./);
+    assert.match(resend.failed, /Not sent · press Enter to send it again/);
+    assert.doesNotMatch(resend.failed, /may have received/);
+    assert.strictEqual(resend.postsAtFailure, 2);
+    assert.deepStrictEqual(requestContents(resend.requests[2]), ['First question', 'First answer.', 'Second question']);
+  } finally {
+    await resend.ui.close();
+  }
+
+  const retry = await failThenRetry('request',
+    new client.ChatApiError('Chat service took too long.', {notSent: true}));
+  try {
+    assert.match(retry.failed, /Chat service took too long\. Your question was not sent\. Type \/retry to send it again\./);
+    assert.match(retry.failed, /Not sent · \/retry sends it again/);
+    assert.doesNotMatch(retry.failed, /may have received/);
+    assert.deepStrictEqual(retry.requests[2], retry.requests[1]);
+  } finally {
+    await retry.ui.close();
+  }
+});
+
+// Every request waits until the test answers or fails it, in the order they were sent.
+function heldRequests() {
+  const requests = [];
+  const held = [];
+  return {requests, held, services: {
+    ...client, ensureChatServiceAwake: async () => {},
+    requestChat(messages) {
+      requests.push(messages);
+      const pending = heldStage();
+      held.push(pending);
+      return pending.promise;
+    }
+  }};
+}
+
+// The rail item drawn as selected, if any: "› Website ↗" and the like.
+const railSelection = ui => (ui.screen().split('\n').map(line => line.slice(0, 27).match(/› (\S.*?)\s*$/)).find(Boolean) || [])[1];
+
+test('a failed question put back in the composer takes focus back from the rail, so Enter sends it once', async () => {
+  const failure = new client.ChatApiError('Chat service is busy.', {requestId: 'rail-req-1'});
+  const {requests, held, services} = heldRequests();
+  const ui = await terminalApp({columns: 110, services});
+  try {
+    await ui.type('Rail question\r');
+    await waitFor(() => held.length === 1);
+    // Tab moves focus to the rail while the reply is on its way; ↓↓ selects the website.
+    await ui.type('\t\u001b[B\u001b[B');
+    await ui.waitUntil(() => railSelection(ui) === 'Website ↗', 'the rail did not select the website');
+    held[0].fail(failure);
+    // The status row: the error's own hint wraps around the rail.
+    await ui.expectScreen(/ {2}Press Enter to send it again\n/);
+    await ui.expectScreen(/│ › Rail question/);
+    // The rail shows the open view again, not a selection, and the caret is back in the composer.
+    await ui.waitUntil(() => railSelection(ui) === 'Chat', 'the rail kept its selection');
+    const row = ui.screen().split('\n').indexOf(composerLine(ui));
+    await ui.waitUntil(() => ui.emulator.buffer.active.cursorY === row, 'the caret is not in the composer');
+
+    await ui.type('\r');
+    await waitFor(() => held.length === 2);
+    held[1].release({message: 'Rail answer.'});
+    await ui.expectScreen(/Rail answer\./);
+    await ui.settle();
+    assert.strictEqual(requests.length, 2);
+    assert.deepStrictEqual(requestContents(requests[1]), ['Rail question']);
+    assert.deepStrictEqual(ui.opened, [], 'Enter ran no rail item');
+    assert.match(composerLine(ui), /│ › Ask anything/);
+
+    // A draft typed meanwhile is not replaced, so focus stays where the user put it.
+    await ui.type('Third question\r');
+    await waitFor(() => held.length === 3);
+    // The rail still has the website selected from before.
+    await ui.type('kept draft\t');
+    await ui.waitUntil(() => railSelection(ui) === 'Website ↗', 'the rail did not select the website');
+    held[2].fail(failure);
+    await ui.expectScreen(/ {2}\/retry sends it again\n/);
+    await ui.settle();
+    assert.strictEqual(railSelection(ui), 'Website ↗', 'the rail keeps focus when nothing was restored');
+    assert.match(ui.screen(), /kept draft/);
+    assert.strictEqual(requests.length, 3);
+  } finally {
+    await ui.close();
+  }
+});
+
+test('a failed question put back in the composer leaves /sources for the chat, so Enter sends it once', async () => {
+  const failure = new client.ChatApiError('Chat service is busy.', {requestId: 'sources-req-1'});
+  const {requests, held, services} = heldRequests();
+  const ui = await terminalApp({columns: 80, services});
+  const flat = () => ui.screen().replace(/\s+/g, ' ');
+  const openSources = async () => {
+    await ui.type('/sources\r');
+    await ui.expectScreen(/Sources · reply \d of \d/);
+  };
+  try {
+    await ui.type('First question\r');
+    await waitFor(() => held.length === 1);
+    held[0].release(citedReply('First cited [1].', [{number: 1, title: 'First source', url: 'https://example.com/first'}]));
+    await ui.expectScreen(/First cited \[1\]\./);
+
+    await ui.type('Second question\r');
+    await waitFor(() => held.length === 2);
+    await openSources();
+    held[1].fail(failure);
+    // Back in the chat, with the error, its hint and the restored question on screen.
+    await ui.waitUntil(() => !ui.screen().includes('Sources · reply'), 'the inspector stayed open');
+    await ui.expectScreen(/\/ Chat/);
+    await ui.expectScreen(/CHAT ERROR/);
+    await ui.waitUntil(() => /Your question is back in the composer\. Press Enter to send it again\./.test(flat()),
+      'the error and its hint are not on screen');
+    await ui.expectScreen(/│ › Second question/);
+
+    await ui.type('\r');
+    await waitFor(() => held.length === 3);
+    held[2].release({message: 'Second answer.'});
+    await ui.expectScreen(/Second answer\./);
+    await ui.settle();
+    assert.strictEqual(requests.length, 3);
+    assert.deepStrictEqual(requests[2], requests[1], 'Enter resends the same request');
+    assert.strictEqual(requestContents(requests[2]).at(-1), 'Second question');
+    assert.deepStrictEqual(ui.opened, [], 'Enter opened no source');
+
+    // A failed replacing /retry restores nothing, so the inspector stays open with its selection.
+    await ui.type('/retry\r');
+    await waitFor(() => held.length === 4);
+    await openSources();
+    held[3].fail(failure);
+    await ui.settle();
+    assert.match(ui.screen(), /Sources · reply 1 of 1/);
+    assert.match(ui.screen(), /› \[1\] First source/);
+    assert.match(ui.screen(), /\/retry sends it again/);
+    assert.strictEqual(requests.length, 4);
+    assert.deepStrictEqual(ui.opened, []);
+  } finally {
+    await ui.close();
+  }
+});
+
 test('a failed //question comes back as typed, and a failed /retry of it comes back escaped', async () => {
   const requests = [];
   const services = {
@@ -2768,6 +3029,33 @@ test('a failed //question comes back as typed, and a failed /retry of it comes b
   }
 });
 
+test('a failed literal / question restores without reopening the command palette, so Enter resends it', async () => {
+  const requests = [];
+  const services = {
+    ...client, ensureChatServiceAwake: async () => {},
+    async requestChat(messages) {
+      requests.push(messages);
+      if (requests.length === 1) throw new client.ChatApiError('Chat service is busy.');
+      return {message: 'Slash answer.'};
+    }
+  };
+  const ui = await terminalApp({services});
+  try {
+    await ui.type('/');
+    await ui.type('\u001b');
+    await ui.type('\r');
+    await waitFor(() => requests.length === 1);
+    await ui.expectScreen(/│ › \/\s/);
+    await ui.type('\r');
+    await ui.expectScreen(/Slash answer\./);
+    assert.strictEqual(requests.length, 2);
+    assert.deepStrictEqual(requestContents(requests[0]), ['/']);
+    assert.deepStrictEqual(requestContents(requests[1]), ['/']);
+  } finally {
+    await ui.close();
+  }
+});
+
 test('Esc, Ctrl+C or /clear during a request leaves the composer empty', async () => {
   for (const [key, notice] of [
     ['\u001b', /Cancelled\. Ready for your next message\./],
@@ -2797,5 +3085,87 @@ test('Esc, Ctrl+C or /clear during a request leaves the composer empty', async (
     } finally {
       await ui.close();
     }
+  }
+});
+
+test('a restored conversation scrolls and shows /sources, /save and /copy with the gateway down, never contacting it', async () => {
+  const {directory, file} = historyDirectory();
+  const saveDirectory = path.join(directory, 'saved');
+  fs.mkdirSync(saveDirectory);
+  const answer = Array.from({length: 50}, (_,index) => `Saved line ${index + 1}`).join('\n') + ' [1][2]';
+  try {
+    fs.mkdirSync(path.dirname(file), {recursive: true});
+    fs.writeFileSync(file, JSON.stringify({version: 1, history: [], prompts: ['First saved question', 'Second saved question'], messages: [
+      {role: 'user', content: 'First saved question'},
+      {role: 'assistant', model: 'saved-model', content: 'Short saved answer.', answeredAt: '2026-10-30T12:00:00.000Z'},
+      {role: 'user', content: 'Second saved question'},
+      {role: 'assistant', model: 'saved-model', content: answer, answer, answeredAt: '2026-10-30T12:15:00.000Z', sources: [
+        {number: 1, title: LONG_TITLE, url: LONG_URL},
+        {number: 2, title: 'Second saved source', url: 'https://example.com/second'}
+      ]}
+    ]}));
+    // /save and /copy write the source row's labels, which shorten long titles.
+    const reply = `${answer}\n\nSources: [\\[1\\] A remarkably long source title that keeps going…](${LONG_URL}) · [\\[2\\] Second saved source](https://example.com/second)\n`;
+    await withDownGateway(async gateway => {
+      let clipboardWorks = true;
+      const copied = [];
+      const clipboard = {async copy(text) {
+        copied.push(text);
+        return clipboardWorks;
+      }};
+      // The real chat client, which reads the gateway's address from the environment.
+      const ui = await terminalApp({columns: 80, historyFile: file, saveDirectory, clipboard});
+      const viewport = () => ui.screen().split('\n').slice(2, 25).join('\n');
+      try {
+        // The restored conversation is shown at once, with nothing waiting on the wake-up check.
+        assert.match(ui.screen(), /Restored your last conversation/);
+        assert.match(ui.screen(), /Saved line 50 \[1\]\[2\]/);
+        assert.doesNotMatch(ui.screen(), /Waking|Thinking|Researching/);
+
+        await ui.type('\u001b[5~');
+        await ui.expectScreen(/↑ \d+ lines/);
+        assert.doesNotMatch(viewport(), /Saved line 50/);
+        await ui.type('\u001b[1;5H');
+        await ui.waitUntil(() => viewport().includes('First saved question'), 'Ctrl+Home did not reach the start');
+        assert.match(viewport(), /Short saved answer\./);
+        await ui.type('\u001b[1;5F');
+        await ui.waitUntil(() => viewport().includes('Saved line 50'), 'Ctrl+End did not return to the end');
+
+        await ui.type('/sources\r');
+        await waitFor(() => ui.screen().includes('Sources · reply 1 of 1'));
+        assert.match(ui.screen(), /Sources · reply 1 of 1 · saved-model · (\d+ \w{3}( \d{4})? )?\d{2}:\d{2}/);
+        assert(ui.screen().replace(/\s+/g, '').includes(`[1]${LONG_TITLE.replace(/\s+/g, '')}${LONG_URL}`), ui.screen());
+        assert.match(ui.screen(), / {2}\[2\] Second saved source\n\s*https:\/\/example\.com\/second/);
+        await ui.type('\u001b');
+        await ui.waitUntil(() => !ui.screen().includes('Sources · reply'), 'Esc did not close the sources');
+
+        await ui.type('/save\r');
+        await waitFor(() => fs.readdirSync(saveDirectory).some(name => name.startsWith('otekin-chat-')));
+        const [saved] = fs.readdirSync(saveDirectory).filter(name => name.startsWith('otekin-chat-'));
+        const markdown = fs.readFileSync(path.join(saveDirectory, saved), 'utf8');
+        assert.match(markdown, /^# otekin chat · [^\n]+\n\n## You\n\nFirst saved question\n\n## saved-model · 2026-10-30 \d{2}:\d{2}\n\nShort saved answer\.\n\n## You\n\nSecond saved question\n\n## saved-model · 2026-10-30 \d{2}:\d{2}\n\nSaved line 1\n/);
+        assert(markdown.endsWith(reply), markdown);
+
+        await ui.type('/copy\r');
+        await waitFor(() => shows(ui, 'Copied the latest reply (with 2 sources) to the clipboard'));
+        clipboardWorks = false;
+        await ui.type('/copy\r');
+        await waitFor(() => shows(ui, 'No clipboard available; saved the latest reply (with 2 sources) to'));
+        const [replyFile] = fs.readdirSync(saveDirectory).filter(name => name.startsWith('otekin-reply-'));
+        assert.strictEqual(fs.readFileSync(path.join(saveDirectory, replyFile), 'utf8'), reply);
+        assert.deepStrictEqual(copied, [reply, reply]);
+        assert.strictEqual(gateway.connections(), 0, 'nothing contacted the gateway');
+
+        // Asking proves the gateway is reachable from this test: the readiness check fails and sends nothing.
+        await ui.type('A new question\r');
+        await waitFor(() => shows(ui, 'Your question was not sent.'));
+        assert(gateway.connections() > 0);
+        assert(gateway.requests().every(request => request === 'GET /healthz'), gateway.requests().join(', '));
+      } finally {
+        await ui.close();
+      }
+    });
+  } finally {
+    fs.rmSync(directory, {recursive: true, force: true});
   }
 });

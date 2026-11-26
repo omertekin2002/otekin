@@ -12,8 +12,11 @@ const {
   commandName,
   modelLabel
 } = require('../lib/linear-chat');
-const { prepareRequestMessages, assistantMessageFromResponse, TRIMMED_CONTEXT_NOTICE, MAX_MESSAGES } = require('../lib/chat-client');
+const chatClient = require('../lib/chat-client');
+const { prepareRequestMessages, assistantMessageFromResponse, TRIMMED_CONTEXT_NOTICE, MAX_MESSAGES } = chatClient;
 const chatHistory = require('../lib/chat-history');
+const chatExport = require('../lib/chat-export');
+const { withDownGateway } = require('./down-gateway');
 
 // Cursor movement, erase and alternate-screen sequences, plus any carriage return.
 const REDRAW = /\u001b\[[0-9;?]*[A-HJK]|\u001b\[\?1049|\r/;
@@ -58,7 +61,8 @@ function session(requestChat, options = {}) {
   output.on('data', (chunk) => { out += chunk.toString(); });
   error.on('data', (chunk) => { err += chunk.toString(); });
   const requests = [];
-  const services = {
+  // `options.services` replaces the fakes, for tests that use the real chat client.
+  const services = options.services || {
     prepareRequestMessages,
     assistantMessageFromResponse,
     ensureChatServiceAwake: options.ensureChatServiceAwake || (async () => ({ ok: true })),
@@ -253,6 +257,35 @@ test('linear chat never claims a failed chat request was not sent, and /retry re
   } finally {
     fs.rmSync(directory, { recursive: true, force: true });
   }
+});
+
+test('linear chat says a chat request that never connected was not sent, and /retry sends it', async () => {
+  const s = session(async (_messages, _opts, number) => {
+    if (number === 2) throw new chatClient.ChatApiError('Unable to reach chat service.', { notSent: true });
+    return cited(number);
+  }, { start: { interactive: true } });
+  s.send('Q1\n');
+  await s.idle(2);
+  s.send('Q2\n');
+  await s.idle(3);
+  assert.strictEqual(s.err(), 'Chat error: Unable to reach chat service. Your question was not sent. Type /retry to send it again.\n');
+  s.send('/retry\n');
+  await s.idle(4);
+  s.input.end();
+  await s.chat.finished;
+  assert.strictEqual(s.requests.length, 3);
+  assert.deepStrictEqual(s.requests[2].messages, s.requests[1].messages);
+  assert.match(s.out(), /Answer 3 \[1\]\./);
+});
+
+test('linear chat piped input says a chat request that never connected was not sent, without a /retry hint', async () => {
+  const s = session(async () => {
+    throw new chatClient.ChatApiError('Chat service took too long.', { notSent: true });
+  });
+  s.send('Q1\n');
+  s.input.end();
+  await s.chat.finished;
+  assert.strictEqual(s.err(), 'Chat error: Chat service took too long. Your question was not sent.\n');
 });
 
 test('linear chat piped input reports a wake-up failure without a /retry hint', async () => {
@@ -520,6 +553,95 @@ test('linear chat /help lists /retry, /save, /copy and /clear', async () => {
   assert.match(s.out(), /\/save +Save the conversation as Markdown\n/);
   assert.match(s.out(), /\/copy +Copy the latest reply and its sources\n/);
   assert.match(s.out(), /\/clear +Forget the conversation and its saved history\n/);
+  assert.match(s.out(), /\/last +Show the latest reply and its sources\n/);
+  assert.strictEqual(s.requests.length, 0);
+});
+
+// The answer time /last shows for a reply answered at FIXED_NOW.
+const NOW_LABEL = chatExport.answerTimeLabel(new Date(FIXED_NOW).toISOString(), FIXED_NOW);
+
+test('linear chat /last prints the latest reply as it was printed live, with its answer time, and sends nothing', async () => {
+  const s = session(async (_messages, _opts, number) => cited(number), { start: { now: () => FIXED_NOW } });
+  s.send('/last\nQ1\nQ2\n/last\n');
+  s.input.end();
+  await s.chat.finished;
+  const out = s.out();
+  assert.match(out, /^You: \/last\nNo reply yet\. Ask a question first\.\nYou: Q1\n/m);
+  const live = 'fixture-model:\nAnswer 2 [1].\n\nSources:\n1. Example 2 https://example.com/2\n\n';
+  assert(out.includes(`You: Q2\nResearching…\n${live}`), out);
+  // The same lines, with the answer time after the model label.
+  assert(out.endsWith(`You: /last\n${live.replace('fixture-model:', `fixture-model · ${NOW_LABEL}:`)}You: \n`), out);
+  assert.strictEqual(s.requests.length, 2);
+  assert.doesNotMatch(out, REDRAW);
+  assert.doesNotMatch(out, SGR);
+  assert.strictEqual(s.err(), '');
+});
+
+test('linear chat /last colors only the model label, like a live reply', async () => {
+  const s = session(async () => cited(1), { start: { color: true, now: () => FIXED_NOW } });
+  s.send('Q1\n/last\n');
+  s.input.end();
+  await s.chat.finished;
+  const [, live, last] = s.out().split(/You: (?:Q1|\/last)\n/);
+  assert.match(last, new RegExp(`^\u001b\\[1mfixture-model\u001b\\[0m · ${NOW_LABEL}:\n`));
+  // Everything after the label line matches the live reply, colors included.
+  assert.strictEqual(last.split('\n').slice(1).join('\n').replace(/You: \n$/, ''),
+    live.replace(/^Researching…\n/, '').split('\n').slice(1).join('\n'));
+});
+
+test('linear chat /last during a reply shows the previous completed one, never the reply on its way', async () => {
+  const pending = deferred();
+  const s = session(async (_messages, _opts, number) => (number === 2 ? pending.promise : cited(number)), {
+    start: { interactive: true, now: () => FIXED_NOW }
+  });
+  s.send('/last\n');
+  await s.idle(2);
+  s.send('Q1\n');
+  await s.idle(3);
+  s.send('Q2\n');
+  await tick(5);
+  s.send('/last\n');
+  await tick(5);
+  assert(s.out().endsWith('You: /last\nThe reply being written is not finished yet. The previous reply:\n' +
+    `fixture-model · ${NOW_LABEL}:\nAnswer 1 [1].\n\nSources:\n1. Example 1 https://example.com/1\n\n`), s.out());
+  pending.resolve(cited(2));
+  await s.idle(4);
+  s.input.end();
+  await s.chat.finished;
+  assert.strictEqual(s.out().split('Answer 2 [1].').length - 1, 1);
+  assert.match(s.out(), /You: \/last\nNo reply yet\. Ask a question first\.\n/);
+  assert.strictEqual(s.requests.length, 2);
+});
+
+test('linear chat /last cleans a saved reply\'s answer, model, titles and links as it cleans a live one', async () => {
+  const historyStore = {
+    loadHistory: () => ({
+      history: [],
+      prompts: [],
+      messages: [
+        { role: 'user', content: 'Saved question' },
+        {
+          role: 'assistant',
+          model: 'bad model\u001b[31m',
+          answeredAt: 'not a time',
+          content: 'Ignored.',
+          answer: 'Saved \u202eanswer\u001b[31m red\u001b]8;;https://evil.example\u0007link\u001b]8;;\u0007 [1][2].',
+          sources: [
+            { number: 1, title: '\u202e*Spoofed*\u0007 title\u0085', url: 'https://example.com/one' },
+            { number: 2, title: '\u200b', url: 'javascript:alert(1)' }
+          ]
+        }
+      ]
+    }),
+    saveHistory: () => {},
+    clearHistory: () => {}
+  };
+  const s = session(async () => cited(1), { start: { interactive: true, historyFile: 'unused.json', historyStore } });
+  s.send('/last\n');
+  s.input.end();
+  await s.chat.finished;
+  const last = s.out().split('You: /last\n')[1];
+  assert.strictEqual(last, 'OTEKIN:\nSaved answer redlink [1][2].\n\nSources:\n1. Spoofed title https://example.com/one\n2. Source 2\n\nYou: \n');
   assert.strictEqual(s.requests.length, 0);
 });
 
@@ -969,7 +1091,7 @@ test('linear chat continues a saved conversation with one line and its context',
     await s.chat.finished;
     const out = s.out();
     assert.strictEqual(out.split('Continuing your saved conversation').length - 1, 1);
-    assert.match(out, /^otekin linear chat.*\n.*\nContinuing your saved conversation \(1 question\)\. \/clear forgets it; --no-history skips it\.\nYou: /);
+    assert.match(out, /^otekin linear chat.*\n.*\nContinuing your saved conversation \(1 question\)\. \/last shows the latest reply; \/clear forgets it; --no-history skips it\.\nYou: /);
     // The old reply is not printed again.
     assert.strictEqual(out.split('Answer 1 [1].').length - 1, 0);
     assert.deepStrictEqual(s.requests[0].messages, expected);
@@ -1078,6 +1200,102 @@ test('linear chat replaces a restored last turn with /retry', async () => {
     const saved = chatHistory.loadHistory(file);
     assert.deepStrictEqual(saved.messages.map((message) => [message.role, message.content.split('\n')[0]]),
       [['user', 'Saved question'], ['assistant', 'Answer 9 [1].']]);
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+// The questions a saved history file holds, in order.
+function savedQuestions(file) {
+  const saved = chatHistory.loadHistory(file);
+  return saved && saved.history.filter((message) => message.role === 'user').map((message) => message.content);
+}
+
+const CHANGED = chatHistory.HISTORY_CHANGED_NOTICE;
+const notices = (out) => out.split(CHANGED).length - 1;
+
+test('a second linear chat never overwrites the conversation another one saved', async () => {
+  const { directory, file } = historyFixture();
+  try {
+    const a = historySession(async () => ({ message: 'From A.' }), file);
+    const b = historySession(async () => ({ message: 'From B.' }), file);
+    await a.idle(1);
+    await b.idle(1);
+    a.send('Asked in A\n');
+    await a.idle(2);
+    assert.deepStrictEqual(savedQuestions(file), ['Asked in A']);
+    const saved = fs.readFileSync(file);
+
+    // B started with no file, and A has saved one since: B keeps its hands off it, and says so once.
+    b.send('Asked in B\n');
+    await b.idle(2);
+    assert.deepStrictEqual(fs.readFileSync(file), saved);
+    assert.strictEqual(notices(b.out()), 1);
+    assert.match(b.out(), new RegExp(`From B\\.\\n\\n${CHANGED.replace(/[.*+?^${}()|[\]\\/]/g, '\\$&')}\\nYou: $`));
+    b.send('Asked in B again\n');
+    await b.idle(3);
+    assert.deepStrictEqual(fs.readFileSync(file), saved);
+    assert.strictEqual(notices(b.out()), 1, 'the notice is shown once');
+    assert.doesNotMatch(b.out(), /Could not save/);
+
+    // A, whose save is the file, keeps saving.
+    a.send('Asked in A again\n');
+    await a.idle(3);
+    assert.deepStrictEqual(savedQuestions(file), ['Asked in A', 'Asked in A again']);
+    assert.strictEqual(notices(a.out()), 0);
+
+    // B's own /clear starts it over: it deletes the file and saves again.
+    b.send('/clear\n');
+    await b.idle(4);
+    assert.strictEqual(fs.existsSync(file), false);
+    b.send('Fresh in B\n');
+    await b.idle(5);
+    assert.deepStrictEqual(savedQuestions(file), ['Fresh in B']);
+    assert.strictEqual(notices(b.out()), 1);
+
+    // Now A is the one whose file changed under it.
+    a.send('Third in A\n');
+    await a.idle(4);
+    assert.deepStrictEqual(savedQuestions(file), ['Fresh in B']);
+    assert.strictEqual(notices(a.out()), 1);
+    a.input.end();
+    b.input.end();
+    await Promise.all([a.chat.finished, b.chat.finished]);
+    assert.strictEqual(a.err() + b.err(), '');
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('a /clear in one linear chat is not undone by another that loaded the same conversation', async () => {
+  const { directory, file } = historyFixture();
+  try {
+    saveFullScreenConversation(file);
+    const a = historySession(async () => ({ message: 'From A.' }), file);
+    const b = historySession(async () => ({ message: 'From B.' }), file);
+    await a.idle(1);
+    await b.idle(1);
+    assert.match(b.out(), /Continuing your saved conversation \(1 question\)/);
+    a.send('/clear\n');
+    await a.idle(2);
+    assert.strictEqual(fs.existsSync(file), false);
+
+    b.send('Follow up in B\n');
+    await b.idle(2);
+    assert.strictEqual(fs.existsSync(file), false, "the cleared conversation stays deleted");
+    assert.strictEqual(notices(b.out()), 1);
+    // B still has its conversation in memory: its request kept the saved turn.
+    assert.deepStrictEqual(b.requests[0].messages.map((message) => message.content.split('\n')[0]),
+      ['Saved question', 'Answer 1 [1].', 'Follow up in B']);
+
+    // A started over, so its next reply writes a fresh file.
+    a.send('New start in A\n');
+    await a.idle(3);
+    assert.deepStrictEqual(savedQuestions(file), ['New start in A']);
+    assert.strictEqual(notices(a.out()), 0);
+    a.input.end();
+    b.input.end();
+    await Promise.all([a.chat.finished, b.chat.finished]);
   } finally {
     fs.rmSync(directory, { recursive: true, force: true });
   }
@@ -1314,6 +1532,165 @@ test('linear chat says follow-ups leave out older turns on the first follow-up o
     next.input.end();
     await next.chat.finished;
     assert.strictEqual(trimNotices(next.out()), 1);
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+// A saved conversation of two turns, the latest with two sources and an answer time.
+function saveCitedConversation(file) {
+  const first = cited(1);
+  const second = {
+    message: 'Saved answer [1][2].\n\nSources:\n1. [First saved source](https://example.com/first)\n2. [Second](https://example.com/second)',
+    model: 'saved-model',
+    webSources: [
+      { title: 'First saved source', url: 'https://example.com/first' },
+      { title: 'Second', url: 'https://example.com/second' }
+    ]
+  };
+  const history = prepareRequestMessages(
+    prepareRequestMessages([], 'First question').concat(assistantMessageFromResponse(first)), 'Second question'
+  ).concat(assistantMessageFromResponse(second));
+  chatHistory.saveHistory(file, {
+    history,
+    messages: [
+      { role: 'user', content: 'First question' },
+      { role: 'assistant', model: 'fixture-model', answeredAt: '2026-11-15T09:00:00.000Z', content: 'Answer 1 [1].',
+        answer: 'Answer 1 [1].', sources: [{ number: 1, title: 'Example 1', url: 'https://example.com/1' }] },
+      { role: 'user', content: 'Second question' },
+      { role: 'assistant', model: 'saved-model', answeredAt: '2026-11-15T09:30:00.000Z', content: 'Saved answer [1][2].',
+        answer: 'Saved answer [1][2].', sources: [
+          { number: 1, title: 'First saved source', url: 'https://example.com/first' },
+          { number: 2, title: 'Second', url: 'https://example.com/second' }
+        ] }
+    ],
+    prompts: ['First question', 'Second question']
+  });
+}
+
+test('linear chat /last, /save and /copy keep the Markdown of a restored reply without sources', async () => {
+  const { formatResolvedResponse } = require('../lib/chat-format');
+  const markdown = '# Title\n\nSome **bold** and `code` here.\n\n- item';
+  const reply = { answer: markdown, sources: [] };
+  const answeredAt = '2026-11-15T09:30:00.000Z';
+  const answered = chatExport.answerTimeLabel(answeredAt, FIXED_NOW);
+  const run = async (saved) => {
+    const { directory, file } = historyFixture();
+    const saveDirectory = path.join(directory, 'saved');
+    fs.mkdirSync(saveDirectory);
+    /** @type {string[]} */
+    const copied = [];
+    try {
+      chatHistory.saveHistory(file, { history: [], messages: [{ role: 'user', content: 'Format it' }, saved], prompts: ['Format it'] });
+      const s = session(async () => assert.fail('nothing is sent'), {
+        start: { interactive: true, historyFile: file, saveDirectory, now: () => FIXED_NOW, copy: async (text) => { copied.push(text); return 'pbcopy'; } }
+      });
+      s.send('/last\n/save\n/copy\n');
+      await s.idle(4);
+      s.input.end();
+      await s.chat.finished;
+      const [name] = filesIn(saveDirectory);
+      return { out: s.out(), copied, saved: fs.readFileSync(path.join(saveDirectory, name), 'utf8') };
+    } finally {
+      fs.rmSync(directory, { recursive: true, force: true });
+    }
+  };
+
+  // Saved by the full-screen chat: its content is styled, so only the saved Markdown has the headings.
+  const fullScreen = await run({
+    role: 'assistant', model: 'screen-model', answeredAt,
+    content: formatResolvedResponse(reply, { hyperlinks: true, color: true }),
+    markdown: formatResolvedResponse(reply, { hyperlinks: true }),
+    answer: markdown
+  });
+  assert(fullScreen.out.includes(`You: /last\nscreen-model · ${answered}:\n${markdown}\n\nYou: `), fullScreen.out);
+  assert.deepStrictEqual(fullScreen.copied, [`${markdown}\n`]);
+  assert.match(fullScreen.saved, /\n## screen-model · 2026-11-15 \d{2}:\d{2}\n\n# Title\n/);
+  assert(fullScreen.saved.endsWith(`\n\n${markdown}\n`), fullScreen.saved);
+
+  // Saved before replies kept their Markdown: the plain content, as before.
+  const older = await run({ role: 'assistant', model: 'screen-model', answeredAt, content: 'Title\n\nSome bold and code here.' });
+  assert(older.out.includes(`You: /last\nscreen-model · ${answered}:\nTitle\n\nSome bold and code here.\n\nYou: `), older.out);
+  assert.deepStrictEqual(older.copied, ['Title\n\nSome bold and code here.\n']);
+});
+
+test('linear chat restores, shows /last, /save and /copy with the gateway down, and never contacts it until asked', async () => {
+  const { directory, file } = historyFixture();
+  const saveDirectory = path.join(directory, 'saved');
+  fs.mkdirSync(saveDirectory);
+  /** @type {string[]} */
+  const copied = [];
+  let clipboardWorks = true;
+  try {
+    saveCitedConversation(file);
+    const before = fs.readFileSync(file);
+    await withDownGateway(async (gateway) => {
+      // The real chat client, which reads the gateway's address from the environment.
+      const s = session(async () => assert.fail('the fake chat service is never used'), {
+        services: chatClient,
+        start: {
+          interactive: true,
+          historyFile: file,
+          saveDirectory,
+          now: () => FIXED_NOW,
+          copy: async (text) => {
+            copied.push(text);
+            return clipboardWorks ? 'pbcopy' : null;
+          }
+        }
+      });
+      // The restore line is printed before anything else happens.
+      assert.match(s.out(), /\nContinuing your saved conversation \(2 questions\)\. \/last shows the latest reply; \/clear forgets it; --no-history skips it\.\n$/);
+      const answered = chatExport.answerTimeLabel('2026-11-15T09:30:00.000Z', FIXED_NOW);
+      const last = `saved-model · ${answered}:\nSaved answer [1][2].\n\nSources:\n` +
+        '1. First saved source https://example.com/first\n2. Second https://example.com/second\n\n';
+      const reply = 'Saved answer [1][2].\n\nSources: [\\[1\\] First saved source](https://example.com/first) · ' +
+        '[\\[2\\] Second](https://example.com/second)\n';
+      const offlineCommands = async (prompts) => {
+        const count = s.out().split('You: ').length - 1;
+        s.send('/last\n');
+        await s.idle(count + 1);
+        assert(s.out().endsWith(`You: /last\n${last}You: `), s.out());
+        s.send('/save\n');
+        await s.idle(count + 2);
+        clipboardWorks = true;
+        s.send('/copy\n');
+        await s.idle(count + 3);
+        assert(s.out().endsWith('You: /copy\nCopied the latest reply (with 2 sources) to the clipboard\nYou: '), s.out());
+        clipboardWorks = false;
+        s.send('/copy\n');
+        await s.idle(count + 4);
+        assert.match(s.out(), /You: \/copy\nNo clipboard available; saved the latest reply \(with 2 sources\) to .*otekin-reply-[\d-]+\.md\nYou: $/);
+        const saved = [...s.out().matchAll(/^Saved the conversation to (.+)$/gm)].pop()[1];
+        const markdown = fs.readFileSync(saved, 'utf8');
+        assert.match(markdown, /## fixture-model · 2026-11-15 \d{2}:\d{2}\n\nAnswer 1 \[1\]\.\n\nSources: \[\\\[1\\\] Example 1\]\(https:\/\/example\.com\/1\)\n/);
+        assert.match(markdown, /## saved-model · 2026-11-15 \d{2}:\d{2}\n\nSaved answer/);
+        assert(markdown.includes(reply), markdown);
+        assert.deepStrictEqual(markdown.match(/^## You\n\n.*$/gm), prompts.map((prompt) => `## You\n\n${prompt}`));
+      };
+      await offlineCommands(['First question', 'Second question']);
+      assert.deepStrictEqual(copied, [reply, reply]);
+      assert.strictEqual(gateway.connections(), 0, 'nothing contacted the gateway');
+
+      // A question fails at the readiness check, sending nothing of the conversation.
+      s.send('Follow up\n');
+      await s.idle(s.out().split('You: ').length);
+      assert.strictEqual(s.err(), 'Chat error: Chat service health check failed (HTTP 500). ' +
+        'Your question was not sent. Type /retry to send it again.\n');
+      assert(gateway.connections() > 0);
+      assert(gateway.requests().every((request) => request === 'GET /healthz'), gateway.requests().join(', '));
+
+      // The saved conversation still reads, saves and copies as before.
+      const connections = gateway.connections();
+      await offlineCommands(['First question', 'Second question', 'Follow up']);
+      assert.strictEqual(gateway.connections(), connections);
+      s.input.end();
+      await s.chat.finished;
+    });
+    assert.strictEqual(copied.length, 4);
+    assert(copied.every((text) => text === copied[0]));
+    // A failed question is never saved.
+    assert.deepStrictEqual(fs.readFileSync(file), before);
   } finally {
     fs.rmSync(directory, { recursive: true, force: true });
   }

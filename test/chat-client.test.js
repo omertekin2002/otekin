@@ -1,7 +1,9 @@
 'use strict';
 
 const assert = require('assert');
+const dns = require('dns');
 const http = require('http');
+const net = require('net');
 const {
   MAX_MESSAGE_CHARACTERS,
   MAX_MESSAGES,
@@ -11,6 +13,7 @@ const {
   ensureChatServiceAwake,
   omittedTurns,
   prepareRequestMessages,
+  probeChatService,
   requestChat
 } = require('../lib/chat-client');
 
@@ -139,6 +142,177 @@ test('checkChatService bounds wake-up time and response size', async () => {
       checkChatService({ endpoint, maxResponseBytes: 32 }),
       /health response was too large/i
     );
+  });
+});
+
+// A health server that answers every request with `reply` and records each request as "METHOD /path".
+async function probeWith(reply, options) {
+  const requests = [];
+  let result;
+  await withServer((request, response) => {
+    requests.push(`${request.method} ${request.url}`);
+    request.resume();
+    reply(response);
+  }, async (endpoint) => {
+    result = await probeChatService(Object.assign({ endpoint }, options));
+  });
+  return { result, requests };
+}
+
+function jsonReply(statusCode, body, headers) {
+  return (response) => {
+    response.writeHead(statusCode, Object.assign({ 'Content-Type': 'application/json' }, headers));
+    response.end(typeof body === 'string' ? body : JSON.stringify(body));
+  };
+}
+
+test('probeChatService reports a reachable service from one GET of the health route', async () => {
+  const { result, requests } = await probeWith(jsonReply(200, { ok: true, service: 'fixture' }, {
+    'X-Request-ID': 'health-1'
+  }));
+  assert.deepStrictEqual(requests, ['GET /healthz']);
+  assert.strictEqual(result.status, 'reachable');
+  assert.match(result.endpoint, /^http:\/\/127\.0\.0\.1:\d+\/healthz$/);
+  assert.strictEqual(result.httpStatus, 200);
+  assert.strictEqual(result.requestId, 'health-1');
+  assert.strictEqual(result.message, 'Chat service is reachable.');
+  assert.strictEqual(typeof result.elapsedMs, 'number');
+  assert.ok(result.elapsedMs >= 0);
+  assert.deepStrictEqual(Object.keys(result).sort(),
+    ['elapsedMs', 'endpoint', 'httpStatus', 'message', 'requestId', 'status']);
+});
+
+test('probeChatService reports 502, 503 and 504 as waking without retrying or promising recovery', async () => {
+  for (const statusCode of [502, 503, 504]) {
+    const { result, requests } = await probeWith(jsonReply(statusCode, { error: 'starting' }));
+    assert.deepStrictEqual(requests, ['GET /healthz'], String(statusCode));
+    assert.strictEqual(result.status, 'waking');
+    assert.strictEqual(result.httpStatus, statusCode);
+    assert.strictEqual(result.requestId, null);
+    assert.strictEqual(result.message, `Chat service is not ready yet (HTTP ${statusCode}); it may be waking up.`);
+  }
+});
+
+test('probeChatService reports every other outcome as unavailable after one request', async () => {
+  /** @type {Array<[(response: http.ServerResponse) => void, number, RegExp]>} */
+  const cases = [
+    [jsonReply(500, { error: 'down' }), 500, /health check failed \(HTTP 500\)/],
+    [jsonReply(404, 'not found'), 404, /health check failed \(HTTP 404\)/],
+    [(response) => {
+      response.writeHead(302, { Location: 'http://127.0.0.1:1/healthz' });
+      response.end();
+    }, 302, /unexpected redirect/],
+    [jsonReply(200, '{not json'), 200, /invalid health response/],
+    [jsonReply(200, { ok: 'yes' }), 200, /invalid health response/],
+    [jsonReply(200, [true]), 200, /invalid health response/],
+    [jsonReply(200, { ok: true, padding: 'x'.repeat(17 * 1024) }), 200, /health response was too large/]
+  ];
+  for (const [reply, httpStatus, message] of cases) {
+    const { result, requests } = await probeWith(reply);
+    assert.deepStrictEqual(requests, ['GET /healthz'], String(message));
+    assert.strictEqual(result.status, 'unavailable', String(message));
+    assert.strictEqual(result.httpStatus, httpStatus, String(message));
+    assert.match(result.message, message);
+  }
+});
+
+test('probeChatService reports a refused connection as unavailable', async () => {
+  const result = await probeChatService({ healthEndpoint: 'http://user:secret@127.0.0.1:1/healthz?token=x#frag' });
+  assert.strictEqual(result.status, 'unavailable');
+  assert.strictEqual(result.endpoint, 'http://127.0.0.1:1/healthz');
+  assert.strictEqual(result.httpStatus, null);
+  assert.strictEqual(result.requestId, null);
+  assert.strictEqual(result.message, 'Unable to reach chat service.');
+});
+
+test('probeChatService finishes within its timeout against a server that never responds', async () => {
+  const requests = [];
+  await withServer((request) => {
+    requests.push(request.method);
+    request.resume();
+  }, async (endpoint) => {
+    const started = Date.now();
+    const result = await probeChatService({ endpoint, timeoutMs: 100 });
+    assert.ok(Date.now() - started < 2000);
+    assert.strictEqual(result.status, 'unavailable');
+    assert.strictEqual(result.httpStatus, null);
+    assert.strictEqual(result.message, 'Chat service did not respond within 0.1 s.');
+    assert.ok(result.elapsedMs >= 90);
+  });
+  assert.deepStrictEqual(requests, ['GET']);
+});
+
+test('probeChatService keeps the status and request ID when a response body stalls past the timeout', async () => {
+  for (const [statusCode, state] of [[503, 'waking'], [200, 'unavailable']]) {
+    await withServer((request, response) => {
+      request.resume();
+      response.writeHead(statusCode, { 'Content-Type': 'application/json', 'X-Request-ID': 'stalled-1' });
+      response.flushHeaders();
+    }, async (endpoint) => {
+      const result = await probeChatService({ endpoint, timeoutMs: 100 });
+      assert.strictEqual(result.status, state, String(statusCode));
+      assert.strictEqual(result.httpStatus, statusCode);
+      assert.strictEqual(result.requestId, 'stalled-1');
+      if (state === 'unavailable') assert.strictEqual(result.message, 'Chat service did not respond within 0.1 s.');
+    });
+  }
+});
+
+test('probeChatService reports invalid URL overrides as unavailable without a request', async () => {
+  const saved = { api: process.env.OTEKIN_CHAT_API_URL, health: process.env.OTEKIN_CHAT_HEALTH_URL };
+  try {
+    delete process.env.OTEKIN_CHAT_HEALTH_URL;
+    process.env.OTEKIN_CHAT_API_URL = 'not a url';
+    let result = await probeChatService();
+    assert.strictEqual(result.status, 'unavailable');
+    assert.strictEqual(result.endpoint, null);
+    assert.strictEqual(result.message, 'Chat service URL is invalid.');
+
+    process.env.OTEKIN_CHAT_HEALTH_URL = 'ftp://127.0.0.1/healthz';
+    result = await probeChatService();
+    assert.strictEqual(result.status, 'unavailable');
+    assert.strictEqual(result.message, 'Chat service health URL must use HTTP or HTTPS.');
+  } finally {
+    for (const [key, value] of [['OTEKIN_CHAT_API_URL', saved.api], ['OTEKIN_CHAT_HEALTH_URL', saved.health]]) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
+});
+
+test('probeChatService honours OTEKIN_CHAT_API_URL and OTEKIN_CHAT_HEALTH_URL', async () => {
+  const saved = { api: process.env.OTEKIN_CHAT_API_URL, health: process.env.OTEKIN_CHAT_HEALTH_URL };
+  const urls = [];
+  try {
+    await withServer((request, response) => {
+      urls.push(request.url);
+      jsonReply(200, { ok: true })(response);
+    }, async (endpoint) => {
+      delete process.env.OTEKIN_CHAT_HEALTH_URL;
+      process.env.OTEKIN_CHAT_API_URL = endpoint;
+      assert.strictEqual((await probeChatService()).status, 'reachable');
+      process.env.OTEKIN_CHAT_HEALTH_URL = endpoint.replace('/v1/chat', '/ready');
+      const result = await probeChatService();
+      assert.strictEqual(result.status, 'reachable');
+      assert.match(result.endpoint, /\/ready$/);
+    });
+  } finally {
+    for (const [key, value] of [['OTEKIN_CHAT_API_URL', saved.api], ['OTEKIN_CHAT_HEALTH_URL', saved.health]]) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
+  assert.deepStrictEqual(urls, ['/healthz', '/ready']);
+});
+
+test('probeChatService rejects only when cancelled', async () => {
+  await withServer((request) => {
+    request.resume();
+  }, async (endpoint) => {
+    const controller = new AbortController();
+    const probe = probeChatService({ endpoint, signal: controller.signal });
+    setTimeout(() => controller.abort(), 20);
+    await assert.rejects(probe, /cancelled/i);
   });
 });
 
@@ -301,6 +475,187 @@ test('requestChat enforces total request time and response size', async () => {
 
 test('requestChat rejects unsupported endpoint protocols', async () => {
   await assert.rejects(requestChat([], { endpoint: 'file:///tmp/chat' }), /HTTP or HTTPS/i);
+});
+
+// A raw TCP listener: `onConnection` decides what happens to each accepted socket.
+async function withTcpServer(onConnection, run) {
+  const server = net.createServer(onConnection);
+  await new Promise((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', () => resolve(undefined));
+  });
+  const { port } = /** @type {import('net').AddressInfo} */ (server.address());
+  try {
+    await run(port);
+  } finally {
+    await new Promise((resolve) => server.close(() => resolve(undefined)));
+  }
+}
+
+// A free local port that nothing listens on, so connecting to it is refused.
+async function closedPort() {
+  let port = 0;
+  await withTcpServer(() => {}, async (free) => { port = free; });
+  return port;
+}
+
+/** Resolves to the ChatApiError that `promise` rejects with. */
+async function rejection(promise) {
+  try {
+    await promise;
+  } catch (error) {
+    assert.ok(error instanceof ChatApiError, String(error));
+    return error;
+  }
+  throw new assert.AssertionError({ message: 'expected the request to fail' });
+}
+
+test('requestChat marks a request that never connected as not sent', async () => {
+  const refused = await rejection(requestChat([], { endpoint: `http://127.0.0.1:${await closedPort()}/v1/chat` }));
+  assert.strictEqual(refused.message, 'Unable to reach chat service.');
+  assert.strictEqual(refused.notSent, true);
+
+  // A name that does not resolve (RFC 6761 reserves .invalid). The lookup fails at once, as a
+  // resolver would, so the test doesn't wait on this machine's DNS.
+  const lookup = dns.lookup;
+  /** @type {any} */ (dns).lookup = (hostname, options, callback) => {
+    const done = typeof options === 'function' ? options : callback;
+    process.nextTick(done, Object.assign(new Error(`getaddrinfo ENOTFOUND ${hostname}`), { code: 'ENOTFOUND' }));
+  };
+  let unresolved;
+  try {
+    unresolved = await rejection(requestChat([], { endpoint: 'http://otekin-chat.invalid/v1/chat' }));
+  } finally {
+    dns.lookup = lookup;
+  }
+  assert.strictEqual(unresolved.message, 'Unable to reach chat service.');
+  assert.strictEqual(unresolved.notSent, true);
+
+  for (const [endpoint, message] of [
+    ['ftp://127.0.0.1/chat', 'Chat service URL must use HTTP or HTTPS.'],
+    ['file:///tmp/chat', 'Chat service URL must use HTTP or HTTPS.'],
+    ['not a url', 'Chat service URL is invalid.']
+  ]) {
+    const error = await rejection(requestChat([], { endpoint }));
+    assert.strictEqual(error.message, message);
+    assert.strictEqual(error.notSent, true, endpoint);
+  }
+});
+
+test('requestChat marks an HTTPS request whose TLS handshake failed or never finished as not sent', async () => {
+  // The listener accepts TCP but never speaks TLS: no request byte can be written before the handshake.
+  let accepted = 0;
+  await withTcpServer((socket) => {
+    accepted += 1;
+    socket.once('data', () => socket.destroy());
+  }, async (port) => {
+    const error = await rejection(requestChat([], { endpoint: `https://127.0.0.1:${port}/v1/chat` }));
+    assert.strictEqual(error.message, 'Unable to reach chat service.');
+    assert.strictEqual(error.notSent, true);
+  });
+  assert.strictEqual(accepted, 1);
+
+  const sockets = [];
+  await withTcpServer((socket) => {
+    sockets.push(socket);
+    socket.on('error', () => {});
+  }, async (port) => {
+    const error = await rejection(requestChat([], { endpoint: `https://127.0.0.1:${port}/v1/chat`, timeoutMs: 100 }));
+    assert.strictEqual(error.message, 'Chat service took too long.');
+    assert.strictEqual(error.notSent, true);
+    sockets.forEach((socket) => socket.destroy());
+  });
+});
+
+test('requestChat never marks a request that connected as not sent', async () => {
+  // The server reads the request, then drops the connection without a reply.
+  let received = '';
+  await withTcpServer((socket) => {
+    socket.on('error', () => {});
+    socket.once('data', (chunk) => {
+      received += chunk.toString('utf8');
+      socket.destroy();
+    });
+  }, async (port) => {
+    const error = await rejection(requestChat([], { endpoint: `http://127.0.0.1:${port}/v1/chat` }));
+    assert.strictEqual(error.message, 'Unable to reach chat service.');
+    assert.strictEqual(error.notSent, false);
+  });
+  assert.match(received, /^POST \/v1\/chat HTTP\/1\.1\r\n/);
+
+  // Connected, then the reply stalls past the deadline.
+  await withServer((request) => {
+    request.resume();
+  }, async (endpoint) => {
+    const error = await rejection(requestChat([], { endpoint, timeoutMs: 100 }));
+    assert.strictEqual(error.message, 'Chat service took too long.');
+    assert.strictEqual(error.notSent, false);
+  });
+
+  // A 5xx, invalid JSON and an error event in a stream all come after the request was sent.
+  const replies = [
+    { status: 503, type: 'application/json', body: '{"error":"down"}', message: /HTTP 503/ },
+    { status: 200, type: 'application/json', body: 'not json', message: /invalid JSON/ },
+    {
+      status: 200,
+      type: 'application/x-ndjson',
+      body: '{"type":"error","code":"generation_unavailable"}\n',
+      message: /temporarily unavailable/
+    }
+  ];
+  for (const { status, type, body, message } of replies) {
+    await withServer((request, response) => {
+      request.resume();
+      response.writeHead(status, { 'Content-Type': type });
+      response.end(body);
+    }, async (endpoint) => {
+      const error = await rejection(requestChat([], { endpoint, onDelta: () => {} }));
+      assert.match(error.message, message);
+      assert.strictEqual(error.notSent, false, String(message));
+    });
+  }
+});
+
+test('requestChat counts a reused keep-alive connection as connected', async () => {
+  const agent = new http.Agent({ keepAlive: true, maxSockets: 1 });
+  const original = http.globalAgent;
+  http.globalAgent = agent;
+  let requests = 0;
+  try {
+    await withServer((request, response) => {
+      requests += 1;
+      request.resume();
+      if (requests === 1) {
+        response.writeHead(200, { 'Content-Type': 'application/json' });
+        response.end(JSON.stringify({ message: 'First.' }));
+        return;
+      }
+      // The second request arrives on the same socket, which the server then drops.
+      request.socket.destroy();
+    }, async (endpoint) => {
+      await requestChat([], { endpoint });
+      const error = await rejection(requestChat([], { endpoint }));
+      assert.strictEqual(error.message, 'Unable to reach chat service.');
+      assert.strictEqual(error.notSent, false);
+    });
+  } finally {
+    http.globalAgent = original;
+    agent.destroy();
+  }
+  assert.strictEqual(requests, 2);
+});
+
+test('requestChat does not mark a cancelled request as not sent', async () => {
+  await withServer((request) => {
+    request.resume();
+  }, async (endpoint) => {
+    const controller = new AbortController();
+    const pending = requestChat([], { endpoint, signal: controller.signal });
+    controller.abort();
+    const error = await rejection(pending);
+    assert.strictEqual(error.message, 'Chat request was cancelled.');
+    assert.strictEqual(error.notSent, false);
+  });
 });
 
 test('requestChat reports redirects without following them', async () => {
@@ -706,4 +1061,174 @@ test('onDelta is not called after the request is aborted', async () => {
     await new Promise(resolve => setTimeout(resolve, 40));
     assert.deepStrictEqual(deltas, ['first']);
   });
+});
+
+// One stream that exercises every awkward place a TCP chunk can end: a CRLF line, a blank line, an
+// unknown event, multi-byte UTF-8 characters, and a final event without a trailing newline.
+const awkwardCanonical = { message: 'Son yanıt Ö界 [1]', webSources: [{ title: 'Kaynak', url: 'https://example.com' }] };
+const awkwardStream = Buffer.from([
+  JSON.stringify({ type: 'tool', activity: { id: 's', query: 'Ömer 界', status: 'running' } }) + '\r\n',
+  JSON.stringify({ type: 'delta', text: 'Merhaba Ö' }) + '\n',
+  '\n',
+  JSON.stringify({ type: 'future-event', value: 'ignore' }) + '\n',
+  JSON.stringify({ type: 'delta', text: 'İ界' }) + '\n' + JSON.stringify({ type: 'delta', text: 'x' }) + '\r\n',
+  JSON.stringify({ type: 'tool', activity: { id: 's', query: 'Ömer 界', status: 'complete' } }) + '\n',
+  JSON.stringify({ type: 'done', ...awkwardCanonical })
+].join(''));
+const awkwardEvents = [
+  ['tool', 's', 'Ömer 界', 'running'],
+  ['delta', 'Merhaba Ö'],
+  ['delta', 'İ界'],
+  ['delta', 'x'],
+  ['tool', 's', 'Ömer 界', 'complete']
+];
+
+// Byte offsets around every line ending and inside every multi-byte character, plus the edges.
+function awkwardOffsets(bytes) {
+  const offsets = new Set([1, bytes.length - 1]);
+  for (let index = 0; index < bytes.length; index += 1) {
+    const byte = bytes[index];
+    if (byte === 0x0a || byte === 0x0d) {
+      offsets.add(index);
+      offsets.add(index + 1);
+    } else if (byte >= 0x80) {
+      offsets.add(index);
+      offsets.add(index + 1);
+    }
+  }
+  return [...offsets].filter(offset => offset > 0 && offset < bytes.length).sort((a, b) => a - b);
+}
+
+// `pause` lets the client read each piece before the next arrives. A timer is coarse on Windows,
+// so many-piece streams pass a setImmediate pause instead.
+async function streamPieces(pieces, pause = () => new Promise(resolve => setTimeout(resolve, 2))) {
+  const events = [];
+  let result;
+  await withServer(async (request, response) => {
+    request.resume();
+    response.writeHead(200, { 'Content-Type': 'application/x-ndjson' });
+    for (const piece of pieces.slice(0, -1)) {
+      response.write(piece);
+      await pause();
+    }
+    response.end(pieces[pieces.length - 1]);
+  }, async (endpoint) => {
+    result = await requestChat([], {
+      endpoint,
+      timeoutMs: 5000,
+      onActivity: activity => events.push(['tool', activity.id, activity.query, activity.status]),
+      onDelta: text => events.push(['delta', text])
+    });
+  });
+  return { events, result };
+}
+
+test('streamed events parse identically however the stream is split into chunks', async () => {
+  const whole = await streamPieces([awkwardStream]);
+  assert.deepStrictEqual(whole.events, awkwardEvents);
+  assert.deepStrictEqual(whole.result, awkwardCanonical);
+
+  const offsets = awkwardOffsets(awkwardStream);
+  assert(offsets.length > 20, 'the stream has enough awkward split points to be a meaningful test');
+  for (const offset of offsets) {
+    const split = await streamPieces([awkwardStream.subarray(0, offset), awkwardStream.subarray(offset)]);
+    assert.deepStrictEqual(split.events, awkwardEvents, `split at byte ${offset}`);
+    assert.deepStrictEqual(split.result, awkwardCanonical, `split at byte ${offset}`);
+  }
+
+  // Several splits at once, including pieces that each hold several whole events.
+  const firstLine = awkwardStream.indexOf(0x0a) + 1;
+  const lastLine = awkwardStream.lastIndexOf(0x0a) + 1;
+  const several = await streamPieces([
+    awkwardStream.subarray(0, firstLine - 1),
+    awkwardStream.subarray(firstLine - 1, lastLine),
+    awkwardStream.subarray(lastLine, lastLine + 5),
+    awkwardStream.subarray(lastLine + 5)
+  ]);
+  assert.deepStrictEqual(several.events, awkwardEvents);
+  assert.deepStrictEqual(several.result, awkwardCanonical);
+
+  const bytes = [];
+  for (let index = 0; index < awkwardStream.length; index += 1) bytes.push(awkwardStream.subarray(index, index + 1));
+  const byByte = await streamPieces(bytes, () => new Promise(resolve => setImmediate(resolve)));
+  assert.deepStrictEqual(byByte.events, awkwardEvents);
+  assert.deepStrictEqual(byByte.result, awkwardCanonical);
+});
+
+test('an unfinished stream line that grows past the limit across chunks fails before the stream ends', async () => {
+  const deltas = [];
+  await withServer(async (request, response) => {
+    request.resume();
+    response.writeHead(200, { 'Content-Type': 'application/x-ndjson' });
+    response.write(JSON.stringify({ type: 'delta', text: 'first' }) + '\n' + 'x'.repeat(40));
+    for (let index = 0; index < 3; index += 1) {
+      await new Promise(resolve => setTimeout(resolve, 5));
+      if (response.destroyed) return;
+      response.write('x'.repeat(40));
+    }
+    // Never end the stream: only the unfinished-line limit can reject in time.
+  }, async (endpoint) => {
+    await assert.rejects(requestChat([], {
+      endpoint,
+      maxResponseBytes: 100,
+      timeoutMs: 2000,
+      onDelta: text => deltas.push(text)
+    }), error => {
+      assert(error instanceof ChatApiError);
+      assert.strictEqual(error.message, 'Chat service response was too large.');
+      return true;
+    });
+    assert.deepStrictEqual(deltas, ['first']);
+  });
+});
+
+test('the unfinished stream line limit counts decoded characters, not bytes', async () => {
+  // 60 two-byte characters are 120 bytes but only 60 characters: under a 100 limit while unfinished.
+  await withServer((request, response) => {
+    request.resume();
+    response.writeHead(200, { 'Content-Type': 'application/x-ndjson' });
+    response.write('"' + 'Ö'.repeat(60));
+  }, async (endpoint) => {
+    await assert.rejects(requestChat([], {
+      endpoint, maxResponseBytes: 100, timeoutMs: 150, onDelta() {}
+    }), /took too long/);
+  });
+});
+
+test('a multi-megabyte streamed event is buffered in linear time', async () => {
+  const chunk = 16 * 1024;
+  const timeEvent = async (megabytes) => {
+    const prefix = '{"type":"done","message":"';
+    const suffix = '"}\n';
+    const body = Buffer.from(prefix + 'a'.repeat(megabytes * 1024 * 1024 - prefix.length - suffix.length) + suffix);
+    let elapsed;
+    await withServer((request, response) => {
+      request.resume();
+      response.writeHead(200, { 'Content-Type': 'application/x-ndjson' });
+      let offset = 0;
+      const pump = () => {
+        while (offset < body.length) {
+          const piece = body.subarray(offset, offset + chunk);
+          offset += piece.length;
+          if (!response.write(piece)) {
+            response.once('drain', pump);
+            return;
+          }
+        }
+        response.end();
+      };
+      pump();
+    }, async (endpoint) => {
+      const started = process.hrtime.bigint();
+      const reply = await requestChat([], { endpoint, timeoutMs: 60000, onDelta() {} });
+      elapsed = Number(process.hrtime.bigint() - started) / 1e6;
+      assert.strictEqual(reply.message.length, body.length - prefix.length - suffix.length);
+    });
+    return elapsed;
+  };
+  // Best of two runs each, so one slow garbage collection doesn't decide the result.
+  const small = Math.min(await timeEvent(2), await timeEvent(2));
+  const large = Math.min(await timeEvent(8), await timeEvent(8));
+  // Four times the data: linear buffering takes about 4x as long, quadratic about 16x.
+  assert(large < Math.max(small, 20) * 9, `8 MB took ${large.toFixed(0)} ms, 2 MB took ${small.toFixed(0)} ms`);
 });

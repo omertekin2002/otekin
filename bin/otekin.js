@@ -7,6 +7,7 @@ const {
   requestChat,
   prepareRequestMessages,
   ensureChatServiceAwake,
+  probeChatService,
   assistantMessageFromResponse
 } = require('../lib/chat-client');
 const { formatChatResponse } = require('../lib/chat-format');
@@ -15,7 +16,8 @@ const { browserCommand } = require('../lib/browser');
 const chatHistory = require('../lib/chat-history');
 const { historyFileFor } = chatHistory;
 const {
-  cleanText, chatErrorMessage, createTheme, startProgress, createActivityDisplay, reducedMotionFor, stringifyJsonForOutput
+  cleanText, chatErrorMessage, chatFailureStage, safeRequestId, createTheme, startProgress, createActivityDisplay, reducedMotionFor,
+  stringifyJsonForOutput
 } = require('../lib/terminal');
 const { createStreamPreview } = require('../lib/stream-preview');
 const profile = require('../lib/profile');
@@ -40,6 +42,7 @@ Usage:
   npx otekin chat "What happened today?"
   npx otekin chat
   npx otekin chat --linear
+  npx otekin chat --status
   npx otekin chat -- "-5°C in °F?"
 
 Options:
@@ -50,6 +53,7 @@ Options:
   --no-open               Don't open links in a browser (print them instead)
   --no-history            Don't load or save chat history this run
   --linear                Chat line by line: no animation, each reply printed once
+  --status                With chat: check once whether the chat service is up
   --reduced-motion        Show a static status instead of spinners and timers
   --cv, --resume          Open the CV download link directly
   -s, --select <choice>   Select directly: website | linkedin | cv | chat | exit
@@ -102,16 +106,26 @@ and TERM=dumb output print only the final answer.
 
 Linear chat (otekin chat --linear) reads one question per line, from the keyboard
 or piped input, and prints each finished reply once, with numbered sources and
-their URLs. It never redraws or animates. /retry sends the last message again,
-/save writes the conversation to a Markdown file, and /copy copies the latest
-reply (or saves it to a file when no clipboard works). /clear forgets the
-conversation. Ctrl+C cancels a reply; Ctrl+C or Ctrl+D when idle, /exit or /quit
-ends it. A promptless "otekin chat" on a TERM=dumb terminal opens it automatically.
+their URLs. It never redraws or animates. /last prints the latest reply again,
+without the network. /retry sends the last message again, /save writes the
+conversation to a Markdown file, and /copy copies the latest reply (or saves it
+to a file when no clipboard works). /clear forgets the conversation. Ctrl+C
+cancels a reply; Ctrl+C or Ctrl+D when idle, /exit or /quit ends it. A
+promptless "otekin chat" on a TERM=dumb terminal opens it automatically.
 
 Reduced motion (--reduced-motion or OTEKIN_REDUCED_MOTION=1) keeps the full-screen
 workspace and one-shot chat still: the status shows "… <what is happening>" with
 no spinner or seconds counter and changes only when that text does, and streamed
 text is redrawn at most once a second. Linear chat never animates anyway.
+
+otekin chat --status asks the chat service's health route once whether it is up,
+without sending a question: no conversation content, and no research or model
+providers. It prints one line, such as "Chat service: reachable
+(signloop-chat-api.vercel.app, 0.4 s)", or with --json one object with status,
+endpoint, httpStatus, requestId, elapsedMs and message. The status is reachable,
+waking (HTTP 502, 503 or 504: it may be waking up, or failing) or unavailable
+(anything else, including no answer within 10 s). It never retries. Exit code 0
+means reachable, 1 anything else; Ctrl+C cancels it with exit code 130.
 
 The full-screen and linear chats save their conversation and recent prompts in
 one file, so either picks up where the other left off; /clear deletes it.
@@ -158,6 +172,7 @@ function parseArgs(argv) {
     noOpen: false,
     noHistory: false,
     linear: false,
+    status: false,
     reducedMotion: false,
     upgrade: false,
     select: null,
@@ -182,6 +197,7 @@ function parseArgs(argv) {
     else if (a === '--no-open') opts.noOpen = true;
     else if (a === '--no-history') opts.noHistory = true;
     else if (a === '--linear') opts.linear = true;
+    else if (a === '--status') opts.status = true;
     else if (a === '--reduced-motion') opts.reducedMotion = true;
     else if (a === '--upgrade' && opts.command === 'pilcrow') opts.upgrade = true;
     else if (a === '--cv' || a === '--resume') opts.select = 'cv';
@@ -363,11 +379,51 @@ async function runOneShotChat(prompt, opts) {
       process.exitCode = 130;
       return;
     }
-    process.stderr.write(`Chat error: ${chatErrorMessage(error, 'request')}\n`);
+    process.stderr.write(`Chat error: ${chatErrorMessage(error, chatFailureStage(error, 'request'))}\n`);
     process.exitCode = 1;
   } finally {
     if (preview) process.removeListener('SIGINT', onInterrupt);
   }
+}
+
+// One bounded readiness check: never sends conversation content, never touches saved history.
+async function runStatusCheck(opts) {
+  const controller = new AbortController();
+  const onInterrupt = () => controller.abort();
+  process.on('SIGINT', onInterrupt);
+  let result;
+  try {
+    result = await probeChatService({ signal: controller.signal });
+  } catch (error) {
+    if (controller.signal.aborted) {
+      process.exitCode = 130;
+      return;
+    }
+    throw error;
+  } finally {
+    process.removeListener('SIGINT', onInterrupt);
+  }
+
+  const report = {
+    status: result.status,
+    endpoint: result.endpoint,
+    httpStatus: result.httpStatus,
+    requestId: safeRequestId(result.requestId),
+    elapsedMs: result.elapsedMs,
+    message: cleanText(result.message)
+  };
+  process.exitCode = report.status === 'reachable' ? 0 : 1;
+  if (opts.json) {
+    process.stdout.write(stringifyJsonForOutput(report) + '\n');
+    return;
+  }
+
+  const details = [];
+  if (report.endpoint) details.push(cleanText(new URL(report.endpoint).host));
+  details.push(`${(report.elapsedMs / 1000).toFixed(1)} s`);
+  if (report.requestId) details.push(`Request ID: ${report.requestId}`);
+  const summary = `Chat service: ${report.status} (${details.join(', ')})`;
+  process.stdout.write(report.status === 'reachable' ? `${summary}\n` : `${summary}. ${report.message}\n`);
 }
 
 // Shares saved history with the full-screen chat when stdin is a terminal; piped sessions never
@@ -428,7 +484,7 @@ async function main() {
 
   if (opts.command === 'pilcrow') {
     if (opts.commandArgs.length || opts.select || opts.json || opts.noOpen || opts.noHistory || opts.linear ||
-        opts.reducedMotion) {
+        opts.status || opts.reducedMotion) {
       process.stderr.write('Pilcrow installation accepts only --upgrade, --help, --version, and --non-interactive. Run "otekin pilcrow --help".\n');
       process.exitCode = 1;
       return;
@@ -448,8 +504,23 @@ async function main() {
     return;
   }
 
+  if (opts.status && opts.command !== 'chat') {
+    process.stderr.write('--status works only with chat. Run "otekin chat --status".\n');
+    process.exitCode = 1;
+    return;
+  }
+
   if (opts.command === 'chat') {
     const prompt = opts.commandArgs.join(' ').trim();
+    if (opts.status) {
+      if (opts.linear || prompt) {
+        process.stderr.write(`--status does not take ${opts.linear ? '--linear' : 'a prompt'}. Run "otekin chat --status" on its own.\n`);
+        process.exitCode = 1;
+        return;
+      }
+      await runStatusCheck(opts);
+      return;
+    }
     if (opts.linear) {
       if (opts.json) {
         process.stderr.write('Linear chat does not support --json. Provide a prompt without --linear for one-shot JSON output.\n');

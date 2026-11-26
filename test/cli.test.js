@@ -4,11 +4,13 @@ const assert = require('assert');
 const { spawn } = require('child_process');
 const fs = require('fs');
 const http = require('http');
+const net = require('net');
 const os = require('os');
 const path = require('path');
 const { Terminal } = require('@xterm/headless');
 const pkg = require('../package.json');
 const chatHistory = require('../lib/chat-history');
+const { startDownGateway } = require('./down-gateway');
 
 const ROOT = path.resolve(__dirname, '..');
 const CLI = path.join(ROOT, 'bin', 'otekin.js');
@@ -892,6 +894,75 @@ test('CLI linear chat sends a prompt argument that looks like a command as a que
   });
 });
 
+// A raw TCP listener for the chat URL: `onConnection` decides what happens to each accepted socket.
+async function withTcpServer(onConnection, run) {
+  const server = net.createServer(onConnection);
+  await new Promise((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', () => resolve(undefined));
+  });
+  const { port } = /** @type {import('net').AddressInfo} */ (server.address());
+  try {
+    await run(port);
+  } finally {
+    await new Promise((resolve) => server.close(() => resolve(undefined)));
+  }
+}
+
+test('CLI chat says a chat request that never connected was not sent, in one-shot and linear chat', async () => {
+  let refused = 0;
+  await withTcpServer(() => {}, async (port) => { refused = port; });
+  // The readiness route answers, but the chat URL is refused or isn't HTTP, so the question never left.
+  await withServer(() => {
+    throw new Error('the chat route must not be reached');
+  }, async (endpoint, fixture) => {
+    const health = new URL('/healthz', endpoint).href;
+    for (const [chat, category] of [
+      [`http://127.0.0.1:${refused}/v1/chat`, 'Unable to reach chat service.'],
+      ['ftp://127.0.0.1/chat', 'Chat service URL must use HTTP or HTTPS.']
+    ]) {
+      const env = { OTEKIN_CHAT_HEALTH_URL: health, OTEKIN_CHAT_API_URL: chat };
+      const oneShot = await runCli(['chat', 'hello'], env);
+      assert.strictEqual(oneShot.code, 1);
+      assert.strictEqual(oneShot.stdout, '');
+      assert.strictEqual(oneShot.stderr, `Chat error: ${category} Your question was not sent.\n`);
+      const json = await runCli(['--json', 'chat', 'hello'], env);
+      assert.strictEqual(json.stderr, oneShot.stderr);
+      // The same retry hints as a failed readiness check: none for piped lines, /retry at a terminal.
+      const piped = await runCli(['chat', '--linear'], env, [], 'Q1\n');
+      assert.strictEqual(piped.stderr, `Chat error: ${category} Your question was not sent.\n`);
+      const typed = await runCli(['chat', '--linear'], env, TTY_STDIN, 'Q1\n');
+      assert.strictEqual(typed.stderr, `Chat error: ${category} Your question was not sent. Type /retry to send it again.\n`);
+    }
+    assert(fixture.getRequests().every((request) => request.method === 'GET' && request.url === '/healthz'));
+  });
+});
+
+test('CLI chat says a chat request that connected may have been received, even with no reply', async () => {
+  const received = [];
+  // The chat server reads the question, then drops the connection without answering.
+  await withTcpServer((socket) => {
+    socket.on('error', () => {});
+    socket.once('data', (chunk) => {
+      received.push(chunk.toString('utf8').split('\r\n')[0]);
+      socket.destroy();
+    });
+  }, async (port) => {
+    await withServer(() => {
+      throw new Error('the chat route must not be reached');
+    }, async (endpoint) => {
+      const env = { OTEKIN_CHAT_HEALTH_URL: new URL('/healthz', endpoint).href, OTEKIN_CHAT_API_URL: `http://127.0.0.1:${port}/v1/chat` };
+      const oneShot = await runCli(['chat', 'hello'], env);
+      assert.strictEqual(oneShot.code, 1);
+      assert.strictEqual(oneShot.stderr, 'Chat error: Unable to reach chat service. The chat service may have received your question.\n');
+      const typed = await runCli(['chat', '--linear'], env, TTY_STDIN, 'Q1\n');
+      assert.strictEqual(typed.stderr, 'Chat error: Unable to reach chat service. ' +
+        'The chat service may have received your question. Type /retry to send it again.\n');
+    });
+  });
+  assert.deepStrictEqual(received, ['POST /v1/chat HTTP/1.1', 'POST /v1/chat HTTP/1.1']);
+});
+
 test('CLI linear chat says a question was not sent when the health check fails, and sends nothing', async () => {
   const bodies = [];
   await withServer(linearGateway(bodies, (_body, number) => sourcedReply(number)), async (endpoint, fixture) => {
@@ -999,6 +1070,245 @@ test('CLI rejects --linear with --json or without chat, sending nothing', async 
   });
 });
 
+function healthReply(statusCode, body, headers) {
+  return (request, response) => {
+    request.resume();
+    response.writeHead(statusCode, Object.assign({ 'Content-Type': 'application/json' }, headers));
+    response.end(JSON.stringify(body));
+  };
+}
+
+function noChat() {
+  throw new Error('chat --status must not send a chat request');
+}
+
+function hostOf(endpoint) {
+  return new URL(endpoint).host;
+}
+
+test('CLI chat --status reports a reachable service with one GET and no chat request', async () => {
+  await withServer(noChat, async (endpoint, fixture) => {
+    const human = await runCli(['chat', '--status'], { OTEKIN_CHAT_API_URL: endpoint });
+    assert.strictEqual(human.code, 0);
+    assert.strictEqual(human.stderr, '');
+    assert.match(human.stdout,
+      new RegExp(`^Chat service: reachable \\(${hostOf(endpoint).replace(/\./g, '\\.')}, \\d+\\.\\d s, Request ID: health-ok\\)\\n$`));
+    assert.deepStrictEqual(fixture.getRequests().map((item) => `${item.method} ${item.url}`), ['GET /healthz']);
+
+    const json = await runCli(['--json', 'chat', '--status'], { OTEKIN_CHAT_API_URL: endpoint });
+    assert.strictEqual(json.code, 0);
+    assert.strictEqual(json.stderr, '');
+    const report = JSON.parse(json.stdout);
+    assert.deepStrictEqual(Object.keys(report),
+      ['status', 'endpoint', 'httpStatus', 'requestId', 'elapsedMs', 'message']);
+    assert.strictEqual(report.status, 'reachable');
+    assert.strictEqual(report.endpoint, endpoint.replace('/v1/chat', '/healthz'));
+    assert.strictEqual(report.httpStatus, 200);
+    assert.strictEqual(report.requestId, 'health-ok');
+    assert.strictEqual(typeof report.elapsedMs, 'number');
+    assert.strictEqual(report.message, 'Chat service is reachable.');
+    assert.deepStrictEqual(fixture.getRequests().map((item) => `${item.method} ${item.url}`),
+      ['GET /healthz', 'GET /healthz']);
+  }, healthReply(200, { ok: true }, { 'X-Request-ID': 'health-ok' }));
+});
+
+test('CLI chat --status reports waking and unavailable services with exit code 1 and no retries', async () => {
+  for (const [statusCode, state, message] of [
+    [502, 'waking', 'Chat service is not ready yet (HTTP 502); it may be waking up.'],
+    [503, 'waking', 'Chat service is not ready yet (HTTP 503); it may be waking up.'],
+    [504, 'waking', 'Chat service is not ready yet (HTTP 504); it may be waking up.'],
+    [500, 'unavailable', 'Chat service health check failed (HTTP 500).'],
+    [404, 'unavailable', 'Chat service health check failed (HTTP 404).']
+  ]) {
+    await withServer(noChat, async (endpoint, fixture) => {
+      const human = await runCli(['chat', '--status'], { OTEKIN_CHAT_API_URL: endpoint });
+      assert.strictEqual(human.code, 1, String(statusCode));
+      assert.strictEqual(human.stderr, '');
+      assert.match(human.stdout, new RegExp(`^Chat service: ${state} \\(${hostOf(endpoint).replace(/\./g, '\\.')}, \\d+\\.\\d s\\)\\. `));
+      assert.ok(human.stdout.endsWith(` ${message}\n`), human.stdout);
+
+      const json = await runCli(['chat', '--status', '--json'], { OTEKIN_CHAT_API_URL: endpoint });
+      assert.strictEqual(json.code, 1, String(statusCode));
+      const report = JSON.parse(json.stdout);
+      assert.strictEqual(report.status, state);
+      assert.strictEqual(report.httpStatus, statusCode);
+      assert.strictEqual(report.requestId, null);
+      assert.strictEqual(report.message, message);
+      assert.deepStrictEqual(fixture.getRequests().map((item) => `${item.method} ${item.url}`),
+        ['GET /healthz', 'GET /healthz'], String(statusCode));
+    }, healthReply(statusCode, { error: 'down' }));
+  }
+
+  const refused = await runCli(['chat', '--status', '--json']);
+  assert.strictEqual(refused.code, 1);
+  assert.deepStrictEqual(Object.assign(JSON.parse(refused.stdout), { elapsedMs: 0 }), {
+    status: 'unavailable',
+    endpoint: 'http://127.0.0.1:1/healthz',
+    httpStatus: null,
+    requestId: null,
+    elapsedMs: 0,
+    message: 'Unable to reach chat service.'
+  });
+});
+
+// A gateway written byte by byte, so a header can carry characters Node's server refuses to send.
+async function withRawHealth(head, run) {
+  const server = net.createServer((socket) => {
+    socket.once('data', () => socket.end(Buffer.from(`${head}\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}`, 'latin1')));
+  });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', () => resolve(undefined)));
+  try {
+    const { port } = /** @type {import('net').AddressInfo} */ (server.address());
+    await run(`http://127.0.0.1:${port}/v1/chat`);
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+  }
+}
+
+test('CLI chat --status never prints control characters from a hostile request ID', async () => {
+  // Node's client accepts C1 bytes in a header value and refuses ESC and BEL outright.
+  for (const head of [
+    'HTTP/1.1 503 Service Unavailable\r\nX-Request-ID: evil\u009b31mred­',
+    'HTTP/1.1 503 Service Unavailable\r\nX-Request-ID: evil\u001b]52;c;ZXZpbA==\u0007'
+  ]) {
+    await withRawHealth(head, async (endpoint) => {
+      for (const args of [['chat', '--status'], ['chat', '--status', '--json']]) {
+        const result = await runCli(args, { OTEKIN_CHAT_API_URL: endpoint });
+        assert.strictEqual(result.code, 1);
+        assert.doesNotMatch(result.stdout, /[\u0000-\u0009\u000B-\u001F\u007F-\u009F]|evil/);
+        assert.doesNotMatch(result.stdout, /Request ID/);
+        if (args.includes('--json')) assert.strictEqual(JSON.parse(result.stdout).requestId, null);
+      }
+    });
+  }
+});
+
+test('CLI chat --status reports an invalid URL override as unavailable', async () => {
+  const human = await runCli(['chat', '--status'], { OTEKIN_CHAT_API_URL: 'not a url' });
+  assert.strictEqual(human.code, 1);
+  assert.match(human.stdout, /^Chat service: unavailable \(\d+\.\d s\)\. Chat service URL is invalid\.\n$/);
+
+  const json = await runCli(['chat', '--status', '--json'], {
+    OTEKIN_CHAT_HEALTH_URL: 'file:///tmp/healthz'
+  });
+  assert.strictEqual(json.code, 1);
+  const report = JSON.parse(json.stdout);
+  assert.strictEqual(report.status, 'unavailable');
+  assert.strictEqual(report.endpoint, null);
+  assert.strictEqual(report.message, 'Chat service health URL must use HTTP or HTTPS.');
+});
+
+test('CLI chat --status honours OTEKIN_CHAT_HEALTH_URL and never shows its credentials or query', async () => {
+  await withServer((request, response) => {
+    if (request.method !== 'GET' || !request.url.startsWith('/ready')) noChat();
+    healthReply(200, { ok: true })(request, response);
+  }, async (endpoint, fixture) => {
+    const url = new URL(endpoint.replace('/v1/chat', '/ready?token=secret#frag'));
+    url.username = 'user';
+    url.password = 'hunter2';
+    for (const args of [['chat', '--status'], ['chat', '--status', '--json']]) {
+      const result = await runCli(args, { OTEKIN_CHAT_HEALTH_URL: url.href });
+      assert.strictEqual(result.code, 0);
+      assert.doesNotMatch(result.stdout, /user|hunter2|secret|frag/);
+    }
+    const report = JSON.parse((await runCli(['chat', '--status', '--json'], { OTEKIN_CHAT_HEALTH_URL: url.href })).stdout);
+    assert.strictEqual(report.endpoint, endpoint.replace('/v1/chat', '/ready'));
+    assert.deepStrictEqual(fixture.getRequests().map((item) => `${item.method} ${item.url}`),
+      ['GET /ready?token=secret', 'GET /ready?token=secret', 'GET /ready?token=secret']);
+  });
+});
+
+test('CLI chat --status rejects a prompt, --linear or a missing chat command, sending nothing', async () => {
+  await withServer(noChat, async (endpoint, fixture) => {
+    /** @type {Array<[string[], RegExp]>} */
+    const cases = [
+      [['--status'], /^--status works only with chat\. Run "otekin chat --status"\.\n$/],
+      [['cv', '--status', '--no-open'], /^--status works only with chat/],
+      [['--json', '--status'], /^--status works only with chat/],
+      [['chat', '--status', 'Is it up?'], /^--status does not take a prompt\. Run "otekin chat --status" on its own\.\n$/],
+      [['chat', '--status', '--', '--help'], /^--status does not take a prompt/],
+      [['chat', '--status', '--linear'], /^--status does not take --linear\. Run "otekin chat --status" on its own\.\n$/],
+      [['pilcrow', '--status'], /^Pilcrow installation accepts only/],
+      [['chat', '--statuses'], /^Unknown option: --statuses\n/]
+    ];
+    for (const [args, message] of cases) {
+      const result = await runCli(args, { OTEKIN_CHAT_API_URL: endpoint }, [], 'Q\n');
+      assert.strictEqual(result.code, 1, args.join(' '));
+      assert.strictEqual(result.stdout, '', args.join(' '));
+      assert.match(result.stderr, message, args.join(' '));
+    }
+    assert.deepStrictEqual(fixture.getRequests(), []);
+  });
+});
+
+test('CLI chat --status on a terminal never opens a chat or touches the history file', async () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'otekin-cli-status-'));
+  const missing = path.join(directory, 'state', 'history.json');
+  const existing = path.join(directory, 'history.json');
+  fs.writeFileSync(existing, '{"not":"a history"}');
+  const before = fs.statSync(existing).mtimeMs;
+  try {
+    await withServer(noChat, async (endpoint, fixture) => {
+      for (const file of [missing, existing]) {
+        for (const extra of [[], ['--json'], ['--reduced-motion']]) {
+          const result = await runCli(['chat', '--status'].concat(extra), {
+            OTEKIN_CHAT_API_URL: endpoint,
+            OTEKIN_HISTORY_FILE: file,
+            TERM: 'xterm-256color'
+          }, TTY_STDIN.concat(TTY_STDOUT));
+          assert.strictEqual(result.code, 0, extra.join(' '));
+          assert.doesNotMatch(result.stdout, REDRAW);
+          assert.doesNotMatch(result.stdout, /You:|Continuing/);
+        }
+      }
+      assert.strictEqual(fs.existsSync(path.dirname(missing)), false);
+      assert.strictEqual(fs.readFileSync(existing, 'utf8'), '{"not":"a history"}');
+      assert.strictEqual(fs.statSync(existing).mtimeMs, before);
+      assert.ok(fixture.getRequests().every((item) => item.method === 'GET' && item.url === '/healthz'));
+    }, healthReply(200, { ok: true }));
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+if (process.platform !== 'win32') {
+  test('CLI chat --status exits 130 without an error line when Ctrl+C cancels it', async () => {
+    let arrived;
+    const requested = new Promise((resolve) => {
+      arrived = resolve;
+    });
+    await withServer(noChat, async (endpoint) => {
+      const child = spawn(process.execPath, [CLI, 'chat', '--status'], {
+        cwd: ROOT,
+        env: Object.assign({}, process.env, { OTEKIN_CHAT_API_URL: endpoint, OTEKIN_CHAT_HEALTH_URL: '' }),
+        stdio: ['ignore', 'pipe', 'pipe']
+      });
+      const output = [];
+      child.stdout.on('data', (chunk) => output.push(chunk));
+      child.stderr.on('data', (chunk) => output.push(chunk));
+      const closed = new Promise((resolve) => child.once('close', (code) => resolve(code)));
+      await requested;
+      child.kill('SIGINT');
+      assert.strictEqual(await closed, 130);
+      assert.strictEqual(Buffer.concat(output).toString('utf8'), '');
+    }, (request) => {
+      request.resume();
+      arrived();
+    });
+  });
+}
+
+test('CLI help documents chat --status, its states, JSON fields and exit codes', async () => {
+  const help = await runCli(['--help']);
+  assert.strictEqual(help.code, 0);
+  assert.match(help.stdout, /npx otekin chat --status/);
+  assert.match(help.stdout, /--status\s+With chat: check once whether the chat service is up/);
+  for (const word of ['reachable', 'waking', 'unavailable', 'httpStatus', 'requestId', 'elapsedMs', 'Exit code 0', '130']) {
+    assert.ok(help.stdout.includes(word), word);
+  }
+  assert.match(help.stdout, /no conversation content, and no research or model\s+providers/);
+});
+
 test('CLI piped linear chat never creates or changes the history file', async () => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'otekin-linear-history-'));
   const file = path.join(directory, 'history.json');
@@ -1037,7 +1347,7 @@ test('CLI linear chat at a terminal saves history and continues it in the next r
 
       const second = await runCli(['chat', '--linear'], env, TTY_STDIN, 'Q2\n');
       assert.strictEqual(second.code, 0);
-      assert.strictEqual(second.stdout.split('Continuing your saved conversation (1 question). /clear forgets it; --no-history skips it.\n').length - 1, 1);
+      assert.strictEqual(second.stdout.split('Continuing your saved conversation (1 question). /last shows the latest reply; /clear forgets it; --no-history skips it.\n').length - 1, 1);
       assert.strictEqual(second.stdout.split('Answer 1 [1].').length - 1, 0);
       assert.deepStrictEqual(bodies[1].messages.map((message) => message.content.split('\n')[0]), ['Q1', 'Answer 1 [1].', 'Q2']);
       assert.deepStrictEqual(chatHistory.loadHistory(file).prompts, ['Q1', 'Q2']);
@@ -1063,6 +1373,56 @@ test('CLI linear chat at a terminal saves history and continues it in the next r
   }
 });
 
+test('CLI linear chat reads and saves a saved conversation with the gateway down', async () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'otekin-linear-offline-'));
+  const file = path.join(directory, 'state', 'history.json');
+  const gateway = await startDownGateway();
+  try {
+    chatHistory.saveHistory(file, {
+      history: [],
+      messages: [
+        { role: 'user', content: 'Saved question' },
+        { role: 'assistant', model: 'saved-model', answeredAt: '2026-11-15T09:30:00.000Z', content: 'Saved answer [1].',
+          answer: 'Saved answer [1].', sources: [{ number: 1, title: 'Saved source', url: 'https://example.com/saved' }] }
+      ],
+      prompts: ['Saved question']
+    });
+    const before = fs.readFileSync(file);
+    // Offline /copy is covered in-process with an injected clipboard so tests never touch the OS clipboard.
+    const env = { ...gateway.env, OTEKIN_HISTORY_FILE: file };
+    const offline = async () => {
+      const result = await runCli(['chat', '--linear'], env, TTY_STDIN, '/last\n/save\n', directory);
+      assert.strictEqual(result.code, 0);
+      assert.strictEqual(result.stderr, '');
+      assert.match(result.stdout, /\nContinuing your saved conversation \(1 question\)\. \/last shows the latest reply; \/clear forgets it; --no-history skips it\.\n/);
+      // A terminal echoes typed lines itself, so the CLI repeats a line only when it arrived before its prompt.
+      assert.match(result.stdout, /You: (?:\/last\n)?saved-model · [^\n]*\d{2}:\d{2}:\nSaved answer \[1\]\.\n\nSources:\n1\. Saved source https:\/\/example\.com\/saved\n\n/);
+      const saved = result.stdout.match(/^Saved the conversation to (.+)$/m);
+      assert(saved, result.stdout);
+      assert.match(fs.readFileSync(saved[1], 'utf8'), /## You\n\nSaved question\n\n## saved-model · 2026-11-15 \d{2}:\d{2}\n\nSaved answer \[1\]\.\n\nSources: \[\\\[1\\\] Saved source\]\(https:\/\/example\.com\/saved\)\n$/);
+      assert.doesNotMatch(result.stdout, SGR);
+      assert.doesNotMatch(result.stdout, REDRAW);
+    };
+    await offline();
+    assert.strictEqual(gateway.connections(), 0, 'nothing contacted the gateway');
+
+    const asked = await runCli(['chat', '--linear'], env, TTY_STDIN, 'A new question\n', directory);
+    assert.strictEqual(asked.code, 0);
+    assert.strictEqual(asked.stderr, 'Chat error: Chat service health check failed (HTTP 500). ' +
+      'Your question was not sent. Type /retry to send it again.\n');
+    assert(gateway.connections() > 0);
+    assert(gateway.requests().every((request) => request === 'GET /healthz'), gateway.requests().join(', '));
+    assert.deepStrictEqual(fs.readFileSync(file), before, 'a failed question is never saved');
+
+    const connections = gateway.connections();
+    await offline();
+    assert.strictEqual(gateway.connections(), connections);
+  } finally {
+    await gateway.close();
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
 test('CLI help documents linear chat and its TERM=dumb behavior', async () => {
   const help = await runCli(['--help']);
   assert.match(help.stdout, /npx otekin chat --linear/);
@@ -1072,6 +1432,7 @@ test('CLI help documents linear chat and its TERM=dumb behavior', async () => {
   assert.match(help.stdout, /full-screen and linear chats save their conversation/);
   assert.match(help.stdout, /piped linear chat\) never read or\s+write it/);
   assert.match(help.stdout, /\/clear forgets the\s+conversation/);
+  assert.match(help.stdout, /\/last prints the latest reply again,\s+without the network/);
   assert.doesNotMatch(help.stdout, /does not use saved history yet/);
 });
 
