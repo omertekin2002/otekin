@@ -420,6 +420,172 @@ test('chat history stays under its size cap with many large source lists', () =>
   }
 });
 
+// serializeHistory as it was before it measured each entry once: it re-stringified the whole
+// conversation after dropping each oldest entry. Each message is mapped by the real function on
+// its own (the mapping doesn't depend on the other messages), so only the dropping is copied.
+function quadraticSerialize(state, now) {
+  const data = {
+    version: 1,
+    history: state.history,
+    messages: state.messages.slice(-store.MAX_MESSAGES).map((message) =>
+      JSON.parse(store.serializeHistory({ history: [], messages: [message], prompts: [] }, now)).messages[0]),
+    prompts: state.prompts.slice(-store.MAX_PROMPTS)
+  };
+  let text = JSON.stringify(data);
+  while (Buffer.byteLength(text) > store.MAX_FILE_BYTES && (data.messages.length || data.prompts.length)) {
+    if (data.messages.length) data.messages.shift();
+    else data.prompts.shift();
+    text = JSON.stringify(data);
+  }
+  if (Buffer.byteLength(text) > store.MAX_FILE_BYTES) throw new Error('Chat history is too large to save.');
+  return text;
+}
+
+// The same result or the same error from both versions.
+function assertSameSerialization(state, now, label) {
+  const outcome = (run) => {
+    try {
+      return { text: run() };
+    } catch (error) {
+      return { error: error.message };
+    }
+  };
+  const expected = outcome(() => quadraticSerialize(state, now));
+  const actual = outcome(() => store.serializeHistory(state, now));
+  assert.deepStrictEqual(actual, expected, label);
+  if (actual.text !== undefined) assert(Buffer.byteLength(actual.text) <= store.MAX_FILE_BYTES, label);
+  return actual;
+}
+
+// A small seeded generator (mulberry32), so a failure can be replayed from its seed.
+function seededRandom(seed) {
+  let value = seed >>> 0;
+  return () => {
+    value = (value + 0x6D2B79F5) >>> 0;
+    let t = value;
+    t = Math.imul(t ^ (t >>> 15), t | 1);
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+test('chat history saves exactly what re-stringifying after each dropped entry saved', () => {
+  const now = Date.UTC(2026, 10, 27, 12);
+  // ASCII, two-, three- and four-byte UTF-8 (an emoji is a surrogate pair), and JSON escapes.
+  const pieces = ['plain words ', 'çğıöşü ', '中文字 ', '😀🚀 ', 'quote " backslash \\ ', 'line\nbreak\t', '**bold** `code` '];
+  let trimmed = 0;
+  let promptsTrimmed = 0;
+  for (let seed = 1; seed <= 24; seed++) {
+    const random = seededRandom(seed);
+    const pick = (list) => list[Math.floor(random() * list.length)];
+    const text = (characters) => {
+      let result = '';
+      while (result.length < characters) result += pick(pieces);
+      return result;
+    };
+    // A third of the seeds fit, a third go over the cap by messages, and a third have so many
+    // prompts that every message and then some prompts are dropped.
+    const scenario = ['under', 'messages', 'prompts'][seed % 3];
+    // The longest entry, in characters; most pieces take one to two bytes per character, and
+    // the sizes are picked so the whole conversation is around the cap, not far over it.
+    const messageCount = scenario === 'prompts' ? Math.floor(random() * 4) : 5 + Math.floor(random() * 25);
+    const scale = { under: 2000, messages: Math.floor(4e6 / messageCount), prompts: 400 }[scenario];
+    const messages = Array.from({ length: messageCount }, () => {
+      const role = pick(['user', 'assistant', 'assistant', 'tools', 'notice', 'error']);
+      const message = { role, content: text(Math.floor(random() * scale)) };
+      if (role !== 'assistant') return message;
+      if (random() < 0.8) message.model = pick(['fixture-model', 'other-model']);
+      const kind = random();
+      if (kind < 0.3) {
+        message.answer = text(Math.floor(random() * scale));
+        message.sources = [
+          { number: 1, title: 'First çğ 😀', url: 'https://example.com/first' },
+          { number: 2, title: 'Second', url: null }
+        ];
+      } else if (kind < 0.6) {
+        message.markdown = text(Math.floor(random() * scale));
+      } else if (kind < 0.7) {
+        message.answer = text(Math.floor(random() * scale));
+      }
+      if (random() < 0.5) message.answeredAt = new Date(now - Math.floor(random() * 1e9)).toISOString();
+      return message;
+    });
+    const promptCount = 30 + Math.floor(random() * 30);
+    const promptScale = scenario === 'prompts' ? Math.floor(3.6e6 / promptCount) : 200;
+    const prompts = Array.from({ length: promptCount }, () => text(Math.floor(random() * promptScale)));
+    const state = { history: [], messages, prompts };
+    const result = assertSameSerialization(state, now, `seed ${seed}`);
+    assert(result.text !== undefined, `seed ${seed} saves`);
+    const saved = JSON.parse(result.text);
+    if (saved.messages.length < Math.min(messages.length, store.MAX_MESSAGES)) trimmed++;
+    if (saved.prompts.length < Math.min(prompts.length, store.MAX_PROMPTS)) promptsTrimmed++;
+  }
+  assert(trimmed > 0, 'some seeds drop messages');
+  assert(promptsTrimmed > 0, 'some seeds drop prompts');
+
+  // Only prompts left to drop: no messages, or every message dropped first.
+  const prompts = Array.from({ length: 50 }, (_, index) => `${index} ${'é😀'.repeat(7500)}`);
+  for (const messages of [[], [{ role: 'user', content: 'x'.repeat(300000) }]]) {
+    const saved = JSON.parse(assertSameSerialization({ history: [], messages, prompts }, now, 'prompts only').text);
+    assert.strictEqual(saved.messages.length, 0);
+    assert(saved.prompts.length > 0 && saved.prompts.length < 50);
+    assert.strictEqual(saved.prompts[saved.prompts.length - 1], prompts[49]);
+  }
+
+  // Right at the cap: a file of exactly MAX_FILE_BYTES is kept whole, and one byte more drops the
+  // oldest entry, down to exactly the cap when that entry is as large as the excess. For prompts,
+  // the only message goes first, then the oldest prompt.
+  const pad = (bytes) => '中'.repeat(Math.floor(bytes / 3)) + 'a'.repeat(bytes % 3);
+  const oldest = { role: 'user', content: 'first' };
+  const cases = [
+    { list: 'messages', first: oldest, base: (last) => ({ history: [], messages: [oldest, { role: 'user', content: last }], prompts: ['p'] }) },
+    { list: 'prompts', first: 'first', base: (last) => ({ history: [], messages: [oldest], prompts: ['first', last] }) }
+  ];
+  for (const { list, first, base } of cases) {
+    const firstBytes = Buffer.byteLength(`${JSON.stringify(first)},`);
+    // The size with an empty newest entry, without the message that is dropped first for prompts.
+    const empty = Buffer.byteLength(store.serializeHistory(list === 'prompts' ? { ...base(''), messages: [] } : base(''), now));
+    for (const extra of [-1, 0, 1, firstBytes]) {
+      const saved = assertSameSerialization(base(pad(store.MAX_FILE_BYTES - empty + extra)), now, `${list} at cap ${extra}`).text;
+      assert.strictEqual(Buffer.byteLength(saved), store.MAX_FILE_BYTES + extra - (extra > 0 ? firstBytes : 0));
+      assert.strictEqual(JSON.parse(saved)[list].length, extra > 0 ? 1 : 2);
+    }
+  }
+
+  // Nothing left to drop: the history the request needs is over the cap on its own.
+  const history = [{ role: 'user', content: 'é'.repeat(store.MAX_FILE_BYTES / 2) }];
+  assert.deepStrictEqual(assertSameSerialization({ history, messages: [{ role: 'user', content: 'a' }], prompts: ['b'] }, now, 'too large'),
+    { error: 'Chat history is too large to save.' });
+});
+
+test('chat history saves a conversation at its size cap quickly', () => {
+  const { directory, file } = tempFile();
+  try {
+    // Each 99,000-character reply is stored twice (content and Markdown), so only a few fit.
+    const messages = [];
+    for (let index = 0; index < 50; index++) {
+      const reply = `Reply ${index} ${'word '.repeat(19800)}`.slice(0, 99000);
+      messages.push({ role: 'user', content: `Question ${index}` });
+      messages.push({ role: 'assistant', model: 'fixture-model', content: reply, markdown: reply });
+    }
+    const state = { history: [], messages, prompts: messages.filter((message) => message.role === 'user').map((message) => message.content) };
+    const started = process.hrtime.bigint();
+    const text = store.serializeHistory(state);
+    const elapsed = Number(process.hrtime.bigint() - started) / 1e6;
+    // About 60 ms on a laptop, against over a second when each dropped entry re-stringified
+    // the conversation; the bound is generous so a slow CI runner doesn't fail it.
+    assert(elapsed < 500, `serializeHistory took ${elapsed.toFixed(0)} ms`);
+    assert(Buffer.byteLength(text) <= store.MAX_FILE_BYTES);
+    store.saveHistory(file, state);
+    const restored = store.loadHistory(file);
+    assert(restored.messages.length > 0 && restored.messages.length < 100);
+    assert.strictEqual(restored.messages[restored.messages.length - 1].answer, messages[99].content);
+    assert.strictEqual(restored.prompts.length, 50);
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
 test('chat history ignores corrupt, oversized, wrong-version and malformed files', () => {
   const { directory, file } = tempFile();
   const write = (text) => {
