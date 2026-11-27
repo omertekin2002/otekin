@@ -143,6 +143,8 @@ test('CLI help and version include chat without changing version behavior', asyn
   assert.match(help.stdout, /--no-history/);
   assert.match(help.stdout, /OTEKIN_NO_HISTORY=1/);
   assert.match(help.stdout, /OTEKIN_HISTORY_FILE/);
+  assert.match(help.stdout, /--upgrade\s+With pilcrow: upgrade an existing installation/);
+  assert.match(help.stdout, /Give at most one choice/);
   assert.doesNotMatch(help.stdout, /memory only|current session/i);
   assert.strictEqual(help.stderr, '');
 
@@ -167,6 +169,16 @@ test('Pilcrow CLI dispatches installation and upgrade without entering chat', as
     const upgrade = await invoke(['pilcrow', '--upgrade', '--non-interactive']);
     assert.strictEqual(upgrade.code, 0);
     assert.strictEqual(upgrade.stdout, 'INSTALL:{"upgrade":true,"nonInteractive":true}\n');
+    // --upgrade may come before pilcrow, like every other option.
+    const upgradeFirst = await invoke(['--upgrade', 'pilcrow']);
+    assert.strictEqual(upgradeFirst.code, 0);
+    assert.strictEqual(upgradeFirst.stdout, 'INSTALL:{"upgrade":true,"nonInteractive":false}\n');
+    assert.strictEqual(upgradeFirst.stderr, '');
+    const upgradeAlone = await invoke(['--upgrade']);
+    assert.strictEqual(upgradeAlone.stdout, '');
+    assert.strictEqual(upgradeAlone.stderr, '--upgrade works only with pilcrow. Run "otekin pilcrow --upgrade".\n');
+    const upgradeAfterDashes = await invoke(['pilcrow', '--', '--upgrade']);
+    assert.match(upgradeAfterDashes.stderr, /^Pilcrow installation accepts only/);
     const help = await invoke(['pilcrow', '--help']);
     assert.strictEqual(help.code, 0);
     assert.match(help.stdout, /Usage: npx otekin pilcrow/);
@@ -240,8 +252,108 @@ test('CLI preserves profile, CV, and LinkedIn commands', async () => {
 test('CLI preserves readable unknown command behavior', async () => {
   const result = await runCli(['unknown-command']);
   assert.strictEqual(result.code, 1);
-  assert.match(result.stdout, /Usage:/);
-  assert.match(result.stderr, /Unknown option: unknown-command/);
+  // Only stderr: a script reading stdout must not get the profile or help for a typo.
+  assert.strictEqual(result.stdout, '');
+  assert.strictEqual(result.stderr, 'Unknown choice: unknown-command\n' +
+    'Choose one of: website, linkedin, cv, chat, exit. Run "otekin --help" to see the options.\n');
+});
+
+const UNEXPECTED_HINT = 'Give one choice, such as "otekin cv". Run "otekin --help" to see the options.\n';
+const CHOICES_HINT = 'Choose one of: website, linkedin, cv, chat, exit. Run "otekin --help" to see the options.\n';
+
+test('CLI rejects extra words, unknown choices and conflicting selections without printing the profile', async () => {
+  await withServer((request, response) => {
+    request.resume();
+    response.writeHead(200, { 'Content-Type': 'application/json' });
+    response.end(JSON.stringify({ message: 'Should not be reached.' }));
+  }, async (endpoint, fixture) => {
+    /** @type {Array<[string[], string]>} */
+    const cases = [
+      [['cv', 'extra', '--no-open'], `Unexpected argument: extra\n${UNEXPECTED_HINT}`],
+      [['website', 'linkedin', '--no-open'], `Unexpected argument: linkedin\n${UNEXPECTED_HINT}`],
+      [['--select', 'website', 'chat', 'q', '--no-open'], `Unexpected argument: chat\n${UNEXPECTED_HINT}`],
+      [['--cv', 'extra'], `Unexpected argument: extra\n${UNEXPECTED_HINT}`],
+      [['--no-open', '--', 'cv', 'extra'], `Unexpected argument: extra\n${UNEXPECTED_HINT}`],
+      [['--upgrade'], '--upgrade works only with pilcrow. Run "otekin pilcrow --upgrade".\n'],
+      [['cv', '--upgrade', '--no-open'], '--upgrade works only with pilcrow. Run "otekin pilcrow --upgrade".\n'],
+      [['chat', 'hi', '--upgrade'], '--upgrade works only with pilcrow. Run "otekin pilcrow --upgrade".\n'],
+      [['--select', 'bogus'], `Unknown choice: bogus\n${CHOICES_HINT}`],
+      [['bogus'], `Unknown choice: bogus\n${CHOICES_HINT}`],
+      [['--select=pilcrow'], `Unknown choice: pilcrow\n${CHOICES_HINT}`],
+      [['--json', 'bogus'], `Unknown choice: bogus\n${CHOICES_HINT}`],
+      [['--json', '--select', 'bogus'], `Unknown choice: bogus\n${CHOICES_HINT}`],
+      [['bogus', 'extra'], `Unknown choice: bogus\n${CHOICES_HINT}`],
+      [['chat', '--select', 'bogus'], `Unknown choice: bogus\n${CHOICES_HINT}`],
+      [['--select', 'chat', '--json'],
+        'Interactive chat does not support --json. Provide a prompt for one-shot JSON output.\n'],
+      [['chat', '--select', 'website'],
+        '--select does not combine with chat. Run "otekin chat" for chat, or "otekin --select website" without chat.\n'],
+      [['chat', 'hi', '-s', 'cv'],
+        '--select does not combine with chat. Run "otekin chat" for chat, or "otekin --select cv" without chat.\n'],
+      [['--cv', 'chat', 'hi'], `Unexpected argument: chat\n${UNEXPECTED_HINT}`],
+      [['chat', 'hi', '--resume'],
+        '--resume does not combine with chat. Run "otekin chat" for chat, or "otekin --resume" without chat.\n'],
+      [['chat', '--json', 'hi', '--cv'],
+        '--cv does not combine with chat. Run "otekin chat" for chat, or "otekin --cv" without chat.\n']
+    ];
+    for (const [args, stderr] of cases) {
+      const result = await runCli(args.concat('--non-interactive'), { OTEKIN_CHAT_API_URL: endpoint });
+      assert.strictEqual(result.code, 1, args.join(' '));
+      assert.strictEqual(result.stdout, '', args.join(' '));
+      assert.strictEqual(result.stderr, stderr, args.join(' '));
+    }
+    assert.deepStrictEqual(fixture.getRequests(), []);
+  });
+});
+
+test('CLI never echoes control characters or =values from a rejected argument', async () => {
+  for (const [args, first] of /** @type {Array<[string[], string]>} */ ([
+    [['cv', 'ex\u001B[31mtra\u0007'], 'Unexpected argument: extra'],
+    [['cv', 'token=secret'], 'Unexpected argument: token'],
+    [['--select', 'bo\u001B]8;;https://x.test\u0007gus'], 'Unknown choice: bogus'],
+    [['--select=bad=secret'], 'Unknown choice: bad'],
+    [['bad\u0085name=secret'], 'Unknown choice: badname']
+  ])) {
+    const result = await runCli(args);
+    assert.strictEqual(result.code, 1, JSON.stringify(args));
+    assert.strictEqual(result.stdout, '');
+    assert.strictEqual(result.stderr.split('\n')[0], first, JSON.stringify(args));
+    assert.doesNotMatch(result.stderr, /[\u0000-\u0009\u000B-\u001F\u007F-\u009F]|secret/, JSON.stringify(args));
+  }
+});
+
+test('CLI keeps a single choice, chat --select chat and profile JSON with a valid choice working', async () => {
+  const profileJson = await runCli(['--json']);
+  for (const args of [['--json', 'cv'], ['cv', '--json'], ['--json', '--select', 'linkedin']]) {
+    const result = await runCli(args);
+    assert.strictEqual(result.code, 0, args.join(' '));
+    assert.strictEqual(result.stdout, profileJson.stdout, args.join(' '));
+    assert.strictEqual(result.stderr, '');
+  }
+
+  const website = await runCli(['--select', 'website', '--no-open']);
+  assert.strictEqual(website.code, 0);
+  assert.strictEqual(website.stdout, `${GREETING}\n${TAGLINE}\n\nLink: https://omertekin2002.github.io\n`);
+  assert.strictEqual(website.stderr, '');
+
+  // Without a terminal, --select chat still prints the profile and explains that chat needs one.
+  const selectChat = await runCli(['--select', 'chat']);
+  assert.strictEqual(selectChat.code, 1);
+  assert.strictEqual(selectChat.stdout, `${GREETING}\n${TAGLINE}\n\n`);
+  assert.match(selectChat.stderr, /^Interactive chat requires a terminal\./);
+
+  const bodies = [];
+  await withServer(async (request, response) => {
+    bodies.push(JSON.parse(await readBody(request)));
+    response.writeHead(200, { 'Content-Type': 'application/json' });
+    response.end(JSON.stringify({ message: 'Answer.' }));
+  }, async (endpoint) => {
+    const result = await runCli(['chat', '--select', 'chat', 'hi'], { OTEKIN_CHAT_API_URL: endpoint });
+    assert.strictEqual(result.code, 0);
+    assert.strictEqual(result.stdout, 'Answer.\n');
+    assert.strictEqual(result.stderr, '');
+  });
+  assert.deepStrictEqual(bodies.map((body) => body.messages[0].content), ['hi']);
 });
 
 test('CLI one-shot chat sends the joined prompt and prints only the answer', async () => {

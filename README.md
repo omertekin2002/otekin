@@ -169,12 +169,13 @@ When the service has optional image generation enabled, ask for an image in the 
 - `--status`: with `chat`, check once whether the chat service is up, without sending a question, and exit with code 0 when it is reachable or 1 otherwise. Add `--json` for a JSON object. It doesn't take a prompt or `--linear`. See [Checking the chat service](#checking-the-chat-service).
 - `--reduced-motion`: replace spinners and ticking timers with a static status in the full-screen workspace and one-shot chat. `OTEKIN_REDUCED_MOTION=1` does the same for every run. See [Reduced motion](#reduced-motion).
 - `--cv`, `--resume`: open the CV link directly.
-- `--select <website|linkedin|cv|chat|exit>`: choose an option directly.
-- `--json`: output profile JSON, or preserve the complete response object for a one-shot chat.
+- `--select <website|linkedin|cv|chat|exit>`: choose an option directly. Give one choice at most: `otekin cv extra` exits with code 1 and `Unexpected argument: extra`, and a choice that isn't in the list, such as `otekin bogus`, exits with code 1 and `Unknown choice: bogus`, without printing the profile. `--select` and `--cv` don't combine with `chat`, except `otekin chat --select chat`.
+- `--json`: output profile JSON, or preserve the complete response object for a one-shot chat. With a valid choice, such as `otekin --json cv`, it still prints the profile JSON. `otekin --select chat --json` is rejected like `otekin chat --json`, because interactive chat has no JSON output.
+- `--upgrade`: with `pilcrow`, before or after it, upgrade an existing Pilcrow installation. Without `pilcrow` it is an error.
 - `--help`, `--version`: print CLI help or the package version.
 - `--`: end options. Later arguments are prompt text after `chat`, or a choice such as `cv`.
 
-Any other option, before or after `chat`, is an error: the CLI exits with code 1 and names the unknown option.
+Any other option, before or after `chat`, is an error: the CLI exits with code 1 and names the unknown option. Like the choice errors above, it prints only to stderr and opens no link.
 
 ## Examples
 
