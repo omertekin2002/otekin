@@ -253,7 +253,9 @@ test('probeChatService keeps the status and request ID when a response body stal
       assert.strictEqual(result.status, state, String(statusCode));
       assert.strictEqual(result.httpStatus, statusCode);
       assert.strictEqual(result.requestId, 'stalled-1');
-      if (state === 'unavailable') assert.strictEqual(result.message, 'Chat service did not respond within 0.1 s.');
+      assert.strictEqual(result.message, state === 'waking'
+        ? 'Chat service is not ready yet (HTTP 503); it may be waking up.'
+        : 'Chat service answered (HTTP 200) but did not finish its response within 0.1 s.');
     });
   }
 });
