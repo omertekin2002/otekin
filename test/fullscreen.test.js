@@ -138,6 +138,9 @@ async function terminalApp(options = {}) {
   };
   // For keys that should change nothing on screen: waits until the app has drawn nothing new for
   // a few frames, so a wrong render would show up before the test checks that nothing changed.
+  // It only proves *no change*. Never use it to wait for a change: while a reply is on its way the
+  // spinner redraws every 100 ms, so settle() can return in the quiet gap between two spinner frames,
+  // before the app has drawn what the test expects. Wait for that with expectScreen() first, then settle().
   const settle = () => waitUntil(() => Date.now() - lastOutput >= SETTLED_MS, 'the screen kept changing');
   await waitFor(() => /Ready when you are|Restored your last conversation/.test(screen()));
   await waitUntil(() => true, 'the first frame was not drawn');
@@ -2980,6 +2983,8 @@ test('a failed question put back in the composer leaves /sources for the chat, s
     await waitFor(() => held.length === 4);
     await openSources();
     held[3].fail(failure);
+    // Wait for the failure to be drawn: a settle() alone can return between spinner frames, before it is.
+    await ui.expectScreen(/\/retry sends it again/);
     await ui.settle();
     assert.match(ui.screen(), /Sources · reply 1 of 1/);
     assert.match(ui.screen(), /› \[1\] First source/);
