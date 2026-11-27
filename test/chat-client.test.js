@@ -225,10 +225,30 @@ test('probeChatService reports a refused connection as unavailable', async () =>
   assert.strictEqual(result.message, 'Unable to reach chat service.');
 });
 
+// Records the method of every HTTP request the client starts while `run` runs. Unlike a server's
+// count, it does not depend on the server reading a request before the client gives up on it.
+async function sentHttpRequests(run) {
+  const methods = [];
+  const original = http.request;
+  Object.assign(http, {
+    request(...args) {
+      const request = original.apply(http, args);
+      methods.push(request.method);
+      return request;
+    }
+  });
+  try {
+    await run();
+  } finally {
+    Object.assign(http, { request: original });
+  }
+  return methods;
+}
+
 test('probeChatService finishes within its timeout against a server that never responds', async () => {
-  const requests = [];
-  await withServer((request) => {
-    requests.push(request.method);
+  const received = [];
+  const sent = await sentHttpRequests(() => withServer((request) => {
+    received.push(request.method);
     request.resume();
   }, async (endpoint) => {
     const started = Date.now();
@@ -237,9 +257,13 @@ test('probeChatService finishes within its timeout against a server that never r
     assert.strictEqual(result.status, 'unavailable');
     assert.strictEqual(result.httpStatus, null);
     assert.strictEqual(result.message, 'Chat service did not respond within 0.1 s.');
-    assert.ok(result.elapsedMs >= 90);
-  });
-  assert.deepStrictEqual(requests, ['GET']);
+    // Not >= 100: a timer can fire a little early by Date.now(), whose steps are ~15 ms on Windows.
+    assert.ok(result.elapsedMs >= 50 && result.elapsedMs < 2000, String(result.elapsedMs));
+  }));
+  // One GET and no retry. On a slow runner the 100 ms timeout can fire before the server reads the
+  // request, so the server may have seen it or not, but never more than once.
+  assert.deepStrictEqual(sent, ['GET']);
+  assert.ok(received.length <= 1 && received.every((method) => method === 'GET'), String(received));
 });
 
 test('probeChatService keeps the status and request ID when a response body stalls past the timeout', async () => {
@@ -253,7 +277,9 @@ test('probeChatService keeps the status and request ID when a response body stal
       assert.strictEqual(result.status, state, String(statusCode));
       assert.strictEqual(result.httpStatus, statusCode);
       assert.strictEqual(result.requestId, 'stalled-1');
-      if (state === 'unavailable') assert.strictEqual(result.message, 'Chat service did not respond within 0.1 s.');
+      assert.strictEqual(result.message, state === 'waking'
+        ? 'Chat service is not ready yet (HTTP 503); it may be waking up.'
+        : 'Chat service answered (HTTP 200) but did not finish its response within 0.1 s.');
     });
   }
 });
