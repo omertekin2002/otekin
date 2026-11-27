@@ -223,7 +223,7 @@ CORS restrictions do not affect this Node.js CLI. The override must use an HTTP 
 
 - **reachable**: the route answered with `{"ok": true}`. `Chat service: reachable (signloop-chat-api.vercel.app, 0.4 s)`. Exit code 0.
 - **waking**: HTTP 502, 503 or 504. The service may be waking up, or it may be failing, so the check doesn't promise it will come up: `Chat service: waking (signloop-chat-api.vercel.app, 1.2 s). Chat service is not ready yet (HTTP 503); it may be waking up.` Exit code 1.
-- **unavailable**: anything else: no connection, no answer within 10 seconds, another HTTP status, a redirect, an invalid or oversized response, or an invalid URL override. The line ends with what went wrong, such as `Unable to reach chat service.` Exit code 1.
+- **unavailable**: anything else: no connection, no answer within 10 seconds, a response that started but did not finish within 10 seconds (`Chat service answered (HTTP 200) but did not finish its response within 10 s.`), another HTTP status, a redirect, an invalid or oversized response, or an invalid URL override. The line ends with what went wrong, such as `Unable to reach chat service.` Exit code 1.
 
 The line includes the gateway's request ID, when it sent a well-formed one, as `Request ID: …` inside the parentheses. With `--json`, it prints one object instead, with the same exit codes:
 
