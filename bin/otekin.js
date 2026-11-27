@@ -54,6 +54,7 @@ Options:
   --no-history            Don't load or save chat history this run
   --linear                Chat line by line: no animation, each reply printed once
   --status                With chat: check once whether the chat service is up
+  --upgrade               With pilcrow: upgrade an existing installation
   --reduced-motion        Show a static status instead of spinners and timers
   --cv, --resume          Open the CV download link directly
   -s, --select <choice>   Select directly: website | linkedin | cv | chat | exit
@@ -61,6 +62,10 @@ Options:
 
 Prompt words that look like options, such as -x or --name, are rejected as
 unknown options unless they come after --.
+
+Give at most one choice, such as "otekin cv": another word after it, a choice
+not in the list, or --select or --cv with chat exits with code 1. With --json,
+a valid choice still prints the profile JSON.
 
 Examples:
   npx otekin
@@ -156,11 +161,28 @@ If the executable directory is not on PATH, setup instructions are printed.
 `);
 }
 
+const CHOICES = 'website, linkedin, cv, chat, exit';
+const INTERACTIVE_JSON_ERROR = 'Interactive chat does not support --json. Provide a prompt for one-shot JSON output.\n';
+
+// Drop any `=value` so pasted values are never echoed back, and strip control characters.
+function argumentName(arg) {
+  return cleanText(String(arg).split('=')[0]);
+}
+
 function unknownOptionError(arg) {
-  // Drop any `=value` so pasted values are never echoed back.
-  const name = cleanText(arg.split('=')[0]);
+  const name = argumentName(arg);
   return `Unknown option: ${name}\n` +
     `Run "otekin --help" to see the options. To send text that starts with "-", put it after "--": otekin chat -- "${name}"`;
+}
+
+function unknownChoiceError(value) {
+  return `Unknown choice: ${argumentName(value)}\n` +
+    `Choose one of: ${CHOICES}. Run "otekin --help" to see the options.`;
+}
+
+function unexpectedArgumentError(arg) {
+  return `Unexpected argument: ${argumentName(arg)}\n` +
+    'Give one choice, such as "otekin cv". Run "otekin --help" to see the options.';
 }
 
 function parseArgs(argv) {
@@ -176,12 +198,16 @@ function parseArgs(argv) {
     reducedMotion: false,
     upgrade: false,
     select: null,
+    // The option that set `select` (`--select`, `-s`, `--cv` or `--resume`), or null for a positional choice.
+    selectOption: null,
     command: null,
     commandArgs: [],
     error: null,
     errorHelp: false
   };
   let optionsEnded = false;
+  // The first positional word after a profile choice: nothing would use it, so it is an error.
+  let unexpected = null;
 
   for (let i = 0; i < argv.length; i += 1) {
     const a = argv[i];
@@ -190,6 +216,7 @@ function parseArgs(argv) {
       else if (opts.command) opts.commandArgs.push(a);
       else if (['chat', 'pilcrow'].includes(a.toLowerCase()) && !opts.select) opts.command = a.toLowerCase();
       else if (!opts.select) opts.select = a;
+      else if (unexpected === null) unexpected = a;
     } else if (a === '-h' || a === '--help') opts.help = true;
     else if (a === '-v' || a === '--version') opts.version = true;
     else if (a === '--non-interactive' || a === '--no-interactive') opts.nonInteractive = true;
@@ -199,17 +226,24 @@ function parseArgs(argv) {
     else if (a === '--linear') opts.linear = true;
     else if (a === '--status') opts.status = true;
     else if (a === '--reduced-motion') opts.reducedMotion = true;
-    else if (a === '--upgrade' && opts.command === 'pilcrow') opts.upgrade = true;
-    else if (a === '--cv' || a === '--resume') opts.select = 'cv';
-    else if (a === '-s' || a === '--select' || a.startsWith('--select=')) {
+    else if (a === '--upgrade') opts.upgrade = true;
+    else if (a === '--cv' || a === '--resume') {
+      opts.select = 'cv';
+      opts.selectOption = a;
+    } else if (a === '-s' || a === '--select' || a.startsWith('--select=')) {
       const value = a.startsWith('--select=') ? a.slice('--select='.length) : argv[(i += 1)];
-      if (value && value !== '--') opts.select = value;
-      else if (!opts.error) {
+      if (value && value !== '--') {
+        opts.select = value;
+        opts.selectOption = '--select';
+      } else if (!opts.error) {
         opts.error = 'Missing value for --select';
         opts.errorHelp = true;
       }
     } else if (!opts.error) opts.error = unknownOptionError(a);
   }
+
+  if (!opts.error && opts.select && !normalizeSelect(opts.select)) opts.error = unknownChoiceError(opts.select);
+  else if (!opts.error && unexpected !== null) opts.error = unexpectedArgumentError(unexpected);
 
   return opts;
 }
@@ -498,6 +532,12 @@ async function main() {
     return;
   }
 
+  if (opts.upgrade) {
+    process.stderr.write('--upgrade works only with pilcrow. Run "otekin pilcrow --upgrade".\n');
+    process.exitCode = 1;
+    return;
+  }
+
   if (opts.linear && opts.command !== 'chat') {
     process.stderr.write('--linear works only with chat. Run "otekin chat --linear".\n');
     process.exitCode = 1;
@@ -506,6 +546,21 @@ async function main() {
 
   if (opts.status && opts.command !== 'chat') {
     process.stderr.write('--status works only with chat. Run "otekin chat --status".\n');
+    process.exitCode = 1;
+    return;
+  }
+
+  // `chat --select chat` keeps working; any other choice would be silently ignored by chat.
+  const selected = normalizeSelect(opts.select);
+  if (opts.command === 'chat' && selected && selected !== 'chat') {
+    const alone = opts.selectOption === '--select' ? `--select ${selected}` : opts.selectOption;
+    process.stderr.write(`${opts.selectOption} does not combine with chat. Run "otekin chat" for chat, or "otekin ${alone}" without chat.\n`);
+    process.exitCode = 1;
+    return;
+  }
+
+  if (!opts.command && selected === 'chat' && opts.json) {
+    process.stderr.write(INTERACTIVE_JSON_ERROR);
     process.exitCode = 1;
     return;
   }
@@ -537,7 +592,7 @@ async function main() {
     }
 
     if (opts.json) {
-      process.stderr.write('Interactive chat does not support --json. Provide a prompt for one-shot JSON output.\n');
+      process.stderr.write(INTERACTIVE_JSON_ERROR);
       process.exitCode = 1;
       return;
     }
@@ -567,7 +622,7 @@ async function main() {
     return;
   }
 
-  if (isInteractiveAllowed(opts) && (!opts.select || normalizeSelect(opts.select) === 'chat')) {
+  if (isInteractiveAllowed(opts) && (!selected || selected === 'chat')) {
     await runInteractiveChat(opts);
     return;
   }
@@ -579,16 +634,9 @@ async function main() {
     process.stdout.write(`${profile.greeting}\n${profile.tagline}\n\n`);
   }
 
-  const selectedFromFlag = normalizeSelect(opts.select);
-  if (opts.select && !selectedFromFlag) {
-    process.stderr.write(`Unknown option: ${opts.select}\n`);
-    printHelp();
-    process.exitCode = 1;
-    return;
-  }
-
-  if (selectedFromFlag) {
-    await handleChoice(selectedFromFlag, opts);
+  // parseArgs has already rejected a choice that normalizeSelect doesn't know.
+  if (selected) {
+    await handleChoice(selected, opts);
     return;
   }
 
